@@ -25,8 +25,10 @@ class FakePage:
 
     def __init__(self, lines: list[dict[str, object]] | Exception) -> None:
         self._lines = lines
+        self.last_extract_kwargs: dict[str, object] | None = None
 
-    def extract_text_lines(self, **_: object) -> list[dict[str, object]]:
+    def extract_text_lines(self, **kwargs: object) -> list[dict[str, object]]:
+        self.last_extract_kwargs = kwargs
         if isinstance(self._lines, Exception):
             raise self._lines
         return self._lines
@@ -44,6 +46,13 @@ class FakeDocument:
 
 
 class PdfParserTests(unittest.TestCase):
+    def test_word_spacing_uses_stricter_horizontal_tolerance(self) -> None:
+        page = FakePage([self._line("Body text", top=100)])
+
+        self._parse([page])
+
+        self.assertEqual(page.last_extract_kwargs["x_tolerance"], 2.0)
+
     def test_two_columns_are_read_left_then_right(self) -> None:
         lines = tuple(
             [

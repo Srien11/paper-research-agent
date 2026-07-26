@@ -26,6 +26,7 @@ from paper_research_agent.ingestion.structure import infer_document_structure
 PARSER_NAME = "pdfplumber"
 PARSER_VERSION = pdfplumber.__version__
 PARSER_CONFIG_SCHEMA_VERSION = "pdf-parser-config-v1"
+X_TOLERANCE = 2.0
 MARGIN_RATIO = 0.08
 REPEAT_RATIO = 0.3
 MIN_REPEAT_PAGES = 3
@@ -77,6 +78,7 @@ def parser_config() -> dict[str, object]:
             "strip": True,
             "return_chars": False,
             "layout": True,
+            "x_tolerance": X_TOLERANCE,
         },
         "header_footer": {
             "margin_ratio": MARGIN_RATIO,
@@ -108,6 +110,7 @@ def extract_lines(page: object) -> tuple[TextLine, ...]:
         strip=True,
         return_chars=False,
         layout=True,
+        x_tolerance=X_TOLERANCE,
     )
     page_width = float(page.width)  # type: ignore[attr-defined]
     page_height = float(page.height)  # type: ignore[attr-defined]
