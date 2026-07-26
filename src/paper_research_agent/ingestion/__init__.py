@@ -7,6 +7,7 @@ from paper_research_agent.ingestion.models import (
     PageRecord,
     SectionRecord,
 )
+from paper_research_agent.ingestion.text import normalize_text
 
 __all__ = [
     "DocumentAsset",
@@ -14,5 +15,5 @@ __all__ = [
     "IngestionManifest",
     "PageRecord",
     "SectionRecord",
+    "normalize_text",
 ]
-
