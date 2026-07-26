@@ -18,8 +18,10 @@ from paper_research_agent.ingestion.models import (
     DocumentAsset,
     DocumentElement,
     PageRecord,
+    SectionRecord,
 )
 from paper_research_agent.ingestion.text import normalize_text
+from paper_research_agent.ingestion.structure import infer_document_structure
 
 PARSER_NAME = "pdfplumber"
 PARSER_VERSION = pdfplumber.__version__
@@ -56,6 +58,7 @@ class PageDraft:
 @dataclass(frozen=True)
 class ParsedDocument:
     pages: tuple[PageRecord, ...]
+    sections: tuple[SectionRecord, ...]
     elements: tuple[DocumentElement, ...]
 
 
@@ -181,7 +184,12 @@ def parse_pdf_asset(pdf_path: Path, asset: DocumentAsset) -> ParsedDocument:
         page, page_elements = _build_page_records(draft, asset, repeated)
         pages.append(page)
         elements.extend(page_elements)
-    return ParsedDocument(pages=tuple(pages), elements=tuple(elements))
+    structured = infer_document_structure(tuple(elements), asset)
+    return ParsedDocument(
+        pages=tuple(pages),
+        sections=structured.sections,
+        elements=structured.elements,
+    )
 
 
 def _extract_page_draft(page: object, page_number: int) -> PageDraft:
@@ -330,4 +338,3 @@ def _margin_zone(line: TextLine, page_height: float) -> str | None:
 
 def _margin_signature(text: str) -> str:
     return _DIGITS.sub("#", normalize_text(text).casefold())
-
