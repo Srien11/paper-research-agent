@@ -10,6 +10,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from paper_research_agent.ingestion.identity import sha256_text
 from paper_research_agent.ingestion.models import DocumentAsset, DocumentElement
 from paper_research_agent.ingestion.structure import (
+    detect_caption_type,
     detect_heading,
     infer_document_structure,
 )
@@ -18,6 +19,31 @@ SHA_A = "a" * 64
 
 
 class DocumentStructureTests(unittest.TestCase):
+    def test_table_and_figure_captions_are_classified(self) -> None:
+        self.assertEqual(
+            detect_caption_type(self._element(0, "Table 3: Retrieval results.")),
+            "table_caption",
+        )
+        self.assertEqual(
+            detect_caption_type(self._element(0, "Fig. 2. System overview.")),
+            "figure_caption",
+        )
+        self.assertIsNone(
+            detect_caption_type(self._element(0, "The table summarizes results."))
+        )
+
+        elements = (
+            self._element(0, "A Reliable Evaluation Framework"),
+            self._element(1, "1 Results"),
+            self._element(2, "Table 3: Retrieval results."),
+            self._element(3, "Figure 2: System overview."),
+        )
+
+        result = infer_document_structure(elements, self._asset())
+
+        self.assertEqual(result.elements[2].element_type, "table_caption")
+        self.assertEqual(result.elements[3].element_type, "figure_caption")
+
     def test_numbered_and_common_headings_are_detected(self) -> None:
         self.assertEqual(detect_heading(self._element(0, "1 Introduction")).level, 1)
         self.assertEqual(detect_heading(self._element(0, "1.2 Retrieval")).level, 2)

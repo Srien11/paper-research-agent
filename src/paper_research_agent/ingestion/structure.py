@@ -42,6 +42,8 @@ _COMMON_HEADINGS = {
 _REFERENCE_TITLES = {"references", "bibliography"}
 _GENERIC_COUNT_LABELS = {"dataset", "datasets", "language", "languages", "task", "tasks"}
 _SENTENCE_PUNCTUATION = re.compile(r"[,;!?]")
+_TABLE_CAPTION = re.compile(r"^(?:table|tab\.)\s+[a-z]?\d+[.:]\s*\S", re.IGNORECASE)
+_FIGURE_CAPTION = re.compile(r"^(?:figure|fig\.)\s+[a-z]?\d+[.:]\s*\S", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -95,7 +97,10 @@ def infer_document_structure(
             )
             continue
         element_type = element.element_type
-        if current_section_title in _REFERENCE_TITLES:
+        caption_type = detect_caption_type(element)
+        if caption_type is not None:
+            element_type = caption_type
+        elif current_section_title in _REFERENCE_TITLES:
             element_type = "reference"
         updated.append(
             element.model_copy(
@@ -143,6 +148,19 @@ def detect_heading(element: DocumentElement) -> HeadingCandidate | None:
         return HeadingCandidate(element=element, level=1)
     if _APPENDIX_HEADING.match(lowered):
         return HeadingCandidate(element=element, level=1)
+    return None
+
+
+def detect_caption_type(
+    element: DocumentElement,
+) -> str | None:
+    """识别带编号的表格与图片标题，供后续切块保留语义边界。"""
+
+    text = element.normalized_text.strip()
+    if _TABLE_CAPTION.match(text):
+        return "table_caption"
+    if _FIGURE_CAPTION.match(text):
+        return "figure_caption"
     return None
 
 
