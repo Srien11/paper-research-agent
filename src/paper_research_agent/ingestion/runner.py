@@ -180,12 +180,13 @@ def _atomic_write(path: Path, content: bytes) -> None:
 
 
 def _canonical_json(value: Any) -> str:
-    return json.dumps(
+    serialized = json.dumps(
         value,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
     )
+    return serialized.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
 
 
 def _sha256_file(path: Path) -> str:
@@ -194,4 +195,3 @@ def _sha256_file(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
-

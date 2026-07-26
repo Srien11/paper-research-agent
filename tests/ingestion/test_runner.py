@@ -49,7 +49,10 @@ class IngestionRunnerTests(unittest.TestCase):
             self.assertEqual(first.output_dir, second.output_dir)
             self.assertEqual(first_hashes, second.manifest.artifact_sha256)
             assets_text = (first.output_dir / "assets.jsonl").read_text(encoding="utf-8")
+            pages_text = (first.output_dir / "pages.jsonl").read_text(encoding="utf-8")
             self.assertNotIn(str(source), assets_text)
+            self.assertEqual(len(pages_text.splitlines()), 1)
+            self.assertIn("\\u2028", pages_text)
             self.assertEqual(first.manifest.asset_count, 1)
             self.assertEqual(first.manifest.parsed_page_count, 1)
 
@@ -68,7 +71,7 @@ class IngestionRunnerTests(unittest.TestCase):
     @staticmethod
     def _fake_parse(path: Path, asset) -> ParsedDocument:
         page_id = make_page_id(asset.source_sha256, 1)
-        text = "Evidence"
+        text = "Evidence\u2028continued"
         text_hash = sha256_text(text)
         page = PageRecord(
             page_id=page_id,
@@ -139,4 +142,3 @@ class IngestionRunnerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

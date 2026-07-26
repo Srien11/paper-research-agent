@@ -88,6 +88,12 @@ def parser_config() -> dict[str, object]:
             "spanning_width_ratio": 0.65,
             "minimum_lines_per_column": 3,
         },
+        "serialization": {
+            "format": "canonical-jsonl-v1",
+            "encoding": "utf-8",
+            "sort_keys": True,
+            "escape_unicode_line_separators": True,
+        },
     }
 
 
