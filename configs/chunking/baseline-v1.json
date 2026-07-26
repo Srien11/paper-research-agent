@@ -1,0 +1,7 @@
+{
+  "schema_version": "chunking-v1",
+  "tokenizer": "regex-token-v1",
+  "max_tokens": 512,
+  "overlap_tokens": 64,
+  "output_dir": "data/processed/chunks"
+}

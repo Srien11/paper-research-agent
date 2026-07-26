@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.paper-research-agent/evaluation/query-v1",
+  "title": "Retrieval diagnostic query",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "query_id",
+    "query",
+    "relevant_paper_ids",
+    "relevant_chunk_ids",
+    "answerable",
+    "annotation_status",
+    "reviewer_count"
+  ],
+  "properties": {
+    "query_id": {"type": "string", "pattern": "^Q[0-9]{3}$"},
+    "query": {"type": "string", "minLength": 1},
+    "relevant_paper_ids": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^[CT][0-9]{3}$"}
+    },
+    "relevant_chunk_ids": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "answerable": {"type": "boolean"},
+    "annotation_status": {"const": "silver_single_reviewer"},
+    "reviewer_count": {"const": 1},
+    "notes": {"type": ["string", "null"]}
+  }
+}

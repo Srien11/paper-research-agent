@@ -17,6 +17,11 @@ ingestion = [
   "pdfplumber>=0.11.10,<0.12",
   "pypdf>=6.14,<7",
 ]
+retrieval = [
+  "numpy>=2.2,<3",
+  "fastembed>=0.8,<0.9",
+  "faiss-cpu>=1.14,<1.15",
+]
 dev = [
   "mypy>=1.15",
   "ruff>=0.11",

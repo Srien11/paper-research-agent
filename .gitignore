@@ -23,10 +23,11 @@ data/evaluations/runs/
 *.faiss
 *.sqlite
 *.sqlite3
+*.npy
+data/models/
 
 # IDE and operating system
 .idea/
 .vscode/
 .DS_Store
 Thumbs.db
-

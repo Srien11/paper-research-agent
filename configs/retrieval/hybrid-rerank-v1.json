@@ -1,0 +1,13 @@
+{
+  "schema_version": "retrieval-v1",
+  "embedding_model": "BAAI/bge-small-en-v1.5",
+  "embedding_revision": "52398278842ec682c6f32300af41344b1c0b0bb2",
+  "reranker_model": "Xenova/ms-marco-MiniLM-L-6-v2",
+  "reranker_revision": "a09144355adeed5f58c8ed011d209bf8ee5a1fec",
+  "rrf_k": 60,
+  "sparse_candidates": 50,
+  "vector_candidates": 50,
+  "rerank_candidates": 30,
+  "top_k": 10,
+  "index_dir": "data/indexes/retrieval-v1"
+}
