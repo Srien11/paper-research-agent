@@ -25,6 +25,10 @@ from paper_research_agent.ingestion.structure import infer_document_structure
 
 PARSER_NAME = "pdfplumber"
 PARSER_VERSION = pdfplumber.__version__
+PARSER_CONFIG_SCHEMA_VERSION = "pdf-parser-config-v1"
+MARGIN_RATIO = 0.08
+REPEAT_RATIO = 0.3
+MIN_REPEAT_PAGES = 3
 _PAGE_NUMBER = re.compile(
     r"^\s*(?:page\s*)?(?:\d+|[ivxlcdm]+)(?:\s*(?:/|of)\s*\d+)?\s*$",
     re.IGNORECASE,
@@ -60,6 +64,31 @@ class ParsedDocument:
     pages: tuple[PageRecord, ...]
     sections: tuple[SectionRecord, ...]
     elements: tuple[DocumentElement, ...]
+
+
+def parser_config() -> dict[str, object]:
+    """返回会影响解析结果的确定性配置。"""
+
+    return {
+        "schema_version": PARSER_CONFIG_SCHEMA_VERSION,
+        "parser_name": PARSER_NAME,
+        "parser_version": PARSER_VERSION,
+        "extract_text_lines": {
+            "strip": True,
+            "return_chars": False,
+            "layout": True,
+        },
+        "header_footer": {
+            "margin_ratio": MARGIN_RATIO,
+            "repeat_ratio": REPEAT_RATIO,
+            "minimum_repeat_pages": MIN_REPEAT_PAGES,
+        },
+        "column_ordering": {
+            "midpoint_margin_ratio": 0.04,
+            "spanning_width_ratio": 0.65,
+            "minimum_lines_per_column": 3,
+        },
+    }
 
 
 def extract_lines(page: object) -> tuple[TextLine, ...]:
@@ -124,7 +153,7 @@ def find_repeated_margin_signatures(
     """发现跨页重复的页眉页脚文本。"""
 
     successful = [draft for draft in drafts if draft.error_code is None]
-    threshold = max(3, math.ceil(len(successful) * 0.3))
+    threshold = max(MIN_REPEAT_PAGES, math.ceil(len(successful) * REPEAT_RATIO))
     counts: dict[tuple[str, str], set[int]] = {}
     for draft in successful:
         for line in draft.lines:
@@ -329,9 +358,9 @@ def _order_column_band(lines: list[TextLine], midpoint: float) -> list[TextLine]
 
 
 def _margin_zone(line: TextLine, page_height: float) -> str | None:
-    if line.top <= page_height * 0.08:
+    if line.top <= page_height * MARGIN_RATIO:
         return "top"
-    if line.bottom >= page_height * 0.92:
+    if line.bottom >= page_height * (1 - MARGIN_RATIO):
         return "bottom"
     return None
 
