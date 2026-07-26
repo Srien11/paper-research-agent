@@ -50,6 +50,23 @@ class IngestionQualityTests(unittest.TestCase):
                 1,
             )
 
+    def test_known_warning_is_distinct_from_pending_manual_review(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            build_dir = self._build_fixture(Path(directory))
+
+            assessment = assess_ingestion(
+                build_dir,
+                minimum_chars_per_paper=1,
+                minimum_sections_per_paper=0,
+                known_warnings=("人工复核后确认不阻塞检索。",),
+            )
+
+            self.assertEqual(assessment.status, "pass_with_warnings")
+            self.assertEqual(
+                assessment.known_warnings,
+                ["人工复核后确认不阻塞检索。"],
+            )
+
     @staticmethod
     def _build_fixture(root: Path) -> Path:
         corpus_dir = root / "corpus"

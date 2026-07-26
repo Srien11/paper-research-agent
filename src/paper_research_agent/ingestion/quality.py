@@ -30,7 +30,7 @@ class QualityAssessment(BaseModel):
     schema_version: Literal["ingestion-quality-v1"] = "ingestion-quality-v1"
     build_id: str
     corpus_version: str
-    status: Literal["pass", "manual_review_required", "fail"]
+    status: Literal["pass", "pass_with_warnings", "manual_review_required", "fail"]
     counts: dict[str, int]
     integrity_errors: dict[str, int]
     gates: dict[str, bool]
@@ -108,11 +108,13 @@ def assess_ingestion(
         "替换字符比例不高于千分之一": replacement_ratio <= 0.001,
         "每篇至少识别三个章节": not low_section_ids,
     }
-    status: Literal["pass", "manual_review_required", "fail"]
+    status: Literal["pass", "pass_with_warnings", "manual_review_required", "fail"]
     if not all(gates.values()):
         status = "fail"
-    elif manual_review_ids or known_warnings or section_density_outliers:
+    elif manual_review_ids or section_density_outliers:
         status = "manual_review_required"
+    elif known_warnings:
+        status = "pass_with_warnings"
     else:
         status = "pass"
 
