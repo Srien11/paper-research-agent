@@ -8,7 +8,8 @@
 
 - [x] 冻结语料论文级数据契约
 - [x] 语料清单校验器
-- [ ] 全 2286 页结构化解析与稳定 chunk ID
+- [x] 全 2286 页确定性结构化解析与元素 ID
+- [ ] 可追溯语义片段与稳定 chunk ID
 - [ ] 基线 A：纯向量检索
 - [ ] 标准问题、标准论文与标准证据片段
 - [ ] 基线 B：BM25 + 向量混合检索
@@ -39,6 +40,7 @@ llm-eval-reliability-v1.0.0-2026-07-26
 $env:PYTHONPATH = 'src'
 python -m unittest discover -s tests -v
 python scripts/validate_corpus.py --corpus-dir D:\agent-study\kf\research_collection
+python scripts/parse_corpus.py --corpus-dir D:\agent-study\kf\research_collection
 ```
 
 ## 工程原则
@@ -50,5 +52,6 @@ python scripts/validate_corpus.py --corpus-dir D:\agent-study\kf\research_collec
 - 受限论文只用于本地研究，不能由仓库重新分发。
 - 冻结清单中的选题理由、挑战提示和问题创意不得进入索引。
 
-当前 `parse_quality_status` 只表示下载阶段的抽页可解析性检查通过，不代表 2286
-页已经完成 RAG 级结构化解析。全量逐页解析属于下一里程碑。
+全量文本解析已覆盖 2286/2286 页，并通过跨记录完整性审计和 14 篇、42 页
+视觉抽检。当前边界是 PDF 文本层：图片、扫描内容和图内算法尚未执行 OCR，
+不能将本阶段称为完整多模态 PDF 解析。
