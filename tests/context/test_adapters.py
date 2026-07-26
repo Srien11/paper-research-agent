@@ -1,0 +1,66 @@
+from __future__ import annotations
+
+import hashlib
+import sys
+import unittest
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+from paper_research_agent.chunking.models import EvidenceChunk
+from paper_research_agent.context.adapters import EvidenceJoinError, join_retrieval_evidence
+from paper_research_agent.retrieval.contracts import RetrievalRun, SearchHit
+
+
+def artifacts() -> tuple[RetrievalRun, EvidenceChunk]:
+    text = "traceable source"
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    chunk = EvidenceChunk(
+        chunk_id="chunk-1",
+        asset_id="asset-1",
+        corpus_id="C001",
+        element_ids=("element-1",),
+        page_start=2,
+        page_end=2,
+        token_start=0,
+        token_end=2,
+        text=text,
+        text_sha256=digest,
+        config_sha256="a" * 64,
+    )
+    hit = SearchHit(
+        chunk_id=chunk.chunk_id,
+        corpus_id=chunk.corpus_id,
+        asset_id=chunk.asset_id,
+        page_start=chunk.page_start,
+        page_end=chunk.page_end,
+        text_sha256=digest,
+        final_score=0.9,
+        final_rank=1,
+    )
+    run = RetrievalRun(
+        query="question",
+        variant="C",
+        top_k=1,
+        hits=(hit,),
+        index_id="index",
+        config_sha256="b" * 64,
+    )
+    return run, chunk
+
+
+class ContextAdapterTests(unittest.TestCase):
+    def test_join_preserves_text_and_retrieval_rank(self) -> None:
+        run, chunk = artifacts()
+        joined = join_retrieval_evidence(run, [chunk])
+        self.assertEqual(joined[0].text, chunk.text)
+        self.assertEqual(joined[0].final_rank, 1)
+
+    def test_missing_or_mismatched_source_fails(self) -> None:
+        run, chunk = artifacts()
+        with self.assertRaises(EvidenceJoinError):
+            join_retrieval_evidence(run, [])
+        changed = chunk.model_copy(update={"page_start": 3, "page_end": 3})
+        with self.assertRaises(EvidenceJoinError):
+            join_retrieval_evidence(run, [changed])

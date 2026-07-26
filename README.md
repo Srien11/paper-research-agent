@@ -14,6 +14,7 @@
 - [x] 30 条单审阅者银标诊断查询
 - [x] 基线 B：BM25 + 向量混合检索
 - [x] 基线 C：混合检索 + 重排模型
+- [x] 分层、预算受控且可引用的 RAG 上下文组装
 - [ ] 多步研究 Agent
 
 详细安排见[RAG 检索基线实施计划](docs/plans/2026-07-26-RAG检索基线实施计划.md)。
@@ -53,6 +54,20 @@ python scripts/search.py "How is hallucination evaluated?" `
 python scripts/evaluate_retrieval.py `
   --chunks data/processed/chunks/chunks.jsonl
 ```
+
+检索运行结果可以在调用大模型前组装为安全的上下文预览：
+
+```powershell
+python scripts/assemble_context.py `
+  --run data/evaluations/example-retrieval-run.json `
+  --chunks data/processed/chunks/chunks.jsonl `
+  --token-budget 8192 --output-reserve 1024
+```
+
+组装顺序固定为可信系统规则、对话历史、当前用户问题/任务状态、检索证据。历史、任务
+状态和论文正文均属于低信任数据；证据使用 canonical JSON 封装，不能覆盖系统规则或
+触发工具。预算计算覆盖最终消息模板并预留输出空间，证据只按完整 chunk 加入，不截断
+引用血缘。
 
 ## 工程原则
 
