@@ -1,0 +1,42 @@
+{
+  "build_id": "build_70e844af8c83c5d89f757a8cd34af784",
+  "corpus_version": "llm-eval-reliability-v1.0.0-2026-07-26",
+  "counts": {
+    "assets": 80,
+    "elements": 160173,
+    "normalized_characters": 7932082,
+    "pages": 2286,
+    "sections": 2244
+  },
+  "gates": {
+    "全部页面有状态记录": true,
+    "替换字符比例不高于千分之一": true,
+    "每篇正文字符量达标": true,
+    "每篇至少识别三个章节": true,
+    "零失败或隔离页面": true,
+    "零跨记录完整性错误": true
+  },
+  "integrity_errors": {},
+  "known_warnings": [
+    "两处 PDF 字体 FontBBox 元数据缺失；人工抽检未发现可见缺字或页面失败。",
+    "C017 第 12 页算法主体为图片，本轮文本基线仅保留图注；图片 OCR 与多模态索引留待后续工程任务。"
+  ],
+  "manual_review_ids": [],
+  "schema_version": "ingestion-quality-v1",
+  "status": "pass_with_warnings",
+  "structure_quality": {
+    "low_section_corpus_ids": [],
+    "maximum_elements_per_paper": 8575,
+    "maximum_sections_per_paper": 91,
+    "median_sections_per_paper": 25.0,
+    "minimum_sections_per_paper": 7,
+    "section_density_outlier_ids": []
+  },
+  "text_quality": {
+    "low_text_corpus_ids": [],
+    "maximum_chars_per_paper": 661518,
+    "minimum_chars_per_paper": 34893,
+    "replacement_characters": 0,
+    "replacement_ratio": 0.0
+  }
+}
