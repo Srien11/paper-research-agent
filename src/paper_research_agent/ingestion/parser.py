@@ -457,8 +457,11 @@ def _split_cross_column_line(
     gap, split_index = max(candidates)
     if gap < page_width * COLUMN_SPLIT_GAP_RATIO:
         return (original,) if original.text else ()
-    left_line = _chars_to_text_line(horizontal_chars[:split_index])
-    right_line = _chars_to_text_line(horizontal_chars[split_index:])
+    left_chars = horizontal_chars[:split_index]
+    right_chars = horizontal_chars[split_index:]
+    left_text, right_text = _split_text_at_char_boundary(original.text, left_chars)
+    left_line = _chars_to_text_line(left_chars, left_text)
+    right_line = _chars_to_text_line(right_chars, right_text)
     return tuple(line for line in (left_line, right_line) if line.text)
 
 
@@ -472,17 +475,34 @@ def _item_to_text_line(item: dict[str, object]) -> TextLine:
     )
 
 
-def _chars_to_text_line(chars: list[dict[str, object]]) -> TextLine:
-    parts: list[str] = []
-    previous_x1: float | None = None
-    for char in chars:
-        x0 = float(char["x0"])
-        if previous_x1 is not None and x0 - previous_x1 > X_TOLERANCE:
-            parts.append(" ")
-        parts.append(str(char.get("text", "")))
-        previous_x1 = float(char["x1"])
+def _split_text_at_char_boundary(
+    text: str,
+    left_chars: list[dict[str, object]],
+) -> tuple[str, str]:
+    """按左栏实际字符数切开已含合成空格的原始行文本。"""
+
+    target = sum(
+        1
+        for char in left_chars
+        for character in str(char.get("text", ""))
+        if not character.isspace()
+    )
+    consumed = 0
+    boundary = 0
+    for boundary, character in enumerate(text, start=1):
+        if not character.isspace():
+            consumed += 1
+        if consumed >= target:
+            break
+    return text[:boundary].strip(), text[boundary:].strip()
+
+
+def _chars_to_text_line(
+    chars: list[dict[str, object]],
+    text: str,
+) -> TextLine:
     return TextLine(
-        text="".join(parts).strip(),
+        text=text,
         x0=min(float(char["x0"]) for char in chars),
         top=min(float(char["top"]) for char in chars),
         x1=max(float(char["x1"]) for char in chars),

@@ -119,6 +119,20 @@ class PdfParserTests(unittest.TestCase):
             ["L1", "L2", "L3", "R1", "R2", "R3"],
         )
 
+    def test_split_columns_preserve_spaces_from_original_line(self) -> None:
+        line = self._merged_line("Left words", "Right words", top=100)
+        line["text"] = "Left words Right words"
+        line["chars"] = [
+            *self._chars("Leftwords", start=50, top=100),
+            *self._chars("Rightwords", start=350, top=100),
+        ]
+        lines = [line, {**line, "top": 120.0, "bottom": 130.0}, {**line, "top": 140.0, "bottom": 150.0}]
+
+        result = self._parse([FakePage(lines)])
+
+        self.assertEqual(result.elements[0].raw_text, "Left words")
+        self.assertEqual(result.elements[3].raw_text, "Right words")
+
     def test_repeated_headers_and_page_numbers_are_removed(self) -> None:
         pages = [
             FakePage(
@@ -240,6 +254,20 @@ class PdfParserTests(unittest.TestCase):
             "bottom": top + 10.0,
             "chars": chars,
         }
+
+    @staticmethod
+    def _chars(text: str, *, start: float, top: float) -> list[dict[str, object]]:
+        return [
+            {
+                "text": character,
+                "x0": start + index * 5,
+                "x1": start + (index + 1) * 5,
+                "top": top,
+                "bottom": top + 10,
+                "upright": True,
+            }
+            for index, character in enumerate(text)
+        ]
 
 
 if __name__ == "__main__":
