@@ -23,6 +23,9 @@ class RetrievalConfigTests(unittest.TestCase):
             PROJECT_ROOT / "configs/retrieval/hybrid-rerank-v1.json"
         )
         self.assertEqual(chunking.max_tokens, 512)
+        self.assertEqual(
+            chunking.model_dump(mode="json")["output_dir"], "data/processed/chunks"
+        )
         self.assertEqual(retrieval.embedding_model, "BAAI/bge-small-en-v1.5")
         self.assertTrue(retrieval.embedding_revision)
         self.assertTrue(retrieval.reranker_revision)

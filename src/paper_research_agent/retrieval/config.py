@@ -6,7 +6,14 @@ import json
 from pathlib import Path, PurePath
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 
 class FrozenConfig(BaseModel):
@@ -24,6 +31,10 @@ class ChunkingConfig(FrozenConfig):
     @classmethod
     def require_safe_local_output(cls, value: Path) -> Path:
         return _safe_project_relative_path(value)
+
+    @field_serializer("output_dir")
+    def serialize_output_dir(self, value: Path) -> str:
+        return value.as_posix()
 
     @model_validator(mode="after")
     def require_overlap_smaller_than_chunk(self) -> ChunkingConfig:
@@ -56,6 +67,10 @@ class RetrievalConfig(FrozenConfig):
     @classmethod
     def require_safe_local_index(cls, value: Path) -> Path:
         return _safe_project_relative_path(value)
+
+    @field_serializer("index_dir")
+    def serialize_index_dir(self, value: Path) -> str:
+        return value.as_posix()
 
     @model_validator(mode="after")
     def require_valid_candidate_counts(self) -> RetrievalConfig:

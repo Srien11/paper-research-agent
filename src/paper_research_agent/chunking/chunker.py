@@ -93,7 +93,16 @@ def build_chunks(
             )
             if start + len(window) >= len(tokens):
                 break
-    return sorted(chunks, key=lambda item: (item.corpus_id, item.page_start, item.chunk_id))
+    return sorted(
+        chunks,
+        key=lambda item: (
+            item.corpus_id,
+            item.page_start,
+            item.section_id or "",
+            item.token_start,
+            item.chunk_id,
+        ),
+    )
 
 
 def build_paper_cards(
