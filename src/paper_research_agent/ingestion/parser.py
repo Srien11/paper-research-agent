@@ -76,7 +76,7 @@ def parser_config() -> dict[str, object]:
         "parser_version": PARSER_VERSION,
         "extract_text_lines": {
             "strip": True,
-            "return_chars": False,
+            "return_chars": True,
             "layout": True,
             "x_tolerance": X_TOLERANCE,
         },
@@ -99,6 +99,7 @@ def parser_config() -> dict[str, object]:
         "bbox_policy": {
             "discard_fully_outside_page": True,
             "clip_partially_visible_lines": True,
+            "discard_rotated_side_margin_lines": True,
         },
     }
 
@@ -108,7 +109,7 @@ def extract_lines(page: object) -> tuple[TextLine, ...]:
 
     raw_lines = page.extract_text_lines(  # type: ignore[attr-defined]
         strip=True,
-        return_chars=False,
+        return_chars=True,
         layout=True,
         x_tolerance=X_TOLERANCE,
     )
@@ -116,6 +117,8 @@ def extract_lines(page: object) -> tuple[TextLine, ...]:
     page_height = float(page.height)  # type: ignore[attr-defined]
     lines: list[TextLine] = []
     for item in raw_lines:
+        if _is_rotated_side_margin(item, page_width):
+            continue
         text = str(item.get("text", "")).strip()
         if not text:
             continue
@@ -414,3 +417,16 @@ def _clip_line_to_page(
         x1=x1,
         bottom=bottom,
     )
+
+
+def _is_rotated_side_margin(item: dict[str, object], page_width: float) -> bool:
+    """过滤位于左右页边的整行旋转水印，同时保留正文内的竖排图表文字。"""
+
+    chars = item.get("chars")
+    if not isinstance(chars, list) or not chars:
+        return False
+    if any(bool(char.get("upright", True)) for char in chars if isinstance(char, dict)):
+        return False
+    x0 = float(item["x0"])
+    x1 = float(item["x1"])
+    return x1 <= page_width * MARGIN_RATIO or x0 >= page_width * (1 - MARGIN_RATIO)

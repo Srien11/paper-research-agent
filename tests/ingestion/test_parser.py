@@ -52,6 +52,39 @@ class PdfParserTests(unittest.TestCase):
         self._parse([page])
 
         self.assertEqual(page.last_extract_kwargs["x_tolerance"], 2.0)
+        self.assertIs(page.last_extract_kwargs["return_chars"], True)
+
+    def test_rotated_side_margin_watermark_is_removed(self) -> None:
+        rotated = self._line("arXiv watermark", top=100)
+        rotated.update(
+            {
+                "x0": 10.0,
+                "x1": 20.0,
+                "chars": [{"text": "a", "upright": False}],
+            }
+        )
+        body = self._line("Body", top=200)
+
+        result = self._parse([FakePage([rotated, body])])
+
+        self.assertEqual([element.raw_text for element in result.elements], ["Body"])
+
+    def test_rotated_text_inside_page_is_preserved(self) -> None:
+        chart_label = self._line("vertical chart label", top=100)
+        chart_label.update(
+            {
+                "x0": 100.0,
+                "x1": 110.0,
+                "chars": [{"text": "v", "upright": False}],
+            }
+        )
+
+        result = self._parse([FakePage([chart_label])])
+
+        self.assertEqual(
+            [element.raw_text for element in result.elements],
+            ["vertical chart label"],
+        )
 
     def test_two_columns_are_read_left_then_right(self) -> None:
         lines = tuple(
