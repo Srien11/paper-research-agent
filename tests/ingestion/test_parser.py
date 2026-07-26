@@ -102,6 +102,34 @@ class PdfParserTests(unittest.TestCase):
         self.assertEqual(result.pages[1].error_code, "page_extraction_error")
         self.assertEqual(len(result.elements), 1)
 
+    def test_outside_lines_are_removed_and_partial_lines_are_clipped(self) -> None:
+        pages = [
+            FakePage(
+                [
+                    {
+                        "text": "Partial",
+                        "x0": -20.0,
+                        "top": 100.0,
+                        "x1": 100.0,
+                        "bottom": 110.0,
+                    },
+                    {
+                        "text": "Hidden",
+                        "x0": 20.0,
+                        "top": -100.0,
+                        "x1": 100.0,
+                        "bottom": -90.0,
+                    },
+                    self._line("Body", top=200),
+                ]
+            )
+        ]
+
+        result = self._parse(pages)
+
+        self.assertEqual([element.raw_text for element in result.elements], ["Partial", "Body"])
+        self.assertEqual(result.elements[0].bbox, (0.0, 100.0, 100.0, 110.0))
+
     def _parse(self, pages: list[FakePage]):
         with tempfile.TemporaryDirectory() as directory:
             pdf_path = Path(directory) / "fixture.pdf"

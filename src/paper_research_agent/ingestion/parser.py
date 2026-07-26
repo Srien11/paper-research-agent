@@ -94,6 +94,10 @@ def parser_config() -> dict[str, object]:
             "sort_keys": True,
             "escape_unicode_line_separators": True,
         },
+        "bbox_policy": {
+            "discard_fully_outside_page": True,
+            "clip_partially_visible_lines": True,
+        },
     }
 
 
@@ -105,17 +109,26 @@ def extract_lines(page: object) -> tuple[TextLine, ...]:
         return_chars=False,
         layout=True,
     )
-    lines = [
-        TextLine(
-            text=str(item["text"]).strip(),
-            x0=float(item["x0"]),
-            top=float(item["top"]),
-            x1=float(item["x1"]),
-            bottom=float(item["bottom"]),
+    page_width = float(page.width)  # type: ignore[attr-defined]
+    page_height = float(page.height)  # type: ignore[attr-defined]
+    lines: list[TextLine] = []
+    for item in raw_lines:
+        text = str(item.get("text", "")).strip()
+        if not text:
+            continue
+        clipped = _clip_line_to_page(
+            TextLine(
+                text=text,
+                x0=float(item["x0"]),
+                top=float(item["top"]),
+                x1=float(item["x1"]),
+                bottom=float(item["bottom"]),
+            ),
+            page_width,
+            page_height,
         )
-        for item in raw_lines
-        if str(item.get("text", "")).strip()
-    ]
+        if clipped is not None:
+            lines.append(clipped)
     return tuple(lines)
 
 
@@ -373,3 +386,28 @@ def _margin_zone(line: TextLine, page_height: float) -> str | None:
 
 def _margin_signature(text: str) -> str:
     return _DIGITS.sub("#", normalize_text(text).casefold())
+
+
+def _clip_line_to_page(
+    line: TextLine,
+    page_width: float,
+    page_height: float,
+) -> TextLine | None:
+    values = (line.x0, line.top, line.x1, line.bottom)
+    if not all(math.isfinite(value) for value in values):
+        return None
+    if line.x1 <= 0 or line.bottom <= 0 or line.x0 >= page_width or line.top >= page_height:
+        return None
+    x0 = max(0.0, line.x0)
+    top = max(0.0, line.top)
+    x1 = min(page_width, line.x1)
+    bottom = min(page_height, line.bottom)
+    if x1 <= x0 or bottom <= top:
+        return None
+    return TextLine(
+        text=line.text,
+        x0=x0,
+        top=top,
+        x1=x1,
+        bottom=bottom,
+    )
