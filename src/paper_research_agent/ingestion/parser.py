@@ -6,6 +6,7 @@ import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import pdfplumber
 
@@ -27,7 +28,7 @@ PARSER_NAME = "pdfplumber"
 PARSER_VERSION = pdfplumber.__version__
 PARSER_CONFIG_SCHEMA_VERSION = "pdf-parser-config-v1"
 X_TOLERANCE = 2.0
-COLUMN_SPLIT_GAP_RATIO = 0.02
+COLUMN_SPLIT_GAP_RATIO = 0.018
 MARGIN_RATIO = 0.08
 REPEAT_RATIO = 0.3
 MIN_REPEAT_PAGES = 3
@@ -49,6 +50,7 @@ class TextLine:
     top: float
     x1: float
     bottom: float
+    column: Literal["left", "right"] | None = None
 
 
 @dataclass(frozen=True)
@@ -138,15 +140,71 @@ def order_page_lines(
         return ()
     midpoint = page_width / 2
     margin = page_width * 0.04
+    asymmetric_right_starts = [
+        line.x0
+        for line in lines
+        if line.column == "right" and line.x0 < midpoint - margin
+    ]
+    asymmetric_right_start = (
+        min(asymmetric_right_starts) if asymmetric_right_starts else None
+    )
+    if asymmetric_right_start is not None:
+        asymmetric_lines = [
+            line
+            for line in lines
+            if asymmetric_right_start - 1 <= line.x0 < midpoint - margin
+        ]
+        asymmetric_end = max(
+            (line.bottom for line in asymmetric_lines),
+            default=0.0,
+        )
+        upper_region = tuple(line for line in lines if line.top <= asymmetric_end)
+        lower_region = tuple(line for line in lines if line.top > asymmetric_end)
+        if upper_region and lower_region:
+            return (
+                *_order_page_region(
+                    upper_region,
+                    page_width,
+                    asymmetric_right_start,
+                ),
+                *_order_page_region(lower_region, page_width, None),
+            )
+    return _order_page_region(lines, page_width, asymmetric_right_start)
+
+
+def _order_page_region(
+    lines: tuple[TextLine, ...],
+    page_width: float,
+    asymmetric_right_start: float | None,
+) -> tuple[TextLine, ...]:
+    midpoint = page_width / 2
+    margin = page_width * 0.04
     spanning = tuple(
         line
         for line in lines
-        if (line.x0 < midpoint - margin and line.x1 > midpoint + margin)
-        or (line.x1 - line.x0) >= page_width * 0.65
+        if _classify_line(
+            line,
+            midpoint,
+            margin,
+            asymmetric_right_start,
+        )
+        is None
+        and (
+            (line.x0 < midpoint - margin and line.x1 > midpoint + margin)
+            or (line.x1 - line.x0) >= page_width * 0.65
+        )
     )
     non_spanning = tuple(line for line in lines if line not in spanning)
-    left = tuple(line for line in non_spanning if line.x1 <= midpoint + margin)
-    right = tuple(line for line in non_spanning if line.x0 >= midpoint - margin)
+    left = tuple(
+        line
+        for line in non_spanning
+        if _classify_line(line, midpoint, margin, asymmetric_right_start) == "left"
+    )
+    right = tuple(
+        line
+        for line in non_spanning
+        if _classify_line(line, midpoint, margin, asymmetric_right_start) == "right"
+    )
     two_columns = len(left) >= 3 and len(right) >= 3
     if not two_columns:
         return tuple(sorted(lines, key=lambda line: (line.top, line.x0, line.bottom)))
@@ -155,10 +213,24 @@ def order_page_lines(
     remaining = list(non_spanning)
     for separator in sorted(spanning, key=lambda line: (line.top, line.x0)):
         band = [line for line in remaining if line.top < separator.top]
-        ordered.extend(_order_column_band(band, midpoint))
+        ordered.extend(
+            _order_column_band(
+                band,
+                midpoint,
+                margin,
+                asymmetric_right_start,
+            )
+        )
         remaining = [line for line in remaining if line not in band]
         ordered.append(separator)
-    ordered.extend(_order_column_band(remaining, midpoint))
+    ordered.extend(
+        _order_column_band(
+            remaining,
+            midpoint,
+            margin,
+            asymmetric_right_start,
+        )
+    )
     return tuple(ordered)
 
 
@@ -360,16 +432,49 @@ def _raw_offsets(lines: tuple[TextLine, ...]) -> dict[int, tuple[int, int]]:
     return offsets
 
 
-def _order_column_band(lines: list[TextLine], midpoint: float) -> list[TextLine]:
+def _order_column_band(
+    lines: list[TextLine],
+    midpoint: float,
+    margin: float,
+    asymmetric_right_start: float | None,
+) -> list[TextLine]:
     left = sorted(
-        (line for line in lines if line.x0 < midpoint),
+        (
+            line
+            for line in lines
+            if _classify_line(line, midpoint, margin, asymmetric_right_start) == "left"
+        ),
         key=lambda line: (line.top, line.x0),
     )
     right = sorted(
-        (line for line in lines if line.x0 >= midpoint),
+        (
+            line
+            for line in lines
+            if _classify_line(line, midpoint, margin, asymmetric_right_start) == "right"
+        ),
         key=lambda line: (line.top, line.x0),
     )
     return [*left, *right]
+
+
+def _classify_line(
+    line: TextLine,
+    midpoint: float,
+    margin: float,
+    asymmetric_right_start: float | None,
+) -> Literal["left", "right"] | None:
+    if line.column is not None:
+        return line.column
+    if (
+        asymmetric_right_start is not None
+        and line.x0 >= asymmetric_right_start - 1
+    ):
+        return "right"
+    if line.x1 <= midpoint + margin:
+        return "left"
+    if line.x0 >= midpoint - margin:
+        return "right"
+    return None
 
 
 def _margin_zone(line: TextLine, page_height: float) -> str | None:
@@ -406,6 +511,7 @@ def _clip_line_to_page(
         top=top,
         x1=x1,
         bottom=bottom,
+        column=line.column,
     )
 
 
@@ -450,7 +556,7 @@ def _split_cross_column_line(
             zip(horizontal_chars, horizontal_chars[1:]),
             start=1,
         )
-        if float(left["x1"]) <= midpoint <= float(right["x0"])
+        if _looks_like_column_gutter(left, right, midpoint, page_width)
     ]
     if not candidates:
         return (original,) if original.text else ()
@@ -460,9 +566,23 @@ def _split_cross_column_line(
     left_chars = horizontal_chars[:split_index]
     right_chars = horizontal_chars[split_index:]
     left_text, right_text = _split_text_at_char_boundary(original.text, left_chars)
-    left_line = _chars_to_text_line(left_chars, left_text)
-    right_line = _chars_to_text_line(right_chars, right_text)
+    left_line = _chars_to_text_line(left_chars, left_text, "left")
+    right_line = _chars_to_text_line(right_chars, right_text, "right")
     return tuple(line for line in (left_line, right_line) if line.text)
+
+
+def _looks_like_column_gutter(
+    left: dict[str, object],
+    right: dict[str, object],
+    midpoint: float,
+    page_width: float,
+) -> bool:
+    left_edge = float(left["x1"])
+    right_edge = float(right["x0"])
+    if left_edge <= midpoint <= right_edge:
+        return True
+    gap_center_ratio = ((left_edge + right_edge) / 2) / page_width
+    return 0.2 <= gap_center_ratio <= 0.45
 
 
 def _item_to_text_line(item: dict[str, object]) -> TextLine:
@@ -500,6 +620,7 @@ def _split_text_at_char_boundary(
 def _chars_to_text_line(
     chars: list[dict[str, object]],
     text: str,
+    column: Literal["left", "right"],
 ) -> TextLine:
     return TextLine(
         text=text,
@@ -507,4 +628,5 @@ def _chars_to_text_line(
         top=min(float(char["top"]) for char in chars),
         x1=max(float(char["x1"]) for char in chars),
         bottom=max(float(char["bottom"]) for char in chars),
+        column=column,
     )

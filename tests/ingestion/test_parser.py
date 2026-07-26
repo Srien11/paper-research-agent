@@ -133,6 +133,32 @@ class PdfParserTests(unittest.TestCase):
         self.assertEqual(result.elements[0].raw_text, "Left words")
         self.assertEqual(result.elements[3].raw_text, "Right words")
 
+    def test_narrow_nature_style_column_gap_is_split(self) -> None:
+        lines = [
+            self._narrow_merged_line(f"L{number}", f"R{number}", top=100 + number * 20)
+            for number in range(1, 4)
+        ]
+
+        result = self._parse([FakePage(lines)])
+
+        self.assertEqual(
+            [element.raw_text for element in result.elements],
+            ["L1", "L2", "L3", "R1", "R2", "R3"],
+        )
+
+    def test_asymmetric_nature_sidebar_is_split_from_body(self) -> None:
+        lines = [
+            self._sidebar_merged_line(f"M{number}", f"B{number}", top=100 + number * 20)
+            for number in range(1, 4)
+        ]
+
+        result = self._parse([FakePage(lines)])
+
+        self.assertEqual(
+            [element.raw_text for element in result.elements],
+            ["M1", "M2", "M3", "B1", "B2", "B3"],
+        )
+
     def test_repeated_headers_and_page_numbers_are_removed(self) -> None:
         pages = [
             FakePage(
@@ -268,6 +294,44 @@ class PdfParserTests(unittest.TestCase):
             }
             for index, character in enumerate(text)
         ]
+
+    @classmethod
+    def _narrow_merged_line(
+        cls,
+        left: str,
+        right: str,
+        *,
+        top: float,
+    ) -> dict[str, object]:
+        left_chars = cls._chars(left, start=284.8, top=top)
+        right_chars = cls._chars(right, start=306.1, top=top)
+        return {
+            "text": f"{left} {right}",
+            "x0": 284.8,
+            "top": top,
+            "x1": 316.1,
+            "bottom": top + 10,
+            "chars": [*left_chars, *right_chars],
+        }
+
+    @classmethod
+    def _sidebar_merged_line(
+        cls,
+        left: str,
+        right: str,
+        *,
+        top: float,
+    ) -> dict[str, object]:
+        left_chars = cls._chars(left, start=110, top=top)
+        right_chars = cls._chars(right, start=217.3, top=top)
+        return {
+            "text": f"{left} {right}",
+            "x0": 110.0,
+            "top": top,
+            "x1": 227.3,
+            "bottom": top + 10,
+            "chars": [*left_chars, *right_chars],
+        }
 
 
 if __name__ == "__main__":
