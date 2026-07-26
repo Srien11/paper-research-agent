@@ -106,6 +106,19 @@ class PdfParserTests(unittest.TestCase):
             ["Title", "L1", "L2", "L3", "R1", "R2", "R3"],
         )
 
+    def test_merged_cross_column_lines_are_split_before_ordering(self) -> None:
+        lines = [
+            self._merged_line(f"L{number}", f"R{number}", top=100 + number * 20)
+            for number in range(1, 4)
+        ]
+
+        result = self._parse([FakePage(lines)])
+
+        self.assertEqual(
+            [element.raw_text for element in result.elements],
+            ["L1", "L2", "L3", "R1", "R2", "R3"],
+        )
+
     def test_repeated_headers_and_page_numbers_are_removed(self) -> None:
         pages = [
             FakePage(
@@ -199,6 +212,33 @@ class PdfParserTests(unittest.TestCase):
             "top": top,
             "x1": 550.0,
             "bottom": top + 10.0,
+        }
+
+    @staticmethod
+    def _merged_line(left: str, right: str, *, top: float) -> dict[str, object]:
+        chars = [
+            {
+                "text": text,
+                "x0": x0,
+                "x1": x0 + 5,
+                "top": top,
+                "bottom": top + 10,
+                "upright": True,
+            }
+            for text, x0 in [
+                (left[0], 50),
+                (left[1], 55),
+                (right[0], 350),
+                (right[1], 355),
+            ]
+        ]
+        return {
+            "text": f"{left} {right}",
+            "x0": 50.0,
+            "top": top,
+            "x1": 360.0,
+            "bottom": top + 10.0,
+            "chars": chars,
         }
 
 

@@ -27,6 +27,7 @@ PARSER_NAME = "pdfplumber"
 PARSER_VERSION = pdfplumber.__version__
 PARSER_CONFIG_SCHEMA_VERSION = "pdf-parser-config-v1"
 X_TOLERANCE = 2.0
+COLUMN_SPLIT_GAP_RATIO = 0.02
 MARGIN_RATIO = 0.08
 REPEAT_RATIO = 0.3
 MIN_REPEAT_PAGES = 3
@@ -89,6 +90,7 @@ def parser_config() -> dict[str, object]:
             "midpoint_margin_ratio": 0.04,
             "spanning_width_ratio": 0.65,
             "minimum_lines_per_column": 3,
+            "split_merged_line_gap_ratio": COLUMN_SPLIT_GAP_RATIO,
         },
         "serialization": {
             "format": "canonical-jsonl-v1",
@@ -119,22 +121,10 @@ def extract_lines(page: object) -> tuple[TextLine, ...]:
     for item in raw_lines:
         if _is_rotated_side_margin(item, page_width):
             continue
-        text = str(item.get("text", "")).strip()
-        if not text:
-            continue
-        clipped = _clip_line_to_page(
-            TextLine(
-                text=text,
-                x0=float(item["x0"]),
-                top=float(item["top"]),
-                x1=float(item["x1"]),
-                bottom=float(item["bottom"]),
-            ),
-            page_width,
-            page_height,
-        )
-        if clipped is not None:
-            lines.append(clipped)
+        for line in _split_cross_column_line(item, page_width):
+            clipped = _clip_line_to_page(line, page_width, page_height)
+            if clipped is not None:
+                lines.append(clipped)
     return tuple(lines)
 
 
@@ -430,3 +420,71 @@ def _is_rotated_side_margin(item: dict[str, object], page_width: float) -> bool:
     x0 = float(item["x0"])
     x1 = float(item["x1"])
     return x1 <= page_width * MARGIN_RATIO or x0 >= page_width * (1 - MARGIN_RATIO)
+
+
+def _split_cross_column_line(
+    item: dict[str, object],
+    page_width: float,
+) -> tuple[TextLine, ...]:
+    """按跨越页面中线的大间隙拆开被 PDF 引擎合并的左右栏同行文本。"""
+
+    original = _item_to_text_line(item)
+    chars = item.get("chars")
+    if not isinstance(chars, list):
+        return (original,) if original.text else ()
+    horizontal_chars = sorted(
+        (
+            char
+            for char in chars
+            if isinstance(char, dict)
+            and bool(char.get("upright", True))
+            and "x0" in char
+            and "x1" in char
+        ),
+        key=lambda char: float(char["x0"]),
+    )
+    midpoint = page_width / 2
+    candidates = [
+        (float(right["x0"]) - float(left["x1"]), index)
+        for index, (left, right) in enumerate(
+            zip(horizontal_chars, horizontal_chars[1:]),
+            start=1,
+        )
+        if float(left["x1"]) <= midpoint <= float(right["x0"])
+    ]
+    if not candidates:
+        return (original,) if original.text else ()
+    gap, split_index = max(candidates)
+    if gap < page_width * COLUMN_SPLIT_GAP_RATIO:
+        return (original,) if original.text else ()
+    left_line = _chars_to_text_line(horizontal_chars[:split_index])
+    right_line = _chars_to_text_line(horizontal_chars[split_index:])
+    return tuple(line for line in (left_line, right_line) if line.text)
+
+
+def _item_to_text_line(item: dict[str, object]) -> TextLine:
+    return TextLine(
+        text=str(item.get("text", "")).strip(),
+        x0=float(item["x0"]),
+        top=float(item["top"]),
+        x1=float(item["x1"]),
+        bottom=float(item["bottom"]),
+    )
+
+
+def _chars_to_text_line(chars: list[dict[str, object]]) -> TextLine:
+    parts: list[str] = []
+    previous_x1: float | None = None
+    for char in chars:
+        x0 = float(char["x0"])
+        if previous_x1 is not None and x0 - previous_x1 > X_TOLERANCE:
+            parts.append(" ")
+        parts.append(str(char.get("text", "")))
+        previous_x1 = float(char["x1"])
+    return TextLine(
+        text="".join(parts).strip(),
+        x0=min(float(char["x0"]) for char in chars),
+        top=min(float(char["top"]) for char in chars),
+        x1=max(float(char["x1"]) for char in chars),
+        bottom=max(float(char["bottom"]) for char in chars),
+    )
