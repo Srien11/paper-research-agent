@@ -65,6 +65,8 @@ class RetrievalService:
                 page_start=chunk.page_start,
                 page_end=chunk.page_end,
                 text_sha256=chunk.text_sha256,
+                evidence_type=chunk.evidence_type,
+                figure=chunk.figure,
                 scores=scores,
                 ranks={**ranks, "final": rank},
                 final_score=score,

@@ -35,6 +35,8 @@ def join_retrieval_evidence(
             hit.page_start,
             hit.page_end,
             hit.text_sha256,
+            hit.evidence_type,
+            hit.figure,
         )
         actual = (
             matched_chunk.corpus_id,
@@ -43,6 +45,8 @@ def join_retrieval_evidence(
             matched_chunk.page_start,
             matched_chunk.page_end,
             matched_chunk.text_sha256,
+            matched_chunk.evidence_type,
+            matched_chunk.figure,
         )
         if expected != actual:
             raise EvidenceJoinError(f"retrieval metadata does not match source chunk: {hit.chunk_id}")
@@ -56,6 +60,8 @@ def join_retrieval_evidence(
                 page_end=matched_chunk.page_end,
                 text=matched_chunk.text,
                 text_sha256=matched_chunk.text_sha256,
+                evidence_type=matched_chunk.evidence_type,
+                figure=matched_chunk.figure,
                 final_score=hit.final_score,
                 final_rank=hit.final_rank,
             )

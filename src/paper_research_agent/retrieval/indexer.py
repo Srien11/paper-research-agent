@@ -1,4 +1,4 @@
-"""Persist a FAISS IndexFlatIP plus text-free SQLite chunk metadata."""
+"""持久化 FAISS IndexFlatIP 与可追溯的 SQLite 检索元数据。"""
 
 from __future__ import annotations
 
@@ -6,6 +6,8 @@ import hashlib
 import json
 import platform
 import sqlite3
+from collections.abc import Sequence
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -39,38 +41,7 @@ def build_index(
     faiss_path = output_dir / "vectors.faiss"
     metadata_path = output_dir / "metadata.sqlite"
     faiss.write_index(faiss_index, str(faiss_path))
-    with sqlite3.connect(metadata_path) as connection:
-        connection.execute("DROP TABLE IF EXISTS chunks")
-        connection.execute(
-            """
-            CREATE TABLE chunks (
-                position INTEGER PRIMARY KEY,
-                chunk_id TEXT UNIQUE NOT NULL,
-                corpus_id TEXT NOT NULL,
-                asset_id TEXT NOT NULL,
-                section_id TEXT,
-                page_start INTEGER NOT NULL,
-                page_end INTEGER NOT NULL,
-                text_sha256 TEXT NOT NULL
-            )
-            """
-        )
-        connection.executemany(
-            "INSERT INTO chunks VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            [
-                (
-                    position,
-                    chunk.chunk_id,
-                    chunk.corpus_id,
-                    chunk.asset_id,
-                    chunk.section_id,
-                    chunk.page_start,
-                    chunk.page_end,
-                    chunk.text_sha256,
-                )
-                for position, chunk in enumerate(vector_index.chunks)
-            ],
-        )
+    write_chunk_metadata(vector_index.chunks, metadata_path)
     files_sha256 = {
         path.name: hashlib.sha256(path.read_bytes()).hexdigest()
         for path in (faiss_path, metadata_path)
@@ -96,3 +67,51 @@ def build_index(
         encoding="utf-8",
     )
     return manifest
+
+
+def write_chunk_metadata(
+    chunks: Sequence[EvidenceChunk],
+    metadata_path: Path,
+) -> None:
+    """写入与向量位置严格对齐的本地检索元数据。"""
+
+    with closing(sqlite3.connect(metadata_path)) as connection, connection:
+        connection.execute("DROP TABLE IF EXISTS chunks")
+        connection.execute(
+            """
+            CREATE TABLE chunks (
+                position INTEGER PRIMARY KEY,
+                chunk_id TEXT UNIQUE NOT NULL,
+                corpus_id TEXT NOT NULL,
+                asset_id TEXT NOT NULL,
+                section_id TEXT,
+                page_start INTEGER NOT NULL,
+                page_end INTEGER NOT NULL,
+                text_sha256 TEXT NOT NULL,
+                evidence_type TEXT NOT NULL,
+                figure_json TEXT
+            )
+            """
+        )
+        connection.executemany(
+            "INSERT INTO chunks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    position,
+                    chunk.chunk_id,
+                    chunk.corpus_id,
+                    chunk.asset_id,
+                    chunk.section_id,
+                    chunk.page_start,
+                    chunk.page_end,
+                    chunk.text_sha256,
+                    chunk.evidence_type,
+                    (
+                        chunk.figure.model_dump_json()
+                        if chunk.figure is not None
+                        else None
+                    ),
+                )
+                for position, chunk in enumerate(chunks)
+            ],
+        )

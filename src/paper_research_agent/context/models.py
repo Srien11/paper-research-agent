@@ -7,6 +7,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from paper_research_agent.figures.models import FigureRecord
 from paper_research_agent.ingestion.models import Sha256
 
 
@@ -25,6 +26,8 @@ class ContextEvidence(FrozenContract):
     page_end: int = Field(ge=1)
     text: str = Field(min_length=1)
     text_sha256: Sha256
+    evidence_type: Literal["text", "figure_summary"] = "text"
+    figure: FigureRecord | None = None
     final_score: float
     final_rank: int = Field(gt=0)
 
@@ -35,6 +38,10 @@ class ContextEvidence(FrozenContract):
         actual_sha256 = hashlib.sha256(self.text.encode("utf-8")).hexdigest()
         if self.text_sha256 != actual_sha256:
             raise ValueError("context evidence text_sha256 does not match text")
+        if self.evidence_type == "figure_summary" and self.figure is None:
+            raise ValueError("图片摘要证据必须携带完整图片记录")
+        if self.evidence_type == "text" and self.figure is not None:
+            raise ValueError("正文证据不能携带图片记录")
         return self
 
 
@@ -49,11 +56,17 @@ class CitationRef(FrozenContract):
     page_start: int = Field(ge=1)
     page_end: int = Field(ge=1)
     text_sha256: Sha256
+    evidence_type: Literal["text", "figure_summary"] = "text"
+    figure: FigureRecord | None = None
 
     @model_validator(mode="after")
     def validate_pages(self) -> CitationRef:
         if self.page_end < self.page_start:
             raise ValueError("citation page range is reversed")
+        if self.evidence_type == "figure_summary" and self.figure is None:
+            raise ValueError("图片摘要引用必须携带完整图片记录")
+        if self.evidence_type == "text" and self.figure is not None:
+            raise ValueError("正文引用不能携带图片记录")
         return self
 
 

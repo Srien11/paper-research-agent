@@ -6,6 +6,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from paper_research_agent.figures.models import FigureRecord
 from paper_research_agent.ingestion.models import Sha256
 
 
@@ -35,6 +36,8 @@ class SearchHit(FrozenContract):
     page_start: int = Field(ge=1)
     page_end: int = Field(ge=1)
     text_sha256: Sha256
+    evidence_type: Literal["text", "figure_summary"] = "text"
+    figure: FigureRecord | None = None
     scores: dict[str, float] = {}
     ranks: dict[str, int] = {}
     final_score: float
@@ -46,6 +49,10 @@ class SearchHit(FrozenContract):
             raise ValueError("search hit page range is reversed")
         if any(rank <= 0 for rank in self.ranks.values()):
             raise ValueError("stage ranks must be positive")
+        if self.evidence_type == "figure_summary" and self.figure is None:
+            raise ValueError("图片摘要命中必须携带完整图片记录")
+        if self.evidence_type == "text" and self.figure is not None:
+            raise ValueError("正文命中不能携带图片记录")
         return self
 
 

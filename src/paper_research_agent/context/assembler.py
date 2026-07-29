@@ -62,6 +62,8 @@ def _citation(evidence: ContextEvidence, position: int) -> CitationRef:
         page_start=evidence.page_start,
         page_end=evidence.page_end,
         text_sha256=evidence.text_sha256,
+        evidence_type=evidence.evidence_type,
+        figure=evidence.figure,
     )
 
 
@@ -77,6 +79,12 @@ def _evidence_message(
             "citation_marker": f"[{citation.citation_id}]",
             "corpus_id": evidence.corpus_id,
             "final_rank": evidence.final_rank,
+            "evidence_type": evidence.evidence_type,
+            "figure": (
+                evidence.figure.model_dump(mode="json")
+                if evidence.figure is not None
+                else None
+            ),
             "page_end": evidence.page_end,
             "page_start": evidence.page_start,
             "section_id": evidence.section_id,
