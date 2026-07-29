@@ -17,7 +17,6 @@ _FIGURE_NAME = re.compile(
     re.IGNORECASE,
 )
 _GRAPHIC_OBJECT_TYPES = ("image", "curve", "rect", "line")
-_OBJECT_GROUP_GAP = 24.0
 _CROP_PADDING = 8.0
 
 BBox = tuple[float, float, float, float]
@@ -81,7 +80,10 @@ def detect_figure_bbox(
         and _horizontal_overlap_ratio(bbox, band_x0, band_x1) >= 0.3
         and not _is_page_sized_decoration(bbox, page_width, page_height)
     ]
-    groups = _group_vertically(candidates)
+    groups = _group_vertically(
+        candidates,
+        max_gap=max(24.0, min(72.0, page_height * 0.085)),
+    )
     usable = [
         group
         for group in groups
@@ -215,10 +217,10 @@ def _caption_column_band(
     wide = caption_x1 - caption_x0 >= page_width * 0.45
     if central or wide:
         return margin, page_width - margin
-    gutter = page_width * 0.018
+    gutter_overlap = page_width * 0.01
     if center < midpoint:
-        return margin, midpoint - gutter
-    return midpoint + gutter, page_width - margin
+        return margin, midpoint + gutter_overlap
+    return midpoint - gutter_overlap, page_width - margin
 
 
 def _graphic_bboxes(
@@ -241,14 +243,18 @@ def _graphic_bboxes(
     return result
 
 
-def _group_vertically(bboxes: Iterable[BBox]) -> list[BBox]:
+def _group_vertically(
+    bboxes: Iterable[BBox],
+    *,
+    max_gap: float,
+) -> list[BBox]:
     ordered = sorted(bboxes, key=lambda bbox: (bbox[1], bbox[0], bbox[3], bbox[2]))
     if not ordered:
         return []
     groups: list[BBox] = []
     current = ordered[0]
     for bbox in ordered[1:]:
-        if bbox[1] <= current[3] + _OBJECT_GROUP_GAP:
+        if bbox[1] <= current[3] + max_gap:
             current = _union_bbox(current, bbox)
         else:
             groups.append(current)
@@ -265,9 +271,9 @@ def _padded_bbox(
     band_x1: float,
 ) -> BBox:
     return (
-        max(band_x0, bbox[0] - _CROP_PADDING),
+        band_x0,
         max(page_height * 0.02, bbox[1] - _CROP_PADDING),
-        min(band_x1, bbox[2] + _CROP_PADDING),
+        band_x1,
         min(page_height * 0.98, bbox[3] + _CROP_PADDING),
     )
 

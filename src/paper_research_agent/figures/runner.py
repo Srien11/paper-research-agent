@@ -8,6 +8,7 @@ from pathlib import Path
 from paper_research_agent.corpus import load_frozen_papers
 from paper_research_agent.figures.cropper import FigureCrop, crop_pdf_figures
 from paper_research_agent.ingestion.models import DocumentElement
+from paper_research_agent.ingestion.text import normalize_text
 
 
 def run_figure_cropping(
@@ -50,9 +51,19 @@ def run_figure_cropping(
     if limit is not None:
         captions = captions[:limit]
 
+    page_elements: dict[tuple[str, int], list[DocumentElement]] = {}
+    for element in elements:
+        page_elements.setdefault((element.corpus_id, element.page_number), []).append(
+            element
+        )
     grouped: dict[str, list[dict[str, object]]] = {}
     for caption in captions:
-        grouped.setdefault(caption.corpus_id, []).append(caption.model_dump(mode="json"))
+        payload = caption.model_dump(mode="json")
+        payload["normalized_text"] = merge_caption_text(
+            caption,
+            page_elements[(caption.corpus_id, caption.page_number)],
+        )
+        grouped.setdefault(caption.corpus_id, []).append(payload)
 
     crops: list[FigureCrop] = []
     for corpus_id in sorted(grouped):
@@ -83,4 +94,79 @@ def run_figure_cropping(
     temporary_path = manifest_path.with_suffix(".jsonl.tmp")
     temporary_path.write_text(content, encoding="utf-8")
     temporary_path.replace(manifest_path)
+    prune_orphaned_crops(output_dir, crops)
     return manifest_path, crops
+
+
+def merge_caption_text(
+    caption: DocumentElement,
+    page_elements: list[DocumentElement],
+) -> str:
+    """合并同栏、紧邻图注首行的后续文本行。"""
+
+    if caption.bbox is None:
+        return caption.normalized_text
+    ordered = sorted(page_elements, key=lambda element: element.reading_order)
+    try:
+        position = next(
+            index
+            for index, element in enumerate(ordered)
+            if element.element_id == caption.element_id
+        )
+    except StopIteration:
+        return caption.normalized_text
+
+    x0, top, x1, bottom = caption.bbox
+    line_height = max(1.0, bottom - top)
+    current_bottom = bottom
+    parts = [caption.normalized_text]
+    for candidate in ordered[position + 1 :]:
+        if candidate.bbox is None:
+            break
+        if candidate.element_type in {
+            "title",
+            "heading",
+            "table_caption",
+            "figure_caption",
+            "reference",
+        }:
+            break
+        candidate_x0, candidate_top, candidate_x1, candidate_bottom = candidate.bbox
+        if candidate_top > current_bottom + max(6.0, line_height * 0.9):
+            break
+        if candidate_x1 < x0 - 6 or candidate_x0 > x1 + 6:
+            break
+        parts.append(candidate.normalized_text)
+        current_bottom = max(current_bottom, candidate_bottom)
+    return normalize_text(" ".join(parts))
+
+
+def prune_orphaned_crops(
+    output_dir: Path,
+    crops: list[FigureCrop],
+) -> int:
+    """只删除当前图片输出目录中未被候选清单引用的旧 PNG。"""
+
+    output_root = output_dir.resolve()
+    figures_root = (output_root / "figures").resolve()
+    try:
+        figures_root.relative_to(output_root)
+    except ValueError as error:
+        raise ValueError("图片目录越出输出目录") from error
+    referenced: set[Path] = set()
+    for crop in crops:
+        path = (output_root / crop.image_path).resolve()
+        try:
+            path.relative_to(figures_root)
+        except ValueError as error:
+            raise ValueError("候选图片路径越出图片目录") from error
+        referenced.add(path)
+    if not figures_root.exists():
+        return 0
+    removed = 0
+    for path in figures_root.rglob("*.png"):
+        resolved = path.resolve()
+        if resolved not in referenced:
+            path.unlink()
+            removed += 1
+    return removed
