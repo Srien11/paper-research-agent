@@ -16,6 +16,8 @@ dependencies = [
 ingestion = [
   "pdfplumber>=0.11.10,<0.12",
   "pypdf>=6.14,<7",
+  "pypdfium2>=5.12,<6",
+  "Pillow>=12.3,<13",
 ]
 retrieval = [
   "numpy>=2.2,<3",
