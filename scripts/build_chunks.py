@@ -18,8 +18,19 @@ def main() -> None:
         "--config", type=Path, default=PROJECT_ROOT / "configs/chunking/baseline-v1.json"
     )
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--figures",
+        type=Path,
+        help="可选的 figures.jsonl；提供后将图片摘要作为独立检索块合并。",
+    )
     args = parser.parse_args()
-    for path in run_chunking(args.elements, args.sections, args.config, args.output):
+    for path in run_chunking(
+        args.elements,
+        args.sections,
+        args.config,
+        args.output,
+        figures_path=args.figures,
+    ):
         print(path)
 
 

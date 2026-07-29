@@ -6,10 +6,11 @@ import hashlib
 import json
 import re
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
 from paper_research_agent.chunking.models import EvidenceChunk, PaperCard
+from paper_research_agent.figures.models import FigureRecord
 from paper_research_agent.ingestion.models import DocumentElement
 from paper_research_agent.retrieval.config import ChunkingConfig
 
@@ -103,6 +104,69 @@ def build_chunks(
             item.chunk_id,
         ),
     )
+
+
+def build_figure_chunks(
+    figures: Iterable[FigureRecord],
+    config: ChunkingConfig,
+    *,
+    corpus_by_asset: Mapping[str, str],
+) -> list[EvidenceChunk]:
+    """把每张图片的可检索语义转换为一个独立证据块。"""
+
+    config_hash = canonical_sha256(config.model_dump(mode="json"))
+    chunks: list[EvidenceChunk] = []
+    seen_ids: set[str] = set()
+    for figure in sorted(
+        figures,
+        key=lambda item: (
+            item.asset_id,
+            item.page_number,
+            item.figure_name,
+            item.figure_id,
+        ),
+    ):
+        if figure.figure_id in seen_ids:
+            raise ValueError(f"重复 figure_id: {figure.figure_id}")
+        seen_ids.add(figure.figure_id)
+        corpus_id = corpus_by_asset.get(figure.asset_id)
+        if corpus_id is None:
+            raise ValueError(f"图片没有对应语料编号: {figure.asset_id}")
+        findings = "\n".join(f"- {finding}" for finding in figure.key_findings)
+        parts = [
+            f"图片名称：{figure.figure_name}",
+            f"图片类型：{figure.figure_type}",
+            f"原始图注：{figure.caption}",
+            f"视觉摘要：{figure.summary}",
+        ]
+        if findings:
+            parts.append(f"关键发现：\n{findings}")
+        text = "\n".join(parts)
+        tokens = tokenize(text)
+        identity = {
+            "figure": figure.model_dump(mode="json"),
+            "text": text,
+            "config_sha256": config_hash,
+        }
+        chunks.append(
+            EvidenceChunk(
+                chunk_id=f"chk_{canonical_sha256(identity)[:24]}",
+                asset_id=figure.asset_id,
+                corpus_id=corpus_id,
+                element_ids=(figure.figure_id,),
+                page_start=figure.page_number,
+                page_end=figure.page_number,
+                token_start=0,
+                token_end=len(tokens),
+                text=text,
+                text_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                config_sha256=config_hash,
+                evidence_type="figure_summary",
+                content_origin="generated",
+                figure=figure,
+            )
+        )
+    return chunks
 
 
 def build_paper_cards(

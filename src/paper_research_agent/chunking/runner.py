@@ -8,7 +8,12 @@ from typing import TypeVar
 
 from pydantic import BaseModel
 
-from paper_research_agent.chunking.chunker import build_chunks, build_paper_cards
+from paper_research_agent.chunking.chunker import (
+    build_chunks,
+    build_figure_chunks,
+    build_paper_cards,
+)
+from paper_research_agent.figures.models import FigureRecord
 from paper_research_agent.ingestion.models import DocumentElement, SectionRecord
 from paper_research_agent.retrieval.config import load_chunking_config
 
@@ -34,6 +39,8 @@ def run_chunking(
     sections_path: Path,
     config_path: Path,
     output_dir: Path | None = None,
+    *,
+    figures_path: Path | None = None,
 ) -> tuple[Path, Path]:
     config = load_chunking_config(config_path)
     elements = _read_jsonl(elements_path, DocumentElement)
@@ -44,6 +51,25 @@ def run_chunking(
         if section.title_normalized.strip().casefold() == "abstract"
     }
     chunks = build_chunks(elements, config, abstract_section_ids=abstract_ids)
+    if figures_path is not None:
+        corpus_by_asset = {element.asset_id: element.corpus_id for element in elements}
+        figures = _read_jsonl(figures_path, FigureRecord)
+        chunks.extend(
+            build_figure_chunks(
+                figures,
+                config,
+                corpus_by_asset=corpus_by_asset,
+            )
+        )
+        chunks.sort(
+            key=lambda item: (
+                item.corpus_id,
+                item.page_start,
+                item.section_id or "",
+                item.token_start,
+                item.chunk_id,
+            )
+        )
     cards = build_paper_cards(elements, chunks, config, abstract_section_ids=abstract_ids)
     target = output_dir or config.output_dir
     chunks_path = target / "chunks.jsonl"
