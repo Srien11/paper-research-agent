@@ -14,6 +14,28 @@ from paper_research_agent.figures.models import FigureRecord
 
 
 class EvidenceChunkContractTests(unittest.TestCase):
+    def test_legacy_text_chunk_remains_readable(self) -> None:
+        chunk = EvidenceChunk.model_validate(
+            {
+                "schema_version": "evidence-chunk-v1",
+                "chunk_id": "c1",
+                "asset_id": "a1",
+                "corpus_id": "C001",
+                "element_ids": ["e1"],
+                "page_start": 1,
+                "page_end": 1,
+                "token_start": 0,
+                "token_end": 1,
+                "text": "x",
+                "text_sha256": "0" * 64,
+                "config_sha256": "1" * 64,
+                "content_origin": "source_text",
+            }
+        )
+        self.assertEqual(chunk.schema_version, "evidence-chunk-v1")
+        self.assertEqual(chunk.evidence_type, "text")
+        self.assertIsNone(chunk.figure)
+
     def test_invalid_page_range_is_rejected(self) -> None:
         with self.assertRaises(ValidationError):
             EvidenceChunk(

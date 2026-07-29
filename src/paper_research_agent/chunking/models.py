@@ -15,7 +15,7 @@ class FrozenContract(BaseModel):
 
 
 class EvidenceChunk(FrozenContract):
-    schema_version: Literal["evidence-chunk-v2"] = "evidence-chunk-v2"
+    schema_version: Literal["evidence-chunk-v1", "evidence-chunk-v2"] = "evidence-chunk-v2"
     chunk_id: str = Field(min_length=1)
     asset_id: str = Field(min_length=1)
     corpus_id: str = Field(pattern=r"^[CT]\d{3}$")
