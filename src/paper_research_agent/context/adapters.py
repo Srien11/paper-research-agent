@@ -6,7 +6,7 @@ from collections.abc import Iterable
 
 from paper_research_agent.chunking.models import EvidenceChunk
 from paper_research_agent.context.models import ContextEvidence
-from paper_research_agent.retrieval.contracts import RetrievalRun
+from paper_research_agent.retrieval.contracts import BilingualRetrievalRun, RetrievalRun
 
 
 class EvidenceJoinError(ValueError):
@@ -14,9 +14,13 @@ class EvidenceJoinError(ValueError):
 
 
 def join_retrieval_evidence(
-    run: RetrievalRun,
+    run: RetrievalRun | BilingualRetrievalRun,
     chunks: Iterable[EvidenceChunk],
 ) -> tuple[ContextEvidence, ...]:
+    if isinstance(run, BilingualRetrievalRun) and run.rights_status != "loaded":
+        raise EvidenceJoinError(
+            "bilingual retrieval rights were not loaded; context assembly fails closed"
+        )
     chunk_map: dict[str, EvidenceChunk] = {}
     for source_chunk in chunks:
         if source_chunk.chunk_id in chunk_map:
@@ -49,7 +53,9 @@ def join_retrieval_evidence(
             matched_chunk.figure,
         )
         if expected != actual:
-            raise EvidenceJoinError(f"retrieval metadata does not match source chunk: {hit.chunk_id}")
+            raise EvidenceJoinError(
+                f"retrieval metadata does not match source chunk: {hit.chunk_id}"
+            )
         evidence.append(
             ContextEvidence(
                 chunk_id=matched_chunk.chunk_id,

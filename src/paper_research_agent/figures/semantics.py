@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -19,11 +21,14 @@ def run_figure_summarization(
     summarizer: VisionSummarizer,
     *,
     limit: int | None = None,
+    workers: int = 1,
 ) -> list[FigureRecord]:
     """逐张生成图片语义并可恢复地写入 figures.jsonl。"""
 
     if limit is not None and limit <= 0:
         raise ValueError("limit 必须为正整数")
+    if workers <= 0:
+        raise ValueError("workers 必须为正整数")
     candidates = [
         json.loads(line)
         for line in candidates_path.read_text(encoding="utf-8").splitlines()
@@ -40,34 +45,41 @@ def run_figure_summarization(
     if unknown_existing:
         raise ValueError("现有图片语义记录不属于当前候选清单")
 
-    root = candidates_path.parent.resolve()
+    pending: list[Mapping[str, Any]] = []
     for candidate in candidates:
         figure_id = str(candidate["figure_id"])
-        if figure_id in records_by_id:
+        existing_record = records_by_id.get(figure_id)
+        if (
+            existing_record is not None
+            and existing_record.prompt_version == summarizer.prompt_version
+        ):
             continue
-        image_path = _resolve_image_path(root, str(candidate["image_path"]))
-        summary = summarizer.summarize(
-            image_path,
-            figure_name=str(candidate["figure_name"]),
-            caption=str(candidate["caption"]),
-        )
-        record = FigureRecord(
-            figure_id=figure_id,
-            asset_id=str(candidate["asset_id"]),
-            figure_name=str(candidate["figure_name"]),
-            page_number=int(candidate["page_number"]),
-            bbox=_parse_bbox(candidate["bbox"]),
-            caption=str(candidate["caption"]),
-            image_path=str(candidate["image_path"]),
-            figure_type=summary.figure_type,
-            summary=summary.summary,
-            key_findings=summary.key_findings,
-            recognition_confidence=summary.recognition_confidence,
-            model_id=summarizer.model_id,
-            prompt_version=summarizer.prompt_version,
-        )
-        records_by_id[record.figure_id] = record
-        _write_records(output_path, list(records_by_id.values()))
+        pending.append(candidate)
+
+    root = candidates_path.parent.resolve()
+    if workers == 1:
+        for candidate in pending:
+            record = _summarize_candidate(root, candidate, summarizer)
+            records_by_id[record.figure_id] = record
+            _write_records(output_path, list(records_by_id.values()))
+    else:
+        executor = ThreadPoolExecutor(max_workers=workers)
+        futures: dict[Future[FigureRecord], Mapping[str, Any]] = {
+            executor.submit(_summarize_candidate, root, candidate, summarizer): candidate
+            for candidate in pending
+        }
+        try:
+            for future in as_completed(futures):
+                record = future.result()
+                records_by_id[record.figure_id] = record
+                _write_records(output_path, list(records_by_id.values()))
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            executor.shutdown(wait=True, cancel_futures=True)
+            raise
+        else:
+            executor.shutdown(wait=True)
     return sorted(
         records_by_id.values(),
         key=lambda record: (
@@ -76,6 +88,35 @@ def run_figure_summarization(
             record.figure_name,
             record.figure_id,
         ),
+    )
+
+
+def _summarize_candidate(
+    root: Path,
+    candidate: Mapping[str, Any],
+    summarizer: VisionSummarizer,
+) -> FigureRecord:
+    image_path = _resolve_image_path(root, str(candidate["image_path"]))
+    result = summarizer.summarize(
+        image_path,
+        figure_name=str(candidate["figure_name"]),
+        caption=str(candidate["caption"]),
+    )
+    summary = result.summary
+    return FigureRecord(
+        figure_id=str(candidate["figure_id"]),
+        asset_id=str(candidate["asset_id"]),
+        figure_name=str(candidate["figure_name"]),
+        page_number=int(candidate["page_number"]),
+        bbox=_parse_bbox(candidate["bbox"]),
+        caption=str(candidate["caption"]),
+        image_path=str(candidate["image_path"]),
+        figure_type=summary.figure_type,
+        summary=summary.summary,
+        key_findings=summary.key_findings,
+        recognition_confidence=summary.recognition_confidence,
+        model_id=result.model_id,
+        prompt_version=summarizer.prompt_version,
     )
 
 

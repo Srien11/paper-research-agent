@@ -16,7 +16,8 @@
 - [x] 基线 C：混合检索 + 重排模型
 - [x] 分层、预算受控且可引用的 RAG 上下文组装
 - [x] 图片信息契约、806 张图表裁剪与图文混合检索链路
-- [ ] 806 张图表的视觉模型摘要与图文混合索引重建
+- [x] 806 张图表的视觉模型摘要与图文混合索引重建
+- [x] 中文问题到英文科研检索式的双路在线检索编排
 - [ ] 多步研究 Agent
 
 详细安排见[RAG 检索基线实施计划](docs/plans/2026-07-26-RAG检索基线实施计划.md)。
@@ -27,7 +28,7 @@
 
 ```powershell
 Copy-Item .env.example .env
-$env:PRA_CORPUS_DIR = 'D:\agent-study\kf\research_collection'
+$env:PRA_CORPUS_DIR = 'D:\path\to\research_collection'
 ```
 
 当前冻结版本：
@@ -42,8 +43,8 @@ llm-eval-reliability-v1.0.0-2026-07-26
 ```powershell
 $env:PYTHONPATH = 'src'
 python -m unittest discover -s tests -v
-python scripts/validate_corpus.py --corpus-dir D:\agent-study\kf\research_collection
-python scripts/parse_corpus.py --corpus-dir D:\agent-study\kf\research_collection
+python scripts/validate_corpus.py --corpus-dir D:\path\to\research_collection
+python scripts/parse_corpus.py --corpus-dir D:\path\to\research_collection
 
 # 以下 BUILD_DIR 替换为本地最新解析产物目录
 python scripts/build_chunks.py `
@@ -57,6 +58,33 @@ python scripts/evaluate_retrieval.py `
   --chunks data/processed/chunks/chunks.jsonl
 ```
 
+中文生产查询使用独立的双路入口，不改变原有 A/B/C 基线，也不需要重新分块或生成向量：
+
+```powershell
+$env:DASHSCOPE_API_KEY = '<本机 Key>'
+$env:PRA_CORPUS_DIR = 'D:\path\to\research_collection'
+python scripts/search.py "哪些方法能降低 RAG 在 TruthfulQA 上的幻觉？" `
+  --bilingual `
+  --chunks data/processed/chunks/chunks.jsonl
+```
+
+收到查询后，中文 `BM25 + BGE` 召回会与 Qwen 英文科研检索式改写并行启动；中英文
+各自先做一次路内 RRF，再做跨语言 RRF，最后只使用英文改写查询执行一次英文
+Reranker。改写总截止时间默认 2 秒，超时、网络错误、限流或无效 JSON 均返回中文混合
+召回结果，不经过英文 Reranker；没有配置 Key 时同样安全降级。配置见
+`configs/retrieval/bilingual-qwen-v1.json`。
+
+改写缓存和查询审计分别保存在 `data/runtime/query-rewrite-v1.sqlite3` 与
+`data/runtime/query-audit-v1.sqlite3`，不与索引元数据共库。成功改写 90 天内直接命中，
+365 天内只在 API 失败时作为过期缓存降级；审计中的中英文查询明文保留 30 天，之后仅
+保留查询哈希、模型/提示词版本、各阶段排名、分数和延迟。审计不写证据正文、图注、
+`figure_json`、绝对路径、请求/响应体或密钥。
+
+百炼请求只包含固定改写提示词和当前用户问题，不上传论文正文、图片摘要或命中证据。
+传入 `--corpus-dir`（或设置 `PRA_CORPUS_DIR`）后，结果会附带命中论文的
+`storage_class`。双路结果若没有加载版权映射，可以在本地查看排名，但后续上下文组装会
+拒绝继续，避免把 `internal_research_only` 边界默认为可公开。
+
 图片语义入库分为三个阶段。裁剪阶段不调用视觉模型，也不会上传图片：
 
 ```powershell
@@ -66,11 +94,37 @@ python scripts/crop_figures.py `
   --output data/processed/figure-semantics-v1
 ```
 
-视觉摘要阶段要求已安装并配置可用的 `z-ai` 命令行；`model-id` 必须填写实际
-视觉模型及版本，不能用占位名称：
+视觉摘要支持百炼实时 API 和 `z-ai` 命令行。百炼接入使用创建 API Key 时一并显示的
+业务空间专属 API Host；密钥只通过环境变量读取，不能写入命令、日志或仓库：
+
+```powershell
+$env:DASHSCOPE_API_KEY = '<本机新建或重置后的 Key>'
+$env:DASHSCOPE_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1'
+python scripts/summarize_figures.py `
+  --provider dashscope `
+  --candidates data/processed/figure-semantics-v1/figure_candidates.jsonl `
+  --model-id qwen3.7-plus `
+  --model-id qwen3.7-plus-2026-05-26 `
+  --workers 4
+```
+
+多个 `--model-id` 按顺序使用。仅当平台明确返回
+`AllocationQuota.FreeTierOnly` 时才切换下一个模型；普通网络错误、限流和无效 JSON
+会在当前模型重试。若允许免费额度用尽后按量付费，应在百炼控制台关闭“免费额度用完
+即停”，平台会自动按“免费额度 → 资源包 → 节省计划 → 按量付费”扣减，此时通常无需
+配置第二个模型。命令结束会输出各模型的实际输入、输出和总 Token；每成功一张即原子
+更新 `figures.jsonl`，重跑可断点续传。`--workers 4` 会并发处理 4 张图片；若限流频繁，
+可改为 `--workers 2`，程序会遵循 `Retry-After` 并指数退避。
+
+未配置 `DASHSCOPE_BASE_URL` 时默认使用上面的北京共享端点；若能从控制台取得业务空间
+专属 API Host，仍优先使用专属端点。JSON 模式默认不设置输出 Token 硬上限，避免在
+JSON 对象中途截断；摘要长度由提示词约束。
+
+也可以使用原有 `z-ai` 命令行；`model-id` 必须填写实际视觉模型及版本，不能用占位名称：
 
 ```powershell
 python scripts/summarize_figures.py `
+  --provider zai-cli `
   --candidates data/processed/figure-semantics-v1/figure_candidates.jsonl `
   --model-id "<实际视觉模型及版本>"
 ```
@@ -114,8 +168,9 @@ python scripts/assemble_context.py `
 - 冻结清单中的选题理由、挑战提示和问题创意不得进入索引。
 
 全量文本解析已覆盖 2286/2286 页，并通过跨记录完整性审计和 14 篇、42 页
-视觉抽检。806 个图注对应区域已经裁剪为本地图片，但尚未调用视觉模型生成全量摘要，
-当前生产索引仍是文本索引，不能将本阶段称为完整多模态 PDF 解析。
+视觉抽检。806 个图注对应区域已裁剪并由 `qwen3.7-plus` 生成结构化视觉摘要；当前统一
+索引包含 5,446 个正文块和 806 个图片语义块，共 6,252 个 384 维向量。图片采用“视觉
+模型转语义文本，再由文本 Embedding 入库”的方案，并非直接对图片像素生成向量。
 
 检索评测使用开发期单审阅者银标集，不是密封测试集。下一步应由第二名审阅者独立标注
 论文相关性与证据片段，解决分歧后冻结人工金标测试集；在此之前不得据此宣称泛化效果。

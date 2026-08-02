@@ -81,6 +81,37 @@ class RetrievalConfig(FrozenConfig):
         return self
 
 
+class BilingualRetrievalConfig(FrozenConfig):
+    """Online Chinese-to-English retrieval orchestration settings."""
+
+    schema_version: Literal["bilingual-retrieval-v1"] = "bilingual-retrieval-v1"
+    pipeline_id: str = Field(default="zh-en-two-level-rrf-v1", min_length=1)
+    rewrite_model: str = Field(default="qwen3.7-plus", min_length=1)
+    rewrite_prompt_version: Literal["query-rewrite-v1"] = "query-rewrite-v1"
+    rewrite_timeout_seconds: float = Field(default=2.0, gt=0, le=30)
+    rewrite_cache_fresh_days: int = Field(default=90, gt=0)
+    rewrite_cache_stale_days: int = Field(default=365, gt=0)
+    audit_plaintext_days: int = Field(default=30, ge=0)
+    route_rrf_k: int = Field(default=60, gt=0)
+    cache_path: Path = Path("data/runtime/query-rewrite-v1.sqlite3")
+    audit_path: Path = Path("data/runtime/query-audit-v1.sqlite3")
+
+    @field_validator("cache_path", "audit_path")
+    @classmethod
+    def require_safe_runtime_path(cls, value: Path) -> Path:
+        return _safe_project_relative_path(value)
+
+    @field_serializer("cache_path", "audit_path")
+    def serialize_runtime_path(self, value: Path) -> str:
+        return value.as_posix()
+
+    @model_validator(mode="after")
+    def require_stale_window_after_fresh_window(self) -> BilingualRetrievalConfig:
+        if self.rewrite_cache_stale_days < self.rewrite_cache_fresh_days:
+            raise ValueError("rewrite_cache_stale_days cannot be shorter than fresh days")
+        return self
+
+
 def _safe_project_relative_path(value: Path) -> Path:
     raw = str(value)
     path = PurePath(raw)
@@ -95,3 +126,7 @@ def load_chunking_config(path: Path) -> ChunkingConfig:
 
 def load_retrieval_config(path: Path) -> RetrievalConfig:
     return RetrievalConfig.model_validate(json.loads(path.read_text(encoding="utf-8")))
+
+
+def load_bilingual_retrieval_config(path: Path) -> BilingualRetrievalConfig:
+    return BilingualRetrievalConfig.model_validate(json.loads(path.read_text(encoding="utf-8")))

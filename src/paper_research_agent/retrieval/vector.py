@@ -11,7 +11,9 @@ from paper_research_agent.chunking.models import EvidenceChunk
 
 
 class Encoder(Protocol):
-    def encode(self, texts: Sequence[str]) -> Sequence[Sequence[float]]: ...
+    def encode_documents(self, texts: Sequence[str]) -> Sequence[Sequence[float]]: ...
+
+    def encode_query(self, query: str) -> Sequence[float]: ...
 
 
 class SearchableVectorIndex(Protocol):
@@ -35,7 +37,10 @@ class VectorIndex:
     def __init__(self, chunks: Sequence[EvidenceChunk], encoder: Encoder):
         self.chunks = sorted(chunks, key=lambda item: item.chunk_id)
         self.encoder = encoder
-        self.vectors = [normalize(vector) for vector in encoder.encode([item.text for item in self.chunks])]
+        self.vectors = [
+            normalize(vector)
+            for vector in encoder.encode_documents([item.text for item in self.chunks])
+        ]
         if len(self.vectors) != len(self.chunks):
             raise ValueError("encoder result count does not match chunks")
         dimensions = {len(vector) for vector in self.vectors}
@@ -53,10 +58,7 @@ class VectorIndex:
         *,
         filters: Mapping[str, str] | None = None,
     ) -> list[tuple[EvidenceChunk, float]]:
-        query_vectors = self.encoder.encode([query])
-        if len(query_vectors) != 1:
-            raise ValueError("encoder must return exactly one query vector")
-        query_vector = normalize(query_vectors[0])
+        query_vector = normalize(self.encoder.encode_query(query))
         if self.vectors and len(query_vector) != self.dimension:
             raise ValueError("query vector dimension does not match index")
         filters = filters or {}
@@ -101,10 +103,7 @@ class FaissVectorIndex:
             import numpy as np
         except ImportError as error:
             raise RuntimeError("install the retrieval extra to query a FAISS index") from error
-        query_vectors = self.encoder.encode([query])
-        if len(query_vectors) != 1:
-            raise ValueError("encoder must return exactly one query vector")
-        query_vector = normalize(query_vectors[0])
+        query_vector = normalize(self.encoder.encode_query(query))
         if len(query_vector) != self._index.d:
             raise ValueError("query vector dimension does not match FAISS index")
         scores, positions = self._index.search(

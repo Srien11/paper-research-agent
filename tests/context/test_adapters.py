@@ -11,7 +11,12 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from paper_research_agent.chunking.models import EvidenceChunk
 from paper_research_agent.context.adapters import EvidenceJoinError, join_retrieval_evidence
 from paper_research_agent.figures.models import FigureRecord
-from paper_research_agent.retrieval.contracts import RetrievalRun, SearchHit
+from paper_research_agent.retrieval.contracts import (
+    BilingualRetrievalRun,
+    QueryRewriteTrace,
+    RetrievalRun,
+    SearchHit,
+)
 
 
 def artifacts() -> tuple[RetrievalRun, EvidenceChunk]:
@@ -57,6 +62,36 @@ class ContextAdapterTests(unittest.TestCase):
         joined = join_retrieval_evidence(run, [chunk])
         self.assertEqual(joined[0].text, chunk.text)
         self.assertEqual(joined[0].final_rank, 1)
+
+    def test_bilingual_run_joins_through_the_same_evidence_boundary(self) -> None:
+        baseline, chunk = artifacts()
+        run = BilingualRetrievalRun(
+            pipeline_id="pipeline",
+            original_query="中文问题",
+            rewrite=QueryRewriteTrace(
+                status="success",
+                english_query="English query",
+                requested_model="qwen",
+                actual_model="qwen",
+                prompt_version="v1",
+                latency_ms=10,
+            ),
+            degraded=False,
+            top_k=baseline.top_k,
+            hits=baseline.hits,
+            index_id=baseline.index_id,
+            config_sha256=baseline.config_sha256,
+            storage_classes={"C001": "redistributable"},
+            rights_status="loaded",
+        )
+        joined = join_retrieval_evidence(run, [chunk])
+        self.assertEqual(joined[0].text, chunk.text)
+
+        without_rights = run.model_copy(
+            update={"storage_classes": {}, "rights_status": "not_loaded"}
+        )
+        with self.assertRaisesRegex(EvidenceJoinError, "fails closed"):
+            join_retrieval_evidence(without_rights, [chunk])
 
     def test_missing_or_mismatched_source_fails(self) -> None:
         run, chunk = artifacts()

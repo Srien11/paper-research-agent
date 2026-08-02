@@ -6,12 +6,13 @@ import json
 import shutil
 import subprocess
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
-PROMPT_VERSION = "figure-summary-v1"
+PROMPT_VERSION = "figure-summary-v2"
 
 
 class VisionSummary(BaseModel):
@@ -25,8 +26,15 @@ class VisionSummary(BaseModel):
     recognition_confidence: float = Field(ge=0, le=1)
 
 
-class VisionSummarizer(Protocol):
+@dataclass(frozen=True)
+class VisionSummaryResult:
+    """一次视觉调用的摘要及服务端实际返回的模型标识。"""
+
+    summary: VisionSummary
     model_id: str
+
+
+class VisionSummarizer(Protocol):
     prompt_version: str
 
     def summarize(
@@ -35,7 +43,7 @@ class VisionSummarizer(Protocol):
         *,
         figure_name: str,
         caption: str,
-    ) -> VisionSummary: ...
+    ) -> VisionSummaryResult: ...
 
 
 class ZaiCliVisionSummarizer:
@@ -68,7 +76,7 @@ class ZaiCliVisionSummarizer:
         *,
         figure_name: str,
         caption: str,
-    ) -> VisionSummary:
+    ) -> VisionSummaryResult:
         if not image_path.is_file():
             raise FileNotFoundError(f"图片不存在: {image_path}")
         prompt = build_summary_prompt(figure_name=figure_name, caption=caption)
@@ -91,7 +99,10 @@ class ZaiCliVisionSummarizer:
         if result.returncode != 0:
             error = result.stderr.strip() or result.stdout.strip() or "未知错误"
             raise RuntimeError(f"视觉模型调用失败: {error}")
-        return parse_summary_response(result.stdout)
+        return VisionSummaryResult(
+            summary=parse_summary_response(result.stdout),
+            model_id=self.model_id,
+        )
 
 
 def build_summary_prompt(*, figure_name: str, caption: str) -> str:
@@ -105,6 +116,8 @@ def build_summary_prompt(*, figure_name: str, caption: str) -> str:
         "JSON 必须且只能包含："
         'figure_type（图片类型）、summary（内容摘要）、key_findings（字符串数组）、'
         "recognition_confidence（0 到 1 的数字）。"
+        "summary 不超过 160 个汉字；key_findings 保留 1 至 4 条，每条不超过 80 个汉字。"
+        "涉及精确数值、坐标轴、图例、公式或模块关系时，仅记录清晰可辨的内容。"
         f"\n图片名称：{figure_name}"
         f"\n论文原始图注：{caption}"
     )

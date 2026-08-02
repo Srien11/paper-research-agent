@@ -9,7 +9,12 @@ from pydantic import ValidationError
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from paper_research_agent.retrieval.contracts import RetrievalRun, SearchHit
+from paper_research_agent.retrieval.contracts import (
+    BilingualRetrievalRun,
+    QueryRewriteTrace,
+    RetrievalRun,
+    SearchHit,
+)
 
 
 class RetrievalContractTests(unittest.TestCase):
@@ -32,4 +37,24 @@ class RetrievalContractTests(unittest.TestCase):
                 hits=(hit,),
                 index_id="i",
                 config_sha256="1" * 64,
+            )
+
+    def test_bilingual_degradation_must_match_rewrite_failure(self) -> None:
+        with self.assertRaises(ValidationError):
+            BilingualRetrievalRun(
+                pipeline_id="p",
+                original_query="中文",
+                rewrite=QueryRewriteTrace(
+                    status="timeout",
+                    requested_model="qwen",
+                    prompt_version="v1",
+                    latency_ms=1,
+                    error_class="TimeoutError",
+                ),
+                degraded=False,
+                top_k=1,
+                hits=(),
+                index_id="i",
+                config_sha256="1" * 64,
+                rights_status="not_loaded",
             )

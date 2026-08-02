@@ -13,8 +13,14 @@ class FastEmbedEncoder:
             raise RuntimeError("install the retrieval extra to use FastEmbed") from error
         self._model = TextEmbedding(model_name=model_name, revision=revision)
 
-    def encode(self, texts: Sequence[str]) -> list[list[float]]:
-        return [list(vector) for vector in self._model.embed(list(texts))]
+    def encode_documents(self, texts: Sequence[str]) -> list[list[float]]:
+        return [list(vector) for vector in self._model.passage_embed(list(texts))]
+
+    def encode_query(self, query: str) -> list[float]:
+        vectors = [list(vector) for vector in self._model.query_embed(query)]
+        if len(vectors) != 1:
+            raise ValueError("FastEmbed 必须为单条查询返回一个向量")
+        return vectors[0]
 
 
 class FastEmbedReranker:

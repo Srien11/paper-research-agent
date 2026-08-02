@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -10,7 +11,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from paper_research_agent.chunking.models import EvidenceChunk
 from paper_research_agent.context import ContextRequest, assemble_context
 from paper_research_agent.context.adapters import join_retrieval_evidence
-from paper_research_agent.retrieval.contracts import RetrievalRun
+from paper_research_agent.retrieval.contracts import BilingualRetrievalRun, RetrievalRun
 
 DEFAULT_SYSTEM_RULES = (
     "Answer only from supplied evidence. Preserve uncertainty and attach a citation "
@@ -30,7 +31,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
 
-    run = RetrievalRun.model_validate_json(args.run.read_text(encoding="utf-8"))
+    run = _load_run(args.run)
     chunks = [
         EvidenceChunk.model_validate_json(line)
         for line in args.chunks.read_text(encoding="utf-8").splitlines()
@@ -39,7 +40,7 @@ def main() -> None:
     context = assemble_context(
         ContextRequest(
             system_rules=args.system_rules,
-            user_question=args.question or run.query,
+            user_question=args.question or _run_query(run),
             evidence=join_retrieval_evidence(run, chunks),
             task_state=args.task_state,
             token_budget=args.token_budget,
@@ -53,6 +54,19 @@ def main() -> None:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(payload + "\n", encoding="utf-8")
         print(args.output)
+
+
+def _load_run(path: Path) -> RetrievalRun | BilingualRetrievalRun:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise TypeError("retrieval run must be a JSON object")
+    if payload.get("schema_version") == "bilingual-retrieval-run-v1":
+        return BilingualRetrievalRun.model_validate(payload)
+    return RetrievalRun.model_validate(payload)
+
+
+def _run_query(run: RetrievalRun | BilingualRetrievalRun) -> str:
+    return run.original_query if isinstance(run, BilingualRetrievalRun) else run.query
 
 
 if __name__ == "__main__":

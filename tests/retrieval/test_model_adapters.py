@@ -23,8 +23,16 @@ class FakeTextEmbedding:
         type(self).model_name = model_name
         type(self).revision = revision
 
-    def embed(self, documents):
+    document_call = None
+    query_call = None
+
+    def passage_embed(self, documents):
+        type(self).document_call = documents
         return (vector for vector in ((1.0, 2.0), (3.0, 4.0)))
+
+    def query_embed(self, query):
+        type(self).query_call = query
+        return (vector for vector in ((5.0, 6.0),))
 
 
 class FakeTextCrossEncoder:
@@ -52,9 +60,15 @@ class FastEmbedAdapterTests(unittest.TestCase):
     def test_encoder_uses_public_api_and_consumes_embedding_generator(self) -> None:
         with patch.dict(sys.modules, {"fastembed": self.fastembed}):
             encoder = FastEmbedEncoder("org/embedding", revision="embed-sha")
-            self.assertEqual(encoder.encode(("first", "second")), [[1.0, 2.0], [3.0, 4.0]])
+            self.assertEqual(
+                encoder.encode_documents(("first", "second")),
+                [[1.0, 2.0], [3.0, 4.0]],
+            )
+            self.assertEqual(encoder.encode_query("query"), [5.0, 6.0])
         self.assertEqual(FakeTextEmbedding.model_name, "org/embedding")
         self.assertEqual(FakeTextEmbedding.revision, "embed-sha")
+        self.assertEqual(FakeTextEmbedding.document_call, ["first", "second"])
+        self.assertEqual(FakeTextEmbedding.query_call, "query")
 
     def test_reranker_uses_v08_api_and_consumes_score_generator(self) -> None:
         modules = {

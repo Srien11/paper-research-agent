@@ -9,6 +9,7 @@ description = "面向小型论文语料的可复现、证据可追溯 RAG 检索
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "httpx>=0.28,<0.29",
   "pydantic>=2.10,<3",
 ]
 

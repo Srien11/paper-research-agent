@@ -1,0 +1,13 @@
+{
+  "schema_version": "retrieval-v1",
+  "embedding_model": "intfloat/multilingual-e5-large",
+  "embedding_revision": "66076b8dc6e367337e3e90e6fb309fb0f3addaf6",
+  "reranker_model": "Xenova/ms-marco-MiniLM-L-6-v2",
+  "reranker_revision": "a09144355adeed5f58c8ed011d209bf8ee5a1fec",
+  "rrf_k": 60,
+  "sparse_candidates": 50,
+  "vector_candidates": 50,
+  "rerank_candidates": 30,
+  "top_k": 10,
+  "index_dir": "data/indexes/multilingual-e5-large-diagnostic-v1"
+}

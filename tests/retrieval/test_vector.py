@@ -12,8 +12,11 @@ from tests.retrieval.test_bm25 import chunk
 
 
 class FakeEncoder:
-    def encode(self, texts):
+    def encode_documents(self, texts):
         return [[1.0, 0.0] if "alpha" in text else [0.0, 1.0] for text in texts]
+
+    def encode_query(self, query):
+        return [1.0, 0.0] if "alpha" in query else [0.0, 1.0]
 
 
 class VectorTests(unittest.TestCase):
