@@ -20,10 +20,13 @@ data/processed/
 data/indexes/
 data/evaluations/runs/
 data/runtime/live-smoke-v1/
+data/runtime/live-smoke-memory-v1/
 *.pdf
 *.faiss
 *.sqlite
 *.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
 *.npy
 data/models/
 

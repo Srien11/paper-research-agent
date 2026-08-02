@@ -118,6 +118,7 @@ async def _search_bilingual(
     retrieval_config,
     bilingual_config_path,
     index_id,
+    privacy_ttl_days=None,
 ):
     bilingual_config = load_bilingual_retrieval_config(bilingual_config_path)
     try:
@@ -155,7 +156,11 @@ async def _search_bilingual(
         rights=rights,
     )
     try:
-        return await service.search(query, top_k=top_k)
+        return await service.search(
+            query,
+            top_k=top_k,
+            privacy_ttl_days=privacy_ttl_days,
+        )
     finally:
         await service.aclose()
         close = getattr(rewriter, "aclose", None)

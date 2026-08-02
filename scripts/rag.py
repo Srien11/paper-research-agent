@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -20,6 +22,10 @@ from paper_research_agent.answering.dashscope import (
 )
 from paper_research_agent.answering.models import RAGAnswer
 from paper_research_agent.chunking.models import EvidenceChunk
+from paper_research_agent.memory.config import load_memory_config
+from paper_research_agent.memory.context import contextualize_retrieval_query, to_context_memory
+from paper_research_agent.memory.service import turn_from_answer
+from paper_research_agent.memory.store import SQLiteShortTermMemory
 from paper_research_agent.rag import answer_retrieval_run
 from paper_research_agent.retrieval.bm25 import BM25Index
 from paper_research_agent.retrieval.config import load_retrieval_config
@@ -30,6 +36,7 @@ from paper_research_agent.retrieval.vector import FaissVectorIndex
 DEFAULT_RETRIEVAL_CONFIG = PROJECT_ROOT / "configs/retrieval/hybrid-rerank-v1.json"
 DEFAULT_BILINGUAL_CONFIG = PROJECT_ROOT / "configs/retrieval/bilingual-qwen-v1.json"
 DEFAULT_ANSWER_CONFIG = PROJECT_ROOT / "configs/answering/qwen-rag-v1.json"
+DEFAULT_MEMORY_CONFIG = PROJECT_ROOT / "configs/memory/short-term-v1.json"
 DEFAULT_ANSWER_AUDIT = PROJECT_ROOT / "data/runtime/answer-audit-v1.sqlite3"
 
 
@@ -46,6 +53,8 @@ async def run_rag(
     output_reserve_tokens: int = 1200,
     output_path: Path | None = None,
     audit_path: Path = DEFAULT_ANSWER_AUDIT,
+    session_id: str | None = None,
+    memory_config_path: Path = DEFAULT_MEMORY_CONFIG,
 ) -> RAGAnswer:
     retrieval_config = load_retrieval_config(retrieval_config_path)
     chunks = [
@@ -70,8 +79,24 @@ async def run_rag(
         retrieval_config.reranker_model,
         revision=retrieval_config.reranker_revision,
     )
-    run = await _search_bilingual(
+    memory_config = load_memory_config(memory_config_path)
+    memory_store: SQLiteShortTermMemory | None = None
+    memory_turns = ()
+    if session_id is not None:
+        memory_path = PROJECT_ROOT / memory_config.store_path
+        try:
+            memory_store = SQLiteShortTermMemory(memory_path, config=memory_config)
+            memory_turns = memory_store.recent(session_id)
+        except (OSError, sqlite3.Error):
+            memory_store = None
+            memory_turns = ()
+    retrieval_question = contextualize_retrieval_query(
         question,
+        memory_turns,
+        max_question_chars=memory_config.follow_up_max_chars,
+    )
+    run = await _search_bilingual(
+        retrieval_question,
         top_k=top_k,
         corpus_dir=corpus_dir,
         sparse=sparse,
@@ -80,6 +105,9 @@ async def run_rag(
         retrieval_config=retrieval_config,
         bilingual_config_path=bilingual_config_path,
         index_id=manifest.index_id,
+        privacy_ttl_days=(
+            max(1, math.ceil(memory_config.ttl_hours / 24)) if session_id is not None else None
+        ),
     )
     answer_config = load_answering_config(answer_config_path)
     try:
@@ -94,11 +122,31 @@ async def run_rag(
             audit=_optional_audit(audit_path),
             token_budget=token_budget,
             output_reserve_tokens=output_reserve_tokens,
+            user_question=question,
+            short_term_memory=to_context_memory(memory_turns),
+            memory_token_budget=(
+                memory_config.context_token_budget if session_id is not None else 0
+            ),
+            protected_evidence_count=(
+                memory_config.protected_evidence_count if session_id is not None else 1
+            ),
         )
     finally:
         close = getattr(generator, "aclose", None)
         if close is not None:
             await close()
+    if session_id is not None and memory_store is not None:
+        try:
+            turn = turn_from_answer(
+                session_id,
+                question,
+                result,
+                config=memory_config,
+                standalone_question=retrieval_question,
+            )
+            memory_store.append(turn)
+        except (OSError, sqlite3.Error, ValueError):
+            pass
     payload = result.model_dump(mode="json")
     rendered = json.dumps(payload, ensure_ascii=False, indent=2)
     if output_path is None:
@@ -118,6 +166,11 @@ def main() -> None:
     parser.add_argument("--retrieval-config", type=Path, default=DEFAULT_RETRIEVAL_CONFIG)
     parser.add_argument("--bilingual-config", type=Path, default=DEFAULT_BILINGUAL_CONFIG)
     parser.add_argument("--answer-config", type=Path, default=DEFAULT_ANSWER_CONFIG)
+    parser.add_argument("--memory-config", type=Path, default=DEFAULT_MEMORY_CONFIG)
+    parser.add_argument(
+        "--session-id",
+        help="Enable 24-hour local short-term memory for this explicit session ID.",
+    )
     configured_corpus = os.getenv("PRA_CORPUS_DIR")
     parser.add_argument(
         "--corpus-dir",
@@ -146,6 +199,8 @@ def main() -> None:
                 output_reserve_tokens=args.output_reserve,
                 output_path=args.output,
                 audit_path=args.audit_path,
+                session_id=args.session_id,
+                memory_config_path=args.memory_config,
             )
         )
     except Exception as error:  # noqa: BLE001 - sanitize every CLI failure

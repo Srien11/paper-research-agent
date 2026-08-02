@@ -205,6 +205,28 @@ class BilingualRetrievalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second_rewriter.calls, [])
         self.assertFalse(second.degraded)
 
+    async def test_memory_aware_query_has_per_request_one_day_retention(self) -> None:
+        await self.service(FakeRewriter()).search("中文问题", privacy_ttl_days=1)
+
+        with closing(sqlite3.connect(self.directory / "cache.sqlite3")) as connection:
+            cache_row = connection.execute("SELECT created_at, expires_at FROM rewrites").fetchone()
+        with closing(sqlite3.connect(self.directory / "audit.sqlite3")) as connection:
+            audit_row = connection.execute(
+                "SELECT created_at, plaintext_expires_at FROM runs ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+
+        self.assertIsNotNone(cache_row)
+        self.assertIsNotNone(audit_row)
+        assert cache_row is not None and audit_row is not None
+        cache_retention = datetime.fromisoformat(cache_row[1]) - datetime.fromisoformat(
+            cache_row[0]
+        )
+        audit_retention = datetime.fromisoformat(audit_row[1]) - datetime.fromisoformat(
+            audit_row[0]
+        )
+        self.assertEqual(cache_retention, timedelta(days=1))
+        self.assertEqual(audit_retention, timedelta(days=1))
+
     async def test_cache_failure_never_breaks_rewrite_or_local_fallback(self) -> None:
         service = BilingualRetrievalService(
             self.sparse,

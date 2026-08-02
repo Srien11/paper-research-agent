@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -86,6 +87,41 @@ class PromptMessage(FrozenContract):
         return value
 
 
+class ContextMemoryTurn(FrozenContract):
+    """Low-trust conversational continuity projected without evidence or old citations."""
+
+    turn_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    user_question: str = Field(min_length=1)
+    status: Literal["answered", "insufficient_evidence"]
+    assistant_claims: tuple[str, ...] = ()
+
+    @field_validator("user_question")
+    @classmethod
+    def normalize_question(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("memory question must not be blank")
+        return normalized
+
+    @field_validator("assistant_claims")
+    @classmethod
+    def reject_old_citation_labels(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(value.strip() for value in values)
+        if any(not value for value in normalized):
+            raise ValueError("memory claims must not be blank")
+        if any(re.search(r"\[E[1-9]\d*\]", value) for value in normalized):
+            raise ValueError("memory claims cannot contain old citation labels")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_status(self) -> ContextMemoryTurn:
+        if self.status == "answered" and not self.assistant_claims:
+            raise ValueError("answered memory requires claims")
+        if self.status == "insufficient_evidence" and self.assistant_claims:
+            raise ValueError("insufficient memory cannot contain claims")
+        return self
+
+
 class ContextRequest(FrozenContract):
     """Inputs to deterministic context assembly."""
 
@@ -94,6 +130,9 @@ class ContextRequest(FrozenContract):
     evidence: tuple[ContextEvidence, ...]
     task_state: str | None = None
     conversation_history: tuple[PromptMessage, ...] = ()
+    short_term_memory: tuple[ContextMemoryTurn, ...] = ()
+    memory_token_budget: int = Field(default=0, ge=0)
+    protected_evidence_count: int = Field(default=1, gt=0, le=10)
     token_budget: int = Field(gt=0)
     output_reserve_tokens: int = Field(default=0, ge=0)
 
@@ -121,8 +160,13 @@ class ContextRequest(FrozenContract):
             raise ValueError("evidence final_ranks must be unique")
         if any(message.role == "system" for message in self.conversation_history):
             raise ValueError("conversation_history cannot contain system messages")
+        memory_ids = [turn.turn_id for turn in self.short_term_memory]
+        if len(set(memory_ids)) != len(memory_ids):
+            raise ValueError("short-term memory turn IDs must be unique")
         if self.output_reserve_tokens >= self.token_budget:
             raise ValueError("output reserve must be smaller than token budget")
+        if self.memory_token_budget >= self.token_budget:
+            raise ValueError("memory token budget must be smaller than total token budget")
         return self
 
 
@@ -135,6 +179,8 @@ class AssembledContext(FrozenContract):
     token_budget: int = Field(gt=0)
     output_reserve_tokens: int = Field(default=0, ge=0)
     omitted_evidence_count: int = Field(ge=0)
+    included_memory_turn_ids: tuple[str, ...] = ()
+    omitted_memory_turn_count: int = Field(default=0, ge=0)
     evidence_insufficient: bool = False
 
     @model_validator(mode="after")

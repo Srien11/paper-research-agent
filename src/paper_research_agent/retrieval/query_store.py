@@ -124,6 +124,11 @@ class QueryAuditRecord:
     degraded_reason: str | None
     latency_ms: Mapping[str, float]
     rankings: Sequence[AuditRanking]
+    plaintext_days: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.plaintext_days is not None and self.plaintext_days < 0:
+            raise ValueError("plaintext_days cannot be negative")
 
 
 def normalize_query(query: str) -> str:
@@ -168,13 +173,25 @@ class SQLiteQueryRewriteCache:
         stale_days: int,
     ) -> CacheLookup:
         key = rewrite_cache_key(query, model=model, prompt_version=prompt_version)
+        now = datetime.now(UTC)
         with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "DELETE FROM rewrites WHERE expires_at IS NOT NULL AND expires_at <= ?",
+                (now.isoformat(),),
+            )
             row = connection.execute(
                 """SELECT english_query, actual_model, created_at, latency_ms,
                           input_tokens, output_tokens
                    FROM rewrites WHERE cache_key = ?""",
                 (key,),
             ).fetchone()
+            if row is not None:
+                created_at = datetime.fromisoformat(str(row[2]))
+                if now - created_at.astimezone(UTC) > timedelta(days=stale_days):
+                    connection.execute("DELETE FROM rewrites WHERE cache_key = ?", (key,))
+                    row = None
+            connection.commit()
         if row is None:
             return CacheLookup()
         entry = CachedRewrite(
@@ -207,18 +224,19 @@ class SQLiteQueryRewriteCache:
     ) -> None:
         key = rewrite_cache_key(query, model=model, prompt_version=prompt_version)
         now = datetime.now(UTC)
-        cutoff = (now - timedelta(days=stale_days)).isoformat()
+        expires_at = (now + timedelta(days=stale_days)).isoformat()
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 """INSERT INTO rewrites (
                        cache_key, english_query, actual_model, created_at,
-                       latency_ms, input_tokens, output_tokens
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                       expires_at, latency_ms, input_tokens, output_tokens
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(cache_key) DO UPDATE SET
                        english_query = excluded.english_query,
                        actual_model = excluded.actual_model,
                        created_at = excluded.created_at,
+                       expires_at = excluded.expires_at,
                        latency_ms = excluded.latency_ms,
                        input_tokens = excluded.input_tokens,
                        output_tokens = excluded.output_tokens""",
@@ -227,12 +245,13 @@ class SQLiteQueryRewriteCache:
                     english_query,
                     actual_model,
                     now.isoformat(),
+                    expires_at,
                     latency_ms,
                     input_tokens,
                     output_tokens,
                 ),
             )
-            connection.execute("DELETE FROM rewrites WHERE created_at < ?", (cutoff,))
+            connection.execute("DELETE FROM rewrites WHERE expires_at <= ?", (now.isoformat(),))
             connection.commit()
 
     def _initialize(self) -> None:
@@ -244,6 +263,7 @@ class SQLiteQueryRewriteCache:
                     english_query TEXT NOT NULL,
                     actual_model TEXT NOT NULL,
                     created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
                     latency_ms REAL NOT NULL,
                     input_tokens INTEGER NOT NULL,
                     output_tokens INTEGER NOT NULL
@@ -251,6 +271,15 @@ class SQLiteQueryRewriteCache:
                 PRAGMA user_version = 1;
                 """
             )
+            columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(rewrites)")}
+            if "expires_at" not in columns:
+                connection.execute("ALTER TABLE rewrites ADD COLUMN expires_at TEXT")
+                legacy_expiry = datetime.now(UTC) + timedelta(days=365)
+                connection.execute(
+                    "UPDATE rewrites SET expires_at = ? WHERE expires_at IS NULL",
+                    (legacy_expiry.isoformat(),),
+                )
+            connection.commit()
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=5.0)
@@ -273,6 +302,14 @@ class SQLiteQueryAuditLogger:
 
     def write(self, record: QueryAuditRecord) -> bool:
         try:
+            plaintext_days = (
+                self.plaintext_days
+                if record.plaintext_days is None
+                else min(self.plaintext_days, record.plaintext_days)
+            )
+            plaintext_expires_at = (
+                record.created_at.astimezone(UTC) + timedelta(days=plaintext_days)
+            ).isoformat()
             with self._lock, closing(self._connect()) as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 connection.execute(
@@ -281,8 +318,9 @@ class SQLiteQueryAuditLogger:
                            rewritten_query, rewrite_status, requested_model, actual_model,
                            prompt_version, rewrite_latency_ms, input_tokens, output_tokens,
                            error_class, fallback_reason, cache_error_class, pipeline_id,
-                           index_id, config_sha256, degraded_reason, latency_json
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                           index_id, config_sha256, degraded_reason, latency_json,
+                           plaintext_expires_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         record.request_id,
                         record.created_at.astimezone(UTC).isoformat(),
@@ -304,6 +342,7 @@ class SQLiteQueryAuditLogger:
                         record.config_sha256,
                         record.degraded_reason,
                         json.dumps(dict(record.latency_ms), sort_keys=True),
+                        plaintext_expires_at,
                     ),
                 )
                 connection.executemany(
@@ -322,12 +361,11 @@ class SQLiteQueryAuditLogger:
                         for item in record.rankings
                     ],
                 )
-                cutoff = (datetime.now(UTC) - timedelta(days=self.plaintext_days)).isoformat()
                 connection.execute(
                     """UPDATE runs SET original_query = NULL, rewritten_query = NULL
-                       WHERE created_at < ?
+                       WHERE plaintext_expires_at <= ?
                          AND (original_query IS NOT NULL OR rewritten_query IS NOT NULL)""",
-                    (cutoff,),
+                    (datetime.now(UTC).isoformat(),),
                 )
                 connection.commit()
             return True
@@ -358,7 +396,8 @@ class SQLiteQueryAuditLogger:
                     index_id TEXT NOT NULL,
                     config_sha256 TEXT NOT NULL,
                     degraded_reason TEXT,
-                    latency_json TEXT NOT NULL
+                    latency_json TEXT NOT NULL,
+                    plaintext_expires_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS rankings (
                     request_id TEXT NOT NULL,
@@ -379,7 +418,32 @@ class SQLiteQueryAuditLogger:
                 connection.execute("ALTER TABLE runs ADD COLUMN fallback_reason TEXT")
             if "cache_error_class" not in columns:
                 connection.execute("ALTER TABLE runs ADD COLUMN cache_error_class TEXT")
+            if "plaintext_expires_at" not in columns:
+                connection.execute("ALTER TABLE runs ADD COLUMN plaintext_expires_at TEXT")
+            missing_expiry = connection.execute(
+                "SELECT request_id, created_at FROM runs WHERE plaintext_expires_at IS NULL"
+            ).fetchall()
+            connection.executemany(
+                "UPDATE runs SET plaintext_expires_at = ? WHERE request_id = ?",
+                [
+                    (
+                        (
+                            datetime.fromisoformat(str(created_at)).astimezone(UTC)
+                            + timedelta(days=self.plaintext_days)
+                        ).isoformat(),
+                        str(request_id),
+                    )
+                    for request_id, created_at in missing_expiry
+                ],
+            )
+            connection.execute(
+                """UPDATE runs SET original_query = NULL, rewritten_query = NULL
+                   WHERE plaintext_expires_at <= ?
+                     AND (original_query IS NOT NULL OR rewritten_query IS NOT NULL)""",
+                (datetime.now(UTC).isoformat(),),
+            )
             connection.execute("PRAGMA user_version = 2")
+            connection.commit()
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=5.0)

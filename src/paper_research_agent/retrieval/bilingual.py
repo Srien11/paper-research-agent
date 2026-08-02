@@ -113,6 +113,7 @@ class BilingualRetrievalService:
         *,
         top_k: int | None = None,
         filters: Mapping[str, str] | None = None,
+        privacy_ttl_days: int | None = None,
     ) -> BilingualRetrievalRun:
         original_query = query.strip()
         if self._closed:
@@ -122,12 +123,16 @@ class BilingualRetrievalService:
         limit = self.retrieval_config.top_k if top_k is None else top_k
         if limit <= 0:
             raise ValueError("top_k must be positive")
+        if privacy_ttl_days is not None and privacy_ttl_days <= 0:
+            raise ValueError("privacy_ttl_days must be positive")
 
         request_id = uuid.uuid4().hex
         created_at = datetime.now(UTC)
         started = time.perf_counter()
         loop = asyncio.get_running_loop()
-        rewrite_task = asyncio.create_task(self._resolve_rewrite(original_query))
+        rewrite_task = asyncio.create_task(
+            self._resolve_rewrite(original_query, privacy_ttl_days=privacy_ttl_days)
+        )
         zh_future = loop.run_in_executor(
             self._local_executor,
             functools.partial(self._recall, "zh", original_query, filters),
@@ -216,6 +221,7 @@ class BilingualRetrievalService:
                 degraded_reason=degraded_reason,
                 latency_ms=route_latencies,
                 rankings=_audit_rankings(routes, fused, hits),
+                plaintext_days=privacy_ttl_days,
             )
         )
         return run.model_copy(update={"audit_persisted": persisted})
@@ -283,16 +289,22 @@ class BilingualRetrievalService:
             latency_ms=_elapsed_ms(started),
         )
 
-    async def _resolve_rewrite(self, query: str) -> RewriteResolution:
+    async def _resolve_rewrite(
+        self, query: str, *, privacy_ttl_days: int | None = None
+    ) -> RewriteResolution:
         flight_key = rewrite_cache_key(
             query,
             model=self.rewriter.model_id,
             prompt_version=self.rewriter.prompt_version,
         )
+        if privacy_ttl_days is not None:
+            flight_key = f"{flight_key}:privacy:{privacy_ttl_days}"
         async with self._flight_lock:
             task = self._rewrite_flights.get(flight_key)
             if task is None:
-                task = asyncio.create_task(self._rewrite_once(query))
+                task = asyncio.create_task(
+                    self._rewrite_once(query, privacy_ttl_days=privacy_ttl_days)
+                )
                 self._rewrite_flights[flight_key] = task
                 task.add_done_callback(functools.partial(self._cleanup_rewrite_flight, flight_key))
         return await asyncio.shield(task)
@@ -305,17 +317,24 @@ class BilingualRetrievalService:
         if self._rewrite_flights.get(flight_key) is task:
             self._rewrite_flights.pop(flight_key, None)
 
-    async def _rewrite_once(self, query: str) -> RewriteResolution:
+    async def _rewrite_once(
+        self, query: str, *, privacy_ttl_days: int | None = None
+    ) -> RewriteResolution:
         started = time.perf_counter()
         cache_error_class: str | None = None
+        fresh_days = self.bilingual_config.rewrite_cache_fresh_days
+        stale_days = self.bilingual_config.rewrite_cache_stale_days
+        if privacy_ttl_days is not None:
+            fresh_days = min(fresh_days, privacy_ttl_days)
+            stale_days = min(stale_days, privacy_ttl_days)
         try:
             lookup = await asyncio.to_thread(
                 self.cache.lookup,
                 query,
                 model=self.rewriter.model_id,
                 prompt_version=self.rewriter.prompt_version,
-                fresh_days=self.bilingual_config.rewrite_cache_fresh_days,
-                stale_days=self.bilingual_config.rewrite_cache_stale_days,
+                fresh_days=fresh_days,
+                stale_days=stale_days,
             )
         except Exception as error:  # noqa: BLE001 - cache is strictly best-effort
             lookup = CacheLookup()
@@ -359,6 +378,7 @@ class BilingualRetrievalService:
                 query,
                 result,
                 latency_ms,
+                stale_days,
             )
         except Exception as error:  # noqa: BLE001 - cache cannot fail retrieval
             cache_error_class = type(error).__name__
@@ -418,6 +438,7 @@ class BilingualRetrievalService:
         query: str,
         result: QueryRewriteResult,
         latency_ms: float,
+        stale_days: int,
     ) -> None:
         self.cache.put(
             query,
@@ -428,7 +449,7 @@ class BilingualRetrievalService:
             latency_ms=latency_ms,
             input_tokens=result.input_tokens,
             output_tokens=result.output_tokens,
-            stale_days=self.bilingual_config.rewrite_cache_stale_days,
+            stale_days=stale_days,
         )
 
     async def _write_audit(self, record: QueryAuditRecord) -> bool:

@@ -14,6 +14,7 @@ from paper_research_agent.context.models import (
     AssembledContext,
     CitationRef,
     ContextEvidence,
+    ContextMemoryTurn,
     ContextRequest,
     PromptMessage,
 )
@@ -169,6 +170,30 @@ class ContextModelTests(unittest.TestCase):
             omitted_evidence_count=0,
         )
         self.assertEqual(assembled.citations[0].chunk_id, request.evidence[0].chunk_id)
+
+    def test_memory_rejects_old_citation_labels_and_duplicate_turns(self) -> None:
+        with self.assertRaises(ValidationError):
+            ContextMemoryTurn(
+                turn_id="a" * 32,
+                user_question="earlier",
+                status="answered",
+                assistant_claims=("old answer [E1]",),
+            )
+        valid = ContextMemoryTurn(
+            turn_id="a" * 32,
+            user_question="earlier",
+            status="answered",
+            assistant_claims=("old answer",),
+        )
+        with self.assertRaises(ValidationError):
+            ContextRequest(
+                system_rules="Use evidence.",
+                user_question="current",
+                evidence=(),
+                short_term_memory=(valid, valid),
+                memory_token_budget=100,
+                token_budget=500,
+            )
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@
 - [x] 806 张图表的视觉模型摘要与图文混合索引重建
 - [x] 中文问题到英文科研检索式的双路在线检索编排
 - [x] 私人研究模式下的结构化回答生成与严格引用验证
+- [x] 24 小时、按 session 隔离的本地短期记忆与多轮追问上下文
 - [ ] 多步研究 Agent
 
 详细安排见[RAG 检索基线实施计划](docs/plans/2026-07-26-RAG检索基线实施计划.md)。
@@ -77,6 +78,30 @@ python scripts/rag.py "哪些方法能降低 RAG 在 TruthfulQA 上的幻觉？"
   --corpus-dir "$env:PRA_CORPUS_DIR" `
   --output data/runtime/example-answer.json
 ```
+
+连续追问需要显式复用同一个安全 `session_id`；不传该参数时仍是完全无状态的单轮问答：
+
+```powershell
+python scripts/rag.py "BEIR 基准包含哪些检索任务？" `
+  --session-id beir-review-01 `
+  --chunks data/processed/chunks/chunks.jsonl `
+  --corpus-dir "$env:PRA_CORPUS_DIR"
+
+python scripts/rag.py "它和 MTEB 有什么区别？" `
+  --session-id beir-review-01 `
+  --chunks data/processed/chunks/chunks.jsonl `
+  --corpus-dir "$env:PRA_CORPUS_DIR"
+```
+
+短期记忆不是整份模型上下文。它只在本地 SQLite 中保存最近问题、通过引用验证的
+`claims.text`、来源 chunk ID 和版权分类；不会保存论文证据正文、旧的 `[E1]` 标签、完整
+回答、模型请求或原始响应。默认 24 小时过期、每个 session 最多 20 轮，每次最多选 6 轮
+且不超过 1200 个保守估算 Token。配置见 `configs/memory/short-term-v1.json`。
+
+模型上下文是每次调用临时重新组装的快照：可信 system 规则、筛选后的低信任记忆、当前
+问题、本轮新检索证据和输出约束。记忆只帮助解析“它、上述方法、前者”等指代，不能充当
+事实证据；当前回答仍必须引用本轮重新检索到的论文 chunk。memory-aware 查询的改写缓存和
+查询审计明文也被限制为最多 1 天，并在读取或打开数据库时物理清理过期记录。
 
 收到查询后，中文 `BM25 + BGE` 召回会与 Qwen 英文科研检索式改写并行启动；中英文
 各自先做一次路内 RRF，再做跨语言 RRF，最后只使用英文改写查询执行一次英文
@@ -164,10 +189,10 @@ python scripts/assemble_context.py `
   --output data/runtime/example-context.json
 ```
 
-组装顺序固定为可信系统规则、对话历史、当前用户问题/任务状态、检索证据。历史、任务
-状态和论文正文均属于低信任数据；证据使用 canonical JSON 封装，不能覆盖系统规则或
-触发工具。预算计算覆盖最终消息模板并预留输出空间，证据只按完整 chunk 加入，不截断
-引用血缘。
+组装顺序固定为可信系统规则、必要对话历史、低信任短期记忆、当前用户问题/任务状态、
+检索证据。历史、记忆、任务状态和论文正文均属于低信任数据；记忆与证据分别使用
+canonical JSON 封装，不能覆盖系统规则或触发工具。预算计算覆盖最终消息模板并预留输出
+空间；如果空间冲突，先丢弃最旧记忆，至少保护可容纳的最高排名新证据。
 
 `scripts/answer.py` 是调试生成边界的低层入口；它可以把已经组装好的上下文送入私人研究
 回答模块：

@@ -1,0 +1,10 @@
+{
+  "schema_version": "short-term-memory-config-v1",
+  "ttl_hours": 24,
+  "max_turns_per_session": 20,
+  "context_turn_limit": 6,
+  "context_token_budget": 1200,
+  "protected_evidence_count": 3,
+  "follow_up_max_chars": 96,
+  "store_path": "data/runtime/short-term-memory-v1.sqlite3"
+}

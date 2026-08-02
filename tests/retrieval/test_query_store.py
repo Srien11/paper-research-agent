@@ -70,6 +70,9 @@ class QueryRewriteCacheTests(unittest.TestCase):
             )
             self.assertIsNone(expired.fresh)
             self.assertIsNone(expired.stale)
+            with closing(sqlite3.connect(cache.path)) as connection:
+                remaining = connection.execute("SELECT COUNT(*) FROM rewrites").fetchone()
+            self.assertEqual(remaining, (0,))
 
     @staticmethod
     def _set_created_at(path: Path, created_at: datetime) -> None:
@@ -157,6 +160,34 @@ class QueryAuditLoggerTests(unittest.TestCase):
                 (recent_record.original_query, recent_record.rewrite.english_query),
             )
             self.assertEqual(old_ranking_count, (1,))
+
+    def test_reopening_audit_clears_expired_plaintext(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "audit.sqlite"
+            logger = SQLiteQueryAuditLogger(path, plaintext_days=7)
+            record = self._record(request_id="old-request")
+            self.assertTrue(logger.write(record))
+            with closing(sqlite3.connect(path)) as connection, connection:
+                connection.execute(
+                    """UPDATE runs SET created_at = ?, original_query = ?, rewritten_query = ?,
+                                      plaintext_expires_at = ?
+                       WHERE request_id = ?""",
+                    (
+                        (datetime.now(UTC) - timedelta(days=8)).isoformat(),
+                        "expired original",
+                        "expired rewrite",
+                        (datetime.now(UTC) - timedelta(days=1)).isoformat(),
+                        record.request_id,
+                    ),
+                )
+
+            SQLiteQueryAuditLogger(path, plaintext_days=7)
+            with closing(sqlite3.connect(path)) as connection:
+                row = connection.execute(
+                    "SELECT original_query, rewritten_query FROM runs WHERE request_id = ?",
+                    (record.request_id,),
+                ).fetchone()
+            self.assertEqual(row, (None, None))
 
     @staticmethod
     def _record(

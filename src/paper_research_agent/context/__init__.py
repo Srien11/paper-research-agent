@@ -6,6 +6,7 @@ from paper_research_agent.context.models import (
     AssembledContext,
     CitationRef,
     ContextEvidence,
+    ContextMemoryTurn,
     ContextRequest,
     PromptMessage,
 )
@@ -15,6 +16,7 @@ __all__ = [
     "CitationRef",
     "ContextBudgetExceeded",
     "ContextEvidence",
+    "ContextMemoryTurn",
     "ContextRequest",
     "PromptMessage",
     "assemble_context",
