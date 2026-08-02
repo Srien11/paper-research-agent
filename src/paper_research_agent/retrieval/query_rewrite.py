@@ -10,7 +10,7 @@ from typing import Any, Protocol
 
 import httpx
 
-QUERY_REWRITE_PROMPT_VERSION = "query-rewrite-v1"
+QUERY_REWRITE_PROMPT_VERSION = "query-rewrite-v2"
 DEFAULT_API_KEY_ENV = "DASHSCOPE_API_KEY"
 DEFAULT_BASE_URL_ENV = "DASHSCOPE_BASE_URL"
 DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -109,9 +109,10 @@ class DashScopeQueryRewriter:
                 {"role": "user", "content": normalized_query},
             ],
             "response_format": {"type": "json_object"},
-            "temperature": 0,
+            "temperature": 0.1,
+            "top_p": 0.7,
             "enable_thinking": False,
-            "max_tokens": 256,
+            "max_tokens": 128,
         }
         try:
             response = await self._client.post(self._endpoint, json=payload)

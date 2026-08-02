@@ -51,8 +51,8 @@ class RecordingReranker:
 
 
 class FakeRewriter:
-    model_id = "qwen3.7-plus"
-    prompt_version = "query-rewrite-v1"
+    model_id = "qwen3.7-plus-2026-05-26"
+    prompt_version = "query-rewrite-v2"
 
     def __init__(self, *, delay=0.0, error=None):
         self.delay = delay

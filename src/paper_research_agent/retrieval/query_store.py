@@ -16,7 +16,7 @@ from typing import Protocol
 
 from paper_research_agent.retrieval.contracts import QueryRewriteTrace
 
-CACHE_SCHEMA_VERSION = "query-rewrite-cache-v1"
+CACHE_SCHEMA_VERSION = "query-rewrite-cache-v2"
 AUDIT_SCHEMA_VERSION = "query-audit-v1"
 
 
@@ -142,8 +142,10 @@ def rewrite_cache_key(query: str, *, model: str, prompt_version: str) -> str:
         "schema_version": CACHE_SCHEMA_VERSION,
         "prompt_version": prompt_version,
         "requested_model": model,
-        "temperature": 0,
+        "temperature": 0.1,
+        "top_p": 0.7,
         "enable_thinking": False,
+        "max_tokens": 128,
         "query": normalize_query(query),
     }
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))

@@ -66,6 +66,7 @@ class QueryRewriteTests(unittest.IsolatedAsyncioTestCase):
                 "messages",
                 "response_format",
                 "temperature",
+                "top_p",
                 "enable_thinking",
                 "max_tokens",
             },
@@ -83,6 +84,10 @@ class QueryRewriteTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("evidence", payload)
         self.assertNotIn("chunks", payload)
         self.assertNotIn("context", payload)
+        self.assertEqual(payload["temperature"], 0.1)
+        self.assertEqual(payload["top_p"], 0.7)
+        self.assertEqual(payload["max_tokens"], 128)
+        self.assertFalse(payload["enable_thinking"])
         for required_constraint in (
             "model names",
             "dataset names",

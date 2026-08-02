@@ -68,6 +68,11 @@ def join_retrieval_evidence(
                 text_sha256=matched_chunk.text_sha256,
                 evidence_type=matched_chunk.evidence_type,
                 figure=matched_chunk.figure,
+                storage_class=(
+                    run.storage_classes[hit.corpus_id]
+                    if isinstance(run, BilingualRetrievalRun)
+                    else None
+                ),
                 final_score=hit.final_score,
                 final_rank=hit.final_rank,
             )

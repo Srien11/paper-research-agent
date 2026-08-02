@@ -61,6 +61,7 @@ class ContextAdapterTests(unittest.TestCase):
         run, chunk = artifacts()
         joined = join_retrieval_evidence(run, [chunk])
         self.assertEqual(joined[0].text, chunk.text)
+        self.assertIsNone(joined[0].storage_class)
         self.assertEqual(joined[0].final_rank, 1)
 
     def test_bilingual_run_joins_through_the_same_evidence_boundary(self) -> None:
@@ -86,6 +87,7 @@ class ContextAdapterTests(unittest.TestCase):
         )
         joined = join_retrieval_evidence(run, [chunk])
         self.assertEqual(joined[0].text, chunk.text)
+        self.assertEqual(joined[0].storage_class, "redistributable")
 
         without_rights = run.model_copy(
             update={"storage_classes": {}, "rights_status": "not_loaded"}

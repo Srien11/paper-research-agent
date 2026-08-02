@@ -1,13 +1,13 @@
 {
   "schema_version": "bilingual-retrieval-v1",
   "pipeline_id": "zh-en-two-level-rrf-v1",
-  "rewrite_model": "qwen3.7-plus",
-  "rewrite_prompt_version": "query-rewrite-v1",
+  "rewrite_model": "qwen3.7-plus-2026-05-26",
+  "rewrite_prompt_version": "query-rewrite-v2",
   "rewrite_timeout_seconds": 2.0,
   "rewrite_cache_fresh_days": 90,
   "rewrite_cache_stale_days": 365,
   "audit_plaintext_days": 30,
   "route_rrf_k": 60,
-  "cache_path": "data/runtime/query-rewrite-v1.sqlite3",
+  "cache_path": "data/runtime/query-rewrite-v2.sqlite3",
   "audit_path": "data/runtime/query-audit-v1.sqlite3"
 }

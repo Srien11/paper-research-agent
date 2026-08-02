@@ -48,8 +48,13 @@ class ContextAssemblerTests(unittest.TestCase):
         first = assemble_context(request)
         second = assemble_context(request)
         self.assertEqual(first, second)
-        self.assertEqual([message.role for message in first.messages], ["system", "user", "assistant", "user", "user"])
+        self.assertEqual(
+            [message.role for message in first.messages],
+            ["system", "user", "assistant", "user", "user"],
+        )
         self.assertEqual([citation.chunk_id for citation in first.citations], ["c1", "c2"])
+        self.assertIn('"citation_ids":["E1"]', first.messages[0].content)
+        self.assertIn("must not contain inline citation markers", first.messages[0].content)
         self.assertLessEqual(
             first.estimated_tokens + first.output_reserve_tokens, first.token_budget
         )

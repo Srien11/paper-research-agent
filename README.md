@@ -18,6 +18,7 @@
 - [x] 图片信息契约、806 张图表裁剪与图文混合检索链路
 - [x] 806 张图表的视觉模型摘要与图文混合索引重建
 - [x] 中文问题到英文科研检索式的双路在线检索编排
+- [x] 私人研究模式下的结构化回答生成与严格引用验证
 - [ ] 多步研究 Agent
 
 详细安排见[RAG 检索基线实施计划](docs/plans/2026-07-26-RAG检索基线实施计划.md)。
@@ -68,19 +69,28 @@ python scripts/search.py "哪些方法能降低 RAG 在 TruthfulQA 上的幻觉�
   --chunks data/processed/chunks/chunks.jsonl
 ```
 
+完整问答可以用一条命令串起查询改写、双路检索、上下文组装、回答生成和引用验证：
+
+```powershell
+python scripts/rag.py "哪些方法能降低 RAG 在 TruthfulQA 上的幻觉？" `
+  --chunks data/processed/chunks/chunks.jsonl `
+  --corpus-dir "$env:PRA_CORPUS_DIR" `
+  --output data/runtime/example-answer.json
+```
+
 收到查询后，中文 `BM25 + BGE` 召回会与 Qwen 英文科研检索式改写并行启动；中英文
 各自先做一次路内 RRF，再做跨语言 RRF，最后只使用英文改写查询执行一次英文
 Reranker。改写总截止时间默认 2 秒，超时、网络错误、限流或无效 JSON 均返回中文混合
 召回结果，不经过英文 Reranker；没有配置 Key 时同样安全降级。配置见
 `configs/retrieval/bilingual-qwen-v1.json`。
 
-改写缓存和查询审计分别保存在 `data/runtime/query-rewrite-v1.sqlite3` 与
+改写缓存和查询审计分别保存在 `data/runtime/query-rewrite-v2.sqlite3` 与
 `data/runtime/query-audit-v1.sqlite3`，不与索引元数据共库。成功改写 90 天内直接命中，
 365 天内只在 API 失败时作为过期缓存降级；审计中的中英文查询明文保留 30 天，之后仅
 保留查询哈希、模型/提示词版本、各阶段排名、分数和延迟。审计不写证据正文、图注、
 `figure_json`、绝对路径、请求/响应体或密钥。
 
-百炼请求只包含固定改写提示词和当前用户问题，不上传论文正文、图片摘要或命中证据。
+查询改写请求只包含固定改写提示词和当前用户问题，不上传论文正文、图片摘要或命中证据。
 传入 `--corpus-dir`（或设置 `PRA_CORPUS_DIR`）后，结果会附带命中论文的
 `storage_class`。双路结果若没有加载版权映射，可以在本地查看排名，但后续上下文组装会
 拒绝继续，避免把 `internal_research_only` 边界默认为可公开。
@@ -150,13 +160,35 @@ python scripts/build_retrieval_index.py `
 python scripts/assemble_context.py `
   --run data/evaluations/example-retrieval-run.json `
   --chunks data/processed/chunks/chunks.jsonl `
-  --token-budget 8192 --output-reserve 1024
+  --token-budget 8192 --output-reserve 1200 `
+  --output data/runtime/example-context.json
 ```
 
 组装顺序固定为可信系统规则、对话历史、当前用户问题/任务状态、检索证据。历史、任务
 状态和论文正文均属于低信任数据；证据使用 canonical JSON 封装，不能覆盖系统规则或
 触发工具。预算计算覆盖最终消息模板并预留输出空间，证据只按完整 chunk 加入，不截断
 引用血缘。
+
+`scripts/answer.py` 是调试生成边界的低层入口；它可以把已经组装好的上下文送入私人研究
+回答模块：
+
+```powershell
+python scripts/answer.py `
+  --context data/runtime/example-context.json `
+  --output data/runtime/example-answer.json
+```
+
+回答模型固定为 `qwen3.7-plus-2026-05-26`，使用 `temperature=0.1`、`top_p=0.7`、
+`max_tokens=1200` 并关闭思考。模型只返回结构化 `claims + citation_ids`；本地验证器依据
+`AssembledContext.citations` 白名单校验引用并追加 `[E1]` 标记，未知引用、截断输出或非法
+JSON 均关闭失败。没有可用证据时在本地直接返回“证据不足”，不调用 API。
+
+`private_research` 是当前唯一回答输出模式。它允许将已经加载版权分类的少量命中片段发送
+给百炼，但不会上传整篇 PDF，也不会把上下文、证据正文、模型原始响应或答案正文写入审计
+库。`data/runtime/answer-audit-v1.sqlite3` 只保存模型、Token、延迟、引用/chunk ID、版权分类
+和答案哈希。最终回答 JSON 只包含中文答案、结构化 claims、最小引用元数据和调用统计；不
+提供公开导出模式。v1 审计只记录已验证回答和本地证据不足结果；Provider 超时、非法 JSON
+或引用校验失败不会写库，也不会伪装成“证据不足”。
 
 ## 工程原则
 

@@ -19,6 +19,7 @@ data/raw/
 data/processed/
 data/indexes/
 data/evaluations/runs/
+data/runtime/live-smoke-v1/
 *.pdf
 *.faiss
 *.sqlite

@@ -14,8 +14,8 @@ from paper_research_agent.context.adapters import join_retrieval_evidence
 from paper_research_agent.retrieval.contracts import BilingualRetrievalRun, RetrievalRun
 
 DEFAULT_SYSTEM_RULES = (
-    "Answer only from supplied evidence. Preserve uncertainty and attach a citation "
-    "marker to every factual claim."
+    "Answer in Chinese only from supplied evidence. Preserve uncertainty. Return factual "
+    "claims with citation_ids from the supplied evidence; do not embed citation markers in text."
 )
 
 
@@ -27,7 +27,7 @@ def main() -> None:
     parser.add_argument("--system-rules", default=DEFAULT_SYSTEM_RULES)
     parser.add_argument("--task-state")
     parser.add_argument("--token-budget", type=int, default=8192)
-    parser.add_argument("--output-reserve", type=int, default=1024)
+    parser.add_argument("--output-reserve", type=int, default=1200)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
 

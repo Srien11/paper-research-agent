@@ -28,6 +28,7 @@ class ContextEvidence(FrozenContract):
     text_sha256: Sha256
     evidence_type: Literal["text", "figure_summary"] = "text"
     figure: FigureRecord | None = None
+    storage_class: Literal["redistributable", "internal_research_only"] | None = None
     final_score: float
     final_rank: int = Field(gt=0)
 
@@ -58,6 +59,7 @@ class CitationRef(FrozenContract):
     text_sha256: Sha256
     evidence_type: Literal["text", "figure_summary"] = "text"
     figure: FigureRecord | None = None
+    storage_class: Literal["redistributable", "internal_research_only"] | None = None
 
     @model_validator(mode="after")
     def validate_pages(self) -> CitationRef:

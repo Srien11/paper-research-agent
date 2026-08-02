@@ -1,0 +1,11 @@
+{
+  "schema_version": "rag-answering-v1",
+  "model": "qwen3.7-plus-2026-05-26",
+  "prompt_version": "rag-answer-json-v1",
+  "temperature": 0.1,
+  "top_p": 0.7,
+  "max_output_tokens": 1200,
+  "timeout_seconds": 30,
+  "max_retries": 2,
+  "enable_thinking": false
+}
