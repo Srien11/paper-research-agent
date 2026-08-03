@@ -25,6 +25,10 @@ retrieval = [
   "fastembed>=0.8,<0.9",
   "faiss-cpu>=1.14,<1.15",
 ]
+web = [
+  "fastapi>=0.139,<0.140",
+  "uvicorn>=0.52,<0.53",
+]
 dev = [
   "mypy>=1.15",
   "ruff>=0.11",
@@ -32,6 +36,9 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+paper_research_agent = ["web/static/*"]
 
 [tool.ruff]
 line-length = 100

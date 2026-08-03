@@ -1,0 +1,186 @@
+from __future__ import annotations
+
+import json
+import re
+import unittest
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+STATIC_ROOT = PROJECT_ROOT / "src/paper_research_agent/web/static"
+DEPLOY_ROOT = PROJECT_ROOT / "deploy"
+
+
+class StaticWebContractTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.html = (STATIC_ROOT / "index.html").read_text(encoding="utf-8")
+        cls.css = (STATIC_ROOT / "app.css").read_text(encoding="utf-8")
+        cls.javascript = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+
+    def test_login_and_research_workspace_have_accessible_landmarks(self) -> None:
+        required_ids = {
+            "login-form",
+            "username",
+            "password",
+            "main-content",
+            "recommended-questions",
+            "messages",
+            "ask-form",
+            "question",
+            "pipeline-status",
+            "inspector",
+            "generation-metrics",
+            "evidence-dialog",
+            "new-conversation",
+        }
+        all_ids = re.findall(r'id="([^"]+)"', self.html)
+        found_ids = set(all_ids)
+        self.assertEqual(len(all_ids), len(found_ids))
+        self.assertTrue(required_ids.issubset(found_ids))
+        self.assertIn('autocomplete="username"', self.html)
+        self.assertIn('autocomplete="current-password"', self.html)
+        self.assertIn('role="alert"', self.html)
+        self.assertIn('aria-live="polite"', self.html)
+        self.assertIn('aria-controls="inspector"', self.html)
+        self.assertIn('href="#main-content"', self.html)
+
+    def test_ui_contains_all_visible_operational_states(self) -> None:
+        for text in (
+            "可视化测试",
+            "推荐问题",
+            "检索证据",
+            "重排与组装",
+            "生成回答",
+            "验证引用",
+            "上下文检查器",
+            "引用证据",
+            "新对话",
+        ):
+            self.assertIn(text, self.html)
+        for state_token in (
+            "insufficient_evidence",
+            "degraded_reason",
+            "resolved_question",
+            "included_memory_turn_count",
+            "omitted_evidence_count",
+            "is-loading",
+            "appendErrorMessage",
+            "empty-state",
+        ):
+            self.assertIn(state_token, self.javascript + self.html)
+
+    def test_server_text_is_only_projected_with_text_content(self) -> None:
+        forbidden_property = "inner" + "HTML"
+        self.assertNotIn(forbidden_property, self.javascript)
+        self.assertIn("textContent", self.javascript)
+        self.assertIn("replaceChildren", self.javascript)
+        self.assertNotIn("insertAdjacentHTML", self.javascript)
+        self.assertNotIn("document.write", self.javascript)
+
+    def test_api_paths_match_the_private_web_contract(self) -> None:
+        for path in (
+            'session: "api/session"',
+            'login: "api/login"',
+            'logout: "api/logout"',
+            'conversation: "api/conversation"',
+            'ask: "api/ask"',
+        ):
+            self.assertIn(path, self.javascript)
+        self.assertNotIn("api/conversations", self.javascript)
+        self.assertIn('method: "DELETE"', self.javascript)
+        self.assertIn("JSON.stringify({ username, password })", self.javascript)
+
+    def test_browser_storage_excludes_citation_and_evidence_objects(self) -> None:
+        self.assertIn("sessionStorage", self.javascript)
+        self.assertIn('saveHistoryItem({ role: "assistant", text', self.javascript)
+        self.assertNotIn("localStorage", self.javascript)
+        self.assertNotRegex(
+            self.javascript,
+            r"sessionStorage\.setItem\([^\n]+(?:citation|evidence|payload)",
+        )
+
+    def test_styles_cover_focus_reduced_motion_and_mobile_layout(self) -> None:
+        self.assertIn(":focus-visible", self.css)
+        self.assertIn("prefers-reduced-motion", self.css)
+        self.assertIn("@media (max-width: 430px)", self.css)
+        self.assertIn("min-height: 44px", self.css)
+        self.assertIn("env(safe-area-inset-bottom)", self.css)
+
+
+class RecommendationContractTests(unittest.TestCase):
+    def test_recommendations_are_versioned_unique_and_nonempty(self) -> None:
+        path = PROJECT_ROOT / "configs/web/recommended-questions-v1.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["schema_version"], "recommended-questions-v1")
+        questions = payload["questions"]
+        self.assertGreaterEqual(len(questions), 5)
+        self.assertEqual(len({item["id"] for item in questions}), len(questions))
+        for item in questions:
+            self.assertTrue(item["category"].strip())
+            self.assertTrue(item["title"].strip())
+            self.assertTrue(item["prompt"].strip())
+
+
+class DeploymentAssetContractTests(unittest.TestCase):
+    def test_systemd_is_loopback_single_worker_and_hardened(self) -> None:
+        service = (DEPLOY_ROOT / "paper-research-agent.service").read_text(encoding="utf-8")
+        self.assertIn("--host 127.0.0.1 --port 8092", service)
+        self.assertNotIn("--workers", service)
+        self.assertIn("EnvironmentFile=-/etc/zhimo-site-admin.env", service)
+        for directive in (
+            "NoNewPrivileges=true",
+            "PrivateTmp=true",
+            "ProtectSystem=strict",
+            "ProtectHome=true",
+            "UMask=0077",
+            "FASTEMBED_CACHE_PATH=/srv/paper-research-agent/model-cache",
+            "ReadWritePaths=/srv/paper-research-agent/current/data/runtime /srv/paper-research-agent/model-cache",
+        ):
+            self.assertIn(directive, service)
+
+    def test_nginx_uses_canonical_prefix_rate_limits_and_16k_body(self) -> None:
+        zones = (DEPLOY_ROOT / "nginx-paper-research-zones.conf").read_text(encoding="utf-8")
+        locations = (DEPLOY_ROOT / "nginx-paper-research-locations.conf").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("limit_req_zone", zones)
+        self.assertNotIn("location ", zones)
+        self.assertIn("location = /paper-research", locations)
+        self.assertIn("location ^~ /paper-research/", locations)
+        self.assertIn("127.0.0.1:8092", locations)
+        self.assertIn("client_max_body_size 16k", locations)
+        self.assertIn("limit_req zone=paper_research_ask", locations)
+        self.assertNotIn("limit_req_zone", locations)
+        self.assertNotIn("location ^~ /research/", locations)
+
+    def test_deployment_requires_external_environment_and_can_rollback(self) -> None:
+        script = (DEPLOY_ROOT / "deploy_private_web.sh").read_text(encoding="utf-8")
+        self.assertIn("paper-research-agent.env", script)
+        self.assertIn("mode 600", script)
+        self.assertIn("rollback", script)
+        self.assertIn("PREVIOUS_TARGET", script)
+        self.assertIn("nginx -t", script)
+        self.assertIn("/paper-research/readyz", script)
+        self.assertIn("Refusing to switch releases or guess-edit", script)
+        self.assertIn("paper-research-agent-zones.conf", script)
+        self.assertIn("paper-research-agent-locations.conf", script)
+        self.assertRegex(script, r"\\\.pdf\$")
+
+    def test_bundle_builder_copies_only_explicit_private_runtime_inputs(self) -> None:
+        script = (DEPLOY_ROOT / "build_private_bundle.ps1").read_text(encoding="utf-8")
+        for artifact in (
+            "chunks.jsonl",
+            "vectors.faiss",
+            "metadata.sqlite",
+            "core_frozen.jsonl",
+            "challenge_frozen.jsonl",
+        ):
+            self.assertIn(artifact, script)
+        self.assertIn("Get-FileHash", script)
+        self.assertIn("includes_environment = $false", script)
+        self.assertIn("includes_pdfs = $false", script)
+        self.assertNotIn('Copy-SafeTree "$repo\\data"', script)
+
+
+if __name__ == "__main__":
+    unittest.main()

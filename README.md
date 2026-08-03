@@ -215,6 +215,35 @@ JSON 均关闭失败。没有可用证据时在本地直接返回“证据不足
 提供公开导出模式。v1 审计只记录已验证回答和本地证据不足结果；Provider 超时、非法 JSON
 或引用校验失败不会写库，也不会伪装成“证据不足”。
 
+## 站长私有可视化研究台
+
+`paper_research_agent.web` 将现有 RAG 包装为常驻 FastAPI 服务：启动时只加载一次
+6,252 个 chunks、BM25、FAISS、BGE 和 Reranker，后续问题复用同一运行时。生产环境只
+运行一个 Uvicorn worker，并用单查询锁保护本地 CPU 模型；服务仅监听回环地址，由 Nginx
+在 `/paper-research/` 下同源代理。
+
+因为完整索引包含 30 篇 `internal_research_only` 论文，首页项目卡可以公开，但真实问答、
+引用摘录、英文改写、短期记忆和上下文检查器全部要求站长登录。登录后由服务端生成不可猜测
+的 conversation ID，并通过 `HttpOnly + Secure + SameSite=Strict` 签名 Cookie 绑定；
+浏览器不能自选 session ID，也不会保存站长密码。POST 请求还会校验精确同源 Origin。
+
+安装 Web 依赖后，以环境变量提供私有路径与凭据并启动：
+
+```powershell
+python -m pip install -e ".[retrieval,web]"
+python scripts/serve_web.py --host 127.0.0.1 --port 8092
+```
+
+生产凭据优先复用个人站现有 `ZHIMO_ADMIN_USER`、`ZHIMO_ADMIN_SALT`、
+`ZHIMO_ADMIN_HASH` 和 `ZHIMO_PBKDF2_ITERATIONS`；另需独立设置至少 32 字节的
+`PRA_WEB_SESSION_SECRET`。本地开发也可改用 `PRA_WEB_USER` 与 `PRA_WEB_PASSWORD`。
+这些变量、DashScope Key、论文派生数据、模型缓存与运行数据库均不得进入 Git 或部署代码包。
+
+研究台返回安全字段白名单：中文回答与 claims、引用编号、论文标题、官方链接、页码、版权
+分类、短摘录，以及改写状态、入选证据/记忆数量和 Token 预算。它不会返回 PDF 路径、图片
+路径、完整 figure JSON、系统提示词、Provider 原始响应或未选中证据全文。部署模板见
+`deploy/`，推荐问题见 `configs/web/recommended-questions-v1.json`。
+
 ## 工程原则
 
 - 每个结论最终绑定 `paper_id / element_id / page / evidence_span`。

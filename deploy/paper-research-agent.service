@@ -1,0 +1,45 @@
+[Unit]
+Description=Private Paper Research Agent Web Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=paper-rag
+Group=paper-rag
+WorkingDirectory=/srv/paper-research-agent/current
+Environment=PYTHONPATH=/srv/paper-research-agent/current/src
+Environment=PYTHONUNBUFFERED=1
+Environment=FASTEMBED_CACHE_PATH=/srv/paper-research-agent/model-cache
+# Reuse the existing owner's PBKDF2 login variables without copying credentials.
+EnvironmentFile=-/etc/zhimo-site-admin.env
+EnvironmentFile=/etc/paper-research-agent/paper-research-agent.env
+ExecStart=/srv/paper-research-agent/current/.venv/bin/python scripts/serve_web.py --host 127.0.0.1 --port 8092
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=180s
+TimeoutStopSec=45s
+KillSignal=SIGINT
+UMask=0077
+
+# The model/index bundle is immutable; only runtime SQLite files are writable.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectHostname=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RemoveIPC=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/srv/paper-research-agent/current/data/runtime /srv/paper-research-agent/model-cache
+
+[Install]
+WantedBy=multi-user.target

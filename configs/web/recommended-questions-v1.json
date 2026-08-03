@@ -1,0 +1,41 @@
+{
+  "schema_version": "recommended-questions-v1",
+  "questions": [
+    {
+      "id": "rag-hallucination",
+      "category": "RAG 可靠性",
+      "title": "降低检索增强生成的幻觉",
+      "prompt": "现有研究中，哪些方法能降低 RAG 系统的幻觉，并如何评估效果？"
+    },
+    {
+      "id": "llm-evaluation",
+      "category": "评测方法",
+      "title": "大模型评测的可信度",
+      "prompt": "大语言模型评测中常见的可靠性威胁有哪些？"
+    },
+    {
+      "id": "beir-mteb",
+      "category": "检索基准",
+      "title": "BEIR 与 MTEB 的区别",
+      "prompt": "BEIR 和 MTEB 分别覆盖哪些任务，它们的设计目标有什么区别？"
+    },
+    {
+      "id": "judge-bias",
+      "category": "LLM-as-a-Judge",
+      "title": "模型裁判偏差",
+      "prompt": "使用大模型作为评审者时，位置偏差和自我偏好如何影响结论？"
+    },
+    {
+      "id": "citation-faithfulness",
+      "category": "证据引用",
+      "title": "引用是否真正支持结论",
+      "prompt": "论文中有哪些方法用于衡量生成答案的引用正确性与证据忠实度？"
+    },
+    {
+      "id": "figure-evidence",
+      "category": "图表证据",
+      "title": "从论文图表中比较结果",
+      "prompt": "图表证据在模型评测论文中通常用于支持哪些类型的比较结论？"
+    }
+  ]
+}

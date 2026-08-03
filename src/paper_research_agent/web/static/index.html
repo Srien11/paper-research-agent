@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="color-scheme" content="light dark">
+    <meta name="theme-color" content="#f2eee5">
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%232f5142'/%3E%3Ctext x='32' y='43' text-anchor='middle' font-size='34' fill='white'%3E%E7%A0%94%3C/text%3E%3C/svg%3E">
+    <title>论文研究台 · 可视化测试</title>
+    <link rel="stylesheet" href="app.css">
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">跳到主要内容</a>
+
+    <section id="login-view" class="login-shell" aria-labelledby="login-title">
+      <div class="login-card">
+        <p class="eyebrow">PRIVATE RESEARCH / 私人研究</p>
+        <h1 id="login-title">进入论文研究台</h1>
+        <p class="login-copy">全量 80 篇论文仅供站长的个人研究。登录后可查看可追溯回答、引用与检索上下文。</p>
+        <form id="login-form" novalidate>
+          <label for="username">用户名</label>
+          <input id="username" name="username" type="text" autocomplete="username" required>
+          <label for="password">站长密码</label>
+          <input id="password" name="password" type="password" autocomplete="current-password" required>
+          <p id="login-error" class="form-error" role="alert" hidden></p>
+          <button class="button button-primary" type="submit">
+            <span class="button-label">登录研究台</span>
+            <span class="spinner" aria-hidden="true"></span>
+          </button>
+        </form>
+        <p class="privacy-note">会话 Cookie 仅用于访问控制；密钥与论文原文不会进入浏览器存储。</p>
+      </div>
+    </section>
+
+    <div id="app-view" class="app-shell" hidden>
+      <header class="topbar">
+        <a class="brand" href="./" aria-label="论文研究台首页">
+          <span class="brand-mark" aria-hidden="true">研</span>
+          <span><strong>论文研究台</strong><small>Evidence-grounded RAG</small></span>
+        </a>
+        <div class="topbar-actions">
+          <span class="stage-badge"><span class="status-dot" aria-hidden="true"></span>可视化测试</span>
+          <button id="inspector-toggle" class="button button-quiet mobile-only" type="button" aria-controls="inspector" aria-expanded="false">上下文</button>
+          <button id="new-conversation" class="button button-secondary" type="button">新对话</button>
+          <button id="logout" class="button button-quiet" type="button">退出</button>
+        </div>
+      </header>
+
+      <main id="main-content" class="workspace">
+        <aside class="library-panel" aria-labelledby="library-title">
+          <div>
+            <p class="eyebrow">FROZEN CORPUS</p>
+            <h2 id="library-title">研究语料</h2>
+            <div class="corpus-stats" aria-label="语料统计">
+              <div><strong>80</strong><span>篇论文</span></div>
+              <div><strong>6,252</strong><span>证据块</span></div>
+              <div><strong>806</strong><span>图表摘要</span></div>
+            </div>
+          </div>
+          <section aria-labelledby="recommended-title">
+            <div class="section-heading">
+              <h3 id="recommended-title">推荐问题</h3>
+              <span>点击填入</span>
+            </div>
+            <div id="recommended-questions" class="question-list" aria-live="polite"></div>
+          </section>
+          <div class="boundary-card">
+            <strong>私人研究边界</strong>
+            <p>仅展示本轮引用所需的短摘录，不提供全文或本地文件。</p>
+          </div>
+        </aside>
+
+        <section class="chat-panel" aria-labelledby="chat-title">
+          <div class="chat-heading">
+            <div>
+              <p class="eyebrow">TRACEABLE ANSWERING</p>
+              <h1 id="chat-title">向论文提问</h1>
+            </div>
+            <p id="conversation-label" class="conversation-label">新研究会话</p>
+          </div>
+
+          <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+          <div id="messages" class="messages" aria-live="polite" aria-busy="false">
+            <div id="empty-state" class="empty-state">
+              <div class="empty-orbit" aria-hidden="true"><span></span></div>
+              <h2>从一个可验证的问题开始</h2>
+              <p>系统会执行中英文双路检索、证据重排与引用校验。每条结论都必须绑定本轮证据。</p>
+            </div>
+          </div>
+
+          <div id="pipeline-status" class="pipeline" aria-label="问答处理进度" hidden>
+            <div data-phase="retrieve"><span>1</span><p>检索证据</p></div>
+            <div data-phase="rerank"><span>2</span><p>重排与组装</p></div>
+            <div data-phase="answer"><span>3</span><p>生成回答</p></div>
+            <div data-phase="validate"><span>4</span><p>验证引用</p></div>
+          </div>
+
+          <form id="ask-form" class="composer">
+            <label class="sr-only" for="question">研究问题</label>
+            <textarea id="question" name="question" rows="2" maxlength="2000" placeholder="输入一个关于大模型评测、RAG 或检索研究的问题…" required></textarea>
+            <div class="composer-footer">
+              <p><kbd>Ctrl</kbd> + <kbd>Enter</kbd> 发送</p>
+              <button id="ask-button" class="button button-primary" type="submit">
+                <span class="button-label">开始研究</span>
+                <span class="spinner" aria-hidden="true"></span>
+              </button>
+            </div>
+          </form>
+        </section>
+
+        <aside id="inspector" class="inspector-panel" aria-labelledby="inspector-title">
+          <div class="inspector-header">
+            <div>
+              <p class="eyebrow">CONTEXT INSPECTOR</p>
+              <h2 id="inspector-title">上下文检查器</h2>
+            </div>
+            <button id="inspector-close" class="icon-button mobile-only" type="button" aria-label="关闭上下文检查器">×</button>
+          </div>
+          <div id="inspector-empty" class="inspector-empty">
+            <p>完成一次提问后，这里会展示安全的检索状态、Token 统计和引用链路。</p>
+          </div>
+          <div id="inspector-content" hidden>
+            <section class="inspector-section" aria-labelledby="route-title">
+              <h3 id="route-title">检索路径</h3>
+              <dl id="route-metrics" class="metric-list"></dl>
+            </section>
+            <section class="inspector-section" aria-labelledby="token-title">
+              <h3 id="token-title">上下文预算</h3>
+              <dl id="token-metrics" class="metric-list"></dl>
+            </section>
+            <section class="inspector-section" aria-labelledby="generation-title">
+              <h3 id="generation-title">运行指标</h3>
+              <dl id="generation-metrics" class="metric-list"></dl>
+            </section>
+            <section class="inspector-section" aria-labelledby="citation-map-title">
+              <h3 id="citation-map-title">引用链路</h3>
+              <div id="citation-map" class="citation-map"></div>
+            </section>
+          </div>
+        </aside>
+      </main>
+      <div id="inspector-scrim" class="scrim" hidden></div>
+    </div>
+
+    <dialog id="evidence-dialog" class="evidence-dialog" aria-labelledby="evidence-title">
+      <div class="dialog-header">
+        <div>
+          <p class="eyebrow">CITATION DETAIL</p>
+          <h2 id="evidence-title">引用证据</h2>
+        </div>
+        <button id="evidence-close" class="icon-button" type="button" aria-label="关闭引用证据">×</button>
+      </div>
+      <div id="evidence-content" class="evidence-content"></div>
+    </dialog>
+
+    <div id="toast-region" class="toast-region" role="status" aria-live="polite" aria-atomic="true"></div>
+
+    <template id="loading-message-template">
+      <article class="message message-assistant loading-message" aria-label="研究处理中">
+        <div class="message-meta"><span class="assistant-mark" aria-hidden="true">研</span><strong>论文研究 Agent</strong></div>
+        <div class="skeleton"><span></span><span></span><span></span></div>
+      </article>
+    </template>
+  </body>
+</html>

@@ -6,6 +6,7 @@ __pycache__/
 .ruff_cache/
 .venv/
 dist/
+dist-private/
 build/
 *.egg-info/
 
@@ -19,6 +20,7 @@ data/raw/
 data/processed/
 data/indexes/
 data/evaluations/runs/
+data/runtime/
 data/runtime/live-smoke-v1/
 data/runtime/live-smoke-memory-v1/
 *.pdf
