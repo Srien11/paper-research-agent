@@ -9,6 +9,7 @@ NGINX_LOCATIONS_TARGET="/etc/nginx/snippets/paper-research-agent.conf"
 NGINX_INCLUDE="include /etc/nginx/snippets/paper-research-agent.conf;"
 ENV_FILE="${CONFIG_ROOT}/paper-research-agent.env"
 BUNDLE_PATH="${1:-}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 RELEASE_TAG="$(date -u +%Y%m%dT%H%M%SZ)"
 RELEASE_DIR="${APP_ROOT}/releases/${RELEASE_TAG}"
 BACKUP_DIR="${APP_ROOT}/deploy-backups/${RELEASE_TAG}"
@@ -73,6 +74,14 @@ if [[ "$(stat -c '%a' "${ENV_FILE}")" != "600" ]]; then
     printf 'Environment file must have mode 600.\n' >&2
     exit 2
 fi
+if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
+    printf 'Python interpreter not found: %s\n' "${PYTHON_BIN}" >&2
+    exit 2
+fi
+if ! "${PYTHON_BIN}" -c 'import sys; raise SystemExit(sys.version_info < (3, 11))'; then
+    printf 'Python 3.11 or newer is required: %s\n' "${PYTHON_BIN}" >&2
+    exit 2
+fi
 
 tar -tzf "${BUNDLE_PATH}" > "${LIST_FILE}"
 if grep -Eiq '(^|/)\.env($|[./])|\.pdf$|\.(pem|key)$|data/runtime/.+\.(sqlite|sqlite3|db)$' "${LIST_FILE}"; then
@@ -117,7 +126,7 @@ test -f "${RELEASE_DIR}/data/processed/chunks/chunks.jsonl"
 test -f "${RELEASE_DIR}/data/indexes/retrieval-v1/manifest.json"
 install -d -m 0700 -o paper-rag -g paper-rag "${RELEASE_DIR}/data/runtime"
 
-python3.11 -m venv "${RELEASE_DIR}/.venv"
+"${PYTHON_BIN}" -m venv "${RELEASE_DIR}/.venv"
 "${RELEASE_DIR}/.venv/bin/python" -m pip install --disable-pip-version-check --no-input "${RELEASE_DIR}[retrieval,web]"
 chown -R paper-rag:paper-rag "${RELEASE_DIR}"
 chmod -R o-rwx "${RELEASE_DIR}"

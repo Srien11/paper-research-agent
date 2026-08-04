@@ -27,7 +27,11 @@ retrieval = [
 ]
 web = [
   "fastapi>=0.139,<0.140",
-  "uvicorn>=0.52,<0.53",
+  "uvicorn>=0.40,<0.52",
+]
+agent = [
+  "langchain>=1.0,<2",
+  "langgraph>=1.0,<2",
 ]
 dev = [
   "mypy>=1.15",

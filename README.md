@@ -20,6 +20,8 @@
 - [x] 中文问题到英文科研检索式的双路在线检索编排
 - [x] 私人研究模式下的结构化回答生成与严格引用验证
 - [x] 24 小时、按 session 隔离的本地短期记忆与多轮追问上下文
+- [x] 框架无关的只读论文搜索与证据读取工具
+- [x] LangChain 工具适配与最小 LangGraph 研究计划工作流
 - [ ] 多步研究 Agent
 
 详细安排见[RAG 检索基线实施计划](docs/plans/2026-07-26-RAG检索基线实施计划.md)。
@@ -119,6 +121,21 @@ Reranker。改写总截止时间默认 2 秒，超时、网络错误、限流或
 传入 `--corpus-dir`（或设置 `PRA_CORPUS_DIR`）后，结果会附带命中论文的
 `storage_class`。双路结果若没有加载版权映射，可以在本地查看排名，但后续上下文组装会
 拒绝继续，避免把 `internal_research_only` 边界默认为可公开。
+
+首版研究工具位于 `paper_research_agent.agent`。`ResearchToolService` 提供框架无关的
+`search_corpus` 和 `get_evidence`：前者只返回排名、稳定 ID、页码、哈希和版权分类，后者
+只按显式 chunk ID 从本地不可变语料读取正文。搜索结果会再次经过现有血缘适配器校验；
+检索元数据与源 chunk 不一致、版权映射缺失或请求越界时关闭失败。
+
+安装 `agent` 可选依赖后，`build_langchain_tools` 将这两个方法包装为固定名称和 Pydantic
+参数契约的 LangChain 工具；`build_research_graph` 使用 LangGraph 执行
+`plan -> execute_step -> route`。Planner 最多产生 6 个只读检索子问题，Graph 限制每步
+证据数量并按 chunk ID 去重。当前 Graph 终态是可审计证据包，不直接生成答案，也不会绕过
+现有上下文组装、引用白名单和回答验证器：
+
+```powershell
+python -m pip install -e ".[agent]"
+```
 
 图片语义入库分为三个阶段。裁剪阶段不调用视觉模型，也不会上传图片：
 

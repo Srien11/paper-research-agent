@@ -2,6 +2,8 @@
 Description=Private Paper Research Agent Web Service
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -16,11 +18,22 @@ EnvironmentFile=-/etc/zhimo-site-admin.env
 EnvironmentFile=/etc/paper-research-agent/paper-research-agent.env
 ExecStart=/srv/paper-research-agent/current/.venv/bin/python scripts/serve_web.py --host 127.0.0.1 --port 8092
 Restart=on-failure
-RestartSec=5s
+RestartSec=10s
 TimeoutStartSec=180s
 TimeoutStopSec=45s
 KillSignal=SIGINT
 UMask=0077
+
+# Keep this optional research service from starving the public site on a 2-core,
+# 1.8 GiB host. If the models ever outgrow the budget, only this unit fails.
+CPUQuota=150%
+CPUWeight=50
+MemoryHigh=700M
+MemoryMax=850M
+MemorySwapMax=0
+OOMPolicy=stop
+OOMScoreAdjust=500
+TasksMax=128
 
 # The model/index bundle is immutable; only runtime SQLite files are writable.
 NoNewPrivileges=true
