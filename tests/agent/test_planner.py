@@ -27,7 +27,10 @@ class LangChainResearchPlannerTests(unittest.IsolatedAsyncioTestCase):
 
         plan = await planner.plan("比较 RAG 评测方法", max_steps=3)
 
-        model.with_structured_output.assert_called_once_with(ResearchPlan)
+        model.with_structured_output.assert_called_once_with(
+            ResearchPlan,
+            method="function_calling",
+        )
         self.assertEqual(plan.steps[0].query, "RAG evaluation methods")
         messages = structured.ainvoke.await_args.args[0]
         self.assertIn("最多 3", messages[0].content)

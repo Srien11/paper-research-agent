@@ -4,6 +4,8 @@ import argparse
 import asyncio
 import json
 import sys
+import uuid
+from contextlib import suppress
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -14,9 +16,14 @@ from paper_research_agent.web.runtime import RAGRuntime
 
 async def run_smoke(question: str) -> dict[str, object]:
     """Run one production-shaped query and return no evidence excerpts or local paths."""
-    runtime = RAGRuntime.from_environment()
+    session_id = f"local-web-smoke-{uuid.uuid4().hex}"
+    runtime = (
+        await RAGRuntime.from_environment_with_agent()
+        if RAGRuntime.research_agent_enabled_from_environment()
+        else RAGRuntime.from_environment()
+    )
     try:
-        result = await runtime.ask(question, session_id="local-web-smoke")
+        result = await runtime.ask(question, session_id=session_id)
         return {
             "answer": result.answer.model_dump(mode="json"),
             "sources": [
@@ -37,6 +44,8 @@ async def run_smoke(question: str) -> dict[str, object]:
             "generation": result.generation.model_dump(mode="json"),
         }
     finally:
+        with suppress(Exception):
+            await runtime.clear_conversation(session_id)
         await runtime.aclose()
 
 

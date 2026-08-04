@@ -71,9 +71,14 @@ async def _default_runtime_factory() -> WebRuntime:
     """Import the local-model runtime only when application startup begins."""
     from paper_research_agent.web.runtime import RAGRuntime
 
-    factory = getattr(RAGRuntime, "from_environment", None)
+    factory_name = (
+        "from_environment_with_agent"
+        if RAGRuntime.research_agent_enabled_from_environment()
+        else "from_environment"
+    )
+    factory = getattr(RAGRuntime, factory_name, None)
     if factory is None:
-        raise RuntimeError("RAGRuntime.from_environment is unavailable")
+        raise RuntimeError(f"RAGRuntime.{factory_name} is unavailable")
     runtime = await _maybe_await(factory())
     return cast(WebRuntime, runtime)
 

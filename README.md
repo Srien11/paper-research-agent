@@ -22,7 +22,8 @@
 - [x] 24 小时、按 session 隔离的本地短期记忆与多轮追问上下文
 - [x] 框架无关的只读论文搜索与证据读取工具
 - [x] LangChain 工具适配与最小 LangGraph 研究计划工作流
-- [ ] 多步研究 Agent
+- [x] 可选启用、带 SQLite State Checkpoint 的受控多步研究 Agent Runtime
+- [ ] 动态 ReAct、反思与重新规划
 
 详细安排见[RAG 检索基线实施计划](docs/plans/2026-07-26-RAG检索基线实施计划.md)。
 
@@ -130,12 +131,24 @@ Reranker。改写总截止时间默认 2 秒，超时、网络错误、限流或
 安装 `agent` 可选依赖后，`build_langchain_tools` 将这两个方法包装为固定名称和 Pydantic
 参数契约的 LangChain 工具；`build_research_graph` 使用 LangGraph 执行
 `plan -> execute_step -> route`。Planner 最多产生 6 个只读检索子问题，Graph 限制每步
-证据数量并按 chunk ID 去重。当前 Graph 终态是可审计证据包，不直接生成答案，也不会绕过
-现有上下文组装、引用白名单和回答验证器：
+证据数量、总工具调用次数并按 chunk ID 去重。
+
+`ResearchAgentRuntime` 负责总超时、`session_id -> thread_id` 映射，并将 Graph 终态中的正文、
+哈希、页码和版权分类再次与本地不可变 chunk 校验。通过后，证据才会进入现有
+`assemble_context -> answer_context`、引用白名单和回答验证器。SQLite Checkpoint 只保存在
+`data/runtime/`，其中可能包含研究 State 和内部证据正文，禁止提交或公开。
 
 ```powershell
-python -m pip install -e ".[agent]"
+python -m pip install -e ".[retrieval,web,agent]"
+$env:PRA_RESEARCH_AGENT_ENABLED = 'true'
+$env:PRA_RESEARCH_AGENT_MAX_STEPS = '2'
+$env:PRA_RESEARCH_AGENT_EVIDENCE_PER_STEP = '3'
+$env:PRA_RESEARCH_AGENT_MAX_TOOL_CALLS = '4'
+$env:PRA_RESEARCH_AGENT_TIMEOUT_SECONDS = '90'
 ```
+
+默认不开启 Agent，原单次 RAG 路径保持不变。启用后仍只允许 `search_corpus` 和
+`get_evidence`；Shell、任意 Python、写文件、数据库修改和任意外网访问均未注册。
 
 图片语义入库分为三个阶段。裁剪阶段不调用视觉模型，也不会上传图片：
 

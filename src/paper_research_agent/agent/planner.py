@@ -12,7 +12,10 @@ class LangChainResearchPlanner:
     """Ask a chat model only for ordered corpus-search subquestions."""
 
     def __init__(self, model: BaseChatModel):
-        self._structured_model = model.with_structured_output(ResearchPlan)
+        self._structured_model = model.with_structured_output(
+            ResearchPlan,
+            method="function_calling",
+        )
 
     async def plan(self, question: str, *, max_steps: int) -> ResearchPlan:
         if max_steps <= 0 or max_steps > 6:

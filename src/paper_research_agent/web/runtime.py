@@ -14,7 +14,7 @@ import os
 import sqlite3
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Literal, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -60,9 +60,15 @@ from paper_research_agent.retrieval.query_store import (
 from paper_research_agent.retrieval.rights import CorpusRightsMap
 from paper_research_agent.retrieval.vector import FaissVectorIndex
 
+if TYPE_CHECKING:
+    from paper_research_agent.agent.runtime import (
+        ResearchAgentRuntime,
+        ResearchRuntimeResult,
+    )
+
 StorageClass = Literal["redistributable", "internal_research_only"]
 EvidenceType = Literal["text", "figure_summary"]
-RewriteStatus = Literal["success", "cache_hit", "stale_cache", "timeout", "error"]
+RewriteStatus = Literal["success", "cache_hit", "stale_cache", "timeout", "error", "agent"]
 
 
 class _FrozenWebModel(BaseModel):
@@ -168,6 +174,7 @@ class RuntimeDependencies:
         memory_store: ShortTermMemoryStore,
         memory_config: ShortTermMemoryConfig,
         answer_audit: AnswerAuditLogger | None = None,
+        research_agent: ResearchAgentRuntime | None = None,
     ) -> None:
         self.chunks = tuple(chunks)
         self.papers = dict(papers)
@@ -176,6 +183,7 @@ class RuntimeDependencies:
         self.memory_store = memory_store
         self.memory_config = memory_config
         self.answer_audit = answer_audit
+        self.research_agent = research_agent
 
 
 class RAGRuntime:
@@ -215,6 +223,7 @@ class RAGRuntime:
         self._memory_store = dependencies.memory_store
         self._memory_config = dependencies.memory_config
         self._answer_audit = dependencies.answer_audit
+        self._research_agent = dependencies.research_agent
         self._top_k = top_k
         self._token_budget = token_budget
         self._output_reserve_tokens = output_reserve_tokens
@@ -406,6 +415,71 @@ class RAGRuntime:
             answer_audit_path=_optional_env_path("PRA_ANSWER_AUDIT_PATH"),
         )
 
+    @classmethod
+    def research_agent_enabled_from_environment(cls) -> bool:
+        del cls
+        return _environment_flag("PRA_RESEARCH_AGENT_ENABLED", default=False)
+
+    @classmethod
+    async def from_environment_with_agent(cls) -> RAGRuntime:
+        """Construct the normal runtime and then attach the optional Agent lane."""
+        project_root = Path(
+            os.getenv("PRA_PROJECT_ROOT", str(Path(__file__).resolve().parents[3]))
+        )
+        answer_file = _project_path(
+            project_root,
+            _optional_env_path("PRA_ANSWER_CONFIG"),
+            "configs/answering/qwen-rag-v1.json",
+        )
+        answer_config = load_answering_config(answer_file)
+        checkpoint_path = _project_path(
+            project_root,
+            _optional_env_path("PRA_RESEARCH_AGENT_CHECKPOINT_PATH"),
+            "data/runtime/research-agent-state-v1.sqlite3",
+        )
+        policy = _research_policy_from_environment()
+        runtime = cls.from_environment()
+        try:
+            await runtime.enable_research_agent(
+                model_id=answer_config.model,
+                checkpoint_path=checkpoint_path,
+                policy=policy,
+            )
+        except BaseException:
+            await runtime.aclose()
+            raise
+        return runtime
+
+    async def enable_research_agent(
+        self,
+        *,
+        model_id: str,
+        checkpoint_path: Path,
+        policy: object,
+    ) -> None:
+        """Attach one durable, read-only Agent without exposing its internals to Web."""
+        if self._closed:
+            raise RuntimeClosedError("RAG runtime is closed")
+        if self._busy:
+            raise RuntimeBusyError("RAG runtime is busy")
+        if self._research_agent is not None:
+            raise RuntimeError("research agent is already enabled")
+        from paper_research_agent.agent.factory import create_research_agent_runtime
+        from paper_research_agent.agent.policy import ResearchRuntimePolicy
+
+        runtime_policy = ResearchRuntimePolicy.model_validate(policy)
+        storage_classes = {
+            corpus_id: paper.storage_class for corpus_id, paper in self._papers.items()
+        }
+        self._research_agent = await create_research_agent_runtime(
+            retriever=self._retriever,
+            chunks=self._chunks,
+            storage_classes=storage_classes,
+            model_id=model_id,
+            checkpoint_path=checkpoint_path,
+            policy=runtime_policy,
+        )
+
     async def ask(self, question: str, *, session_id: str) -> RuntimeExecutionResult:
         normalized_question = question.strip()
         if not normalized_question:
@@ -433,15 +507,17 @@ class RAGRuntime:
         if self._busy:
             raise RuntimeBusyError("RAG runtime is busy")
         clear = getattr(self._memory_store, "clear", None)
-        if clear is None:
-            return 0
-        return int(await asyncio.to_thread(clear, session_id))
+        cleared = 0 if clear is None else int(await asyncio.to_thread(clear, session_id))
+        if self._research_agent is not None:
+            await self._research_agent.clear(session_id)
+        return cleared
 
     async def aclose(self) -> None:
         if self._closed:
             return
         self._closed = True
         async with self._execution_lock:
+            await _close_async(self._research_agent)
             await _close_async(self._retriever)
             # BilingualRetrievalService does not own its provider adapter.
             rewriter = getattr(self._retriever, "rewriter", None)
@@ -465,16 +541,38 @@ class RAGRuntime:
             memory_turns,
             max_question_chars=policy.follow_up_max_chars,
         )
-        run = await self._retriever.search(
-            resolved_question,
-            top_k=self._top_k,
-            privacy_ttl_days=max(1, math.ceil(policy.ttl_hours / 24)),
-        )
+        research: ResearchRuntimeResult | None = None
+        if self._research_agent is None:
+            run = await self._retriever.search(
+                resolved_question,
+                top_k=self._top_k,
+                privacy_ttl_days=max(1, math.ceil(policy.ttl_hours / 24)),
+            )
+            evidence = join_retrieval_evidence(run, self._chunks)
+            task_state = None
+            retrieval_trace = self._safe_retrieval_trace(
+                question=question,
+                resolved_question=resolved_question,
+                run=run,
+            )
+        else:
+            research = await self._research_agent.run(
+                resolved_question,
+                thread_id=session_id,
+            )
+            evidence = research.evidence
+            task_state = research.task_state
+            retrieval_trace = self._safe_research_trace(
+                question=question,
+                resolved_question=resolved_question,
+                research=research,
+            )
         context = assemble_context(
             ContextRequest(
                 system_rules=self._system_rules,
                 user_question=question,
-                evidence=join_retrieval_evidence(run, self._chunks),
+                evidence=evidence,
+                task_state=task_state,
                 short_term_memory=to_context_memory(memory_turns),
                 memory_token_budget=policy.context_token_budget,
                 protected_evidence_count=policy.protected_evidence_count,
@@ -501,27 +599,95 @@ class RAGRuntime:
             pass
         return self._safe_result(
             question=question,
-            resolved_question=resolved_question,
-            run=run,
+            retrieval=retrieval_trace,
             context=context,
             answer=answer,
+        )
+
+    def _safe_retrieval_trace(
+        self,
+        *,
+        question: str,
+        resolved_question: str,
+        run: BilingualRetrievalRun,
+    ) -> SafeRetrievalTrace:
+        return SafeRetrievalTrace(
+            original_question=question,
+            resolved_question=resolved_question,
+            english_query=run.rewrite.english_query,
+            rewrite_status=run.rewrite.status,
+            degraded=run.degraded,
+            degraded_reason=run.degraded_reason,
+            index_id=run.index_id,
+            audit_persisted=run.audit_persisted,
+            hits=tuple(
+                SafeRetrievalHit(
+                    chunk_id=hit.chunk_id,
+                    corpus_id=hit.corpus_id,
+                    final_rank=hit.final_rank,
+                    evidence_type=hit.evidence_type,
+                    page_start=hit.page_start,
+                    page_end=hit.page_end,
+                    route_ranks=dict(hit.ranks),
+                )
+                for hit in run.hits
+            ),
+        )
+
+    def _safe_research_trace(
+        self,
+        *,
+        question: str,
+        resolved_question: str,
+        research: ResearchRuntimeResult,
+    ) -> SafeRetrievalTrace:
+        index_ids = {item.search.index_id for item in research.observations}
+        if len(index_ids) != 1:
+            raise ValueError("research steps must use one immutable retrieval index")
+        reasons = tuple(
+            dict.fromkeys(
+                item.search.degraded_reason
+                for item in research.observations
+                if item.search.degraded_reason is not None
+            )
+        )
+        return SafeRetrievalTrace(
+            original_question=question,
+            resolved_question=resolved_question,
+            english_query=None,
+            rewrite_status="agent",
+            degraded=bool(reasons),
+            degraded_reason="; ".join(reasons) or None,
+            index_id=next(iter(index_ids)),
+            audit_persisted=False,
+            hits=tuple(
+                SafeRetrievalHit(
+                    chunk_id=item.chunk_id,
+                    corpus_id=item.corpus_id,
+                    final_rank=item.final_rank,
+                    evidence_type=item.evidence_type,
+                    page_start=item.page_start,
+                    page_end=item.page_end,
+                    route_ranks={"agent": item.final_rank},
+                )
+                for item in research.evidence
+            ),
         )
 
     def _safe_result(
         self,
         *,
         question: str,
-        resolved_question: str,
-        run: BilingualRetrievalRun,
+        retrieval: SafeRetrievalTrace,
         context: AssembledContext,
         answer: RAGAnswer,
     ) -> RuntimeExecutionResult:
-        hit_by_chunk = {hit.chunk_id: hit for hit in run.hits}
+        rank_by_chunk = {hit.chunk_id: hit.final_rank for hit in retrieval.hits}
         sources: list[SafeEvidenceSource] = []
         for citation in context.citations:
             chunk = self._chunk_map[citation.chunk_id]
             paper = self._papers[citation.corpus_id]
-            hit = hit_by_chunk[citation.chunk_id]
+            final_rank = rank_by_chunk[citation.chunk_id]
             if citation.storage_class is None:
                 raise RuntimeError("selected evidence is missing storage rights")
             sources.append(
@@ -537,35 +703,13 @@ class RAGRuntime:
                     evidence_type=citation.evidence_type,
                     storage_class=citation.storage_class,
                     excerpt=_excerpt(chunk.text, self._excerpt_chars),
-                    final_rank=hit.final_rank,
+                    final_rank=final_rank,
                 )
             )
-        hits = tuple(
-            SafeRetrievalHit(
-                chunk_id=hit.chunk_id,
-                corpus_id=hit.corpus_id,
-                final_rank=hit.final_rank,
-                evidence_type=hit.evidence_type,
-                page_start=hit.page_start,
-                page_end=hit.page_end,
-                route_ranks=dict(hit.ranks),
-            )
-            for hit in run.hits
-        )
         return RuntimeExecutionResult(
             answer=answer,
             sources=tuple(sources),
-            retrieval=SafeRetrievalTrace(
-                original_question=question,
-                resolved_question=resolved_question,
-                english_query=run.rewrite.english_query,
-                rewrite_status=run.rewrite.status,
-                degraded=run.degraded,
-                degraded_reason=run.degraded_reason,
-                index_id=run.index_id,
-                audit_persisted=run.audit_persisted,
-                hits=hits,
-            ),
+            retrieval=retrieval,
             context=SafeContextTrace(
                 estimated_tokens=context.estimated_tokens,
                 token_budget=context.token_budget,
@@ -605,6 +749,55 @@ def _project_path(root: Path, value: Path | None, default: str) -> Path:
 def _optional_env_path(name: str) -> Path | None:
     value = os.getenv(name, "").strip()
     return Path(value) if value else None
+
+
+def _environment_flag(name: str, *, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean value")
+
+
+def _environment_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        raise ValueError(f"{name} must be an integer") from None
+
+
+def _environment_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        raise ValueError(f"{name} must be a number") from None
+
+
+def _research_policy_from_environment() -> object:
+    from paper_research_agent.agent.policy import ResearchRuntimePolicy
+
+    return ResearchRuntimePolicy(
+        max_steps=_environment_int("PRA_RESEARCH_AGENT_MAX_STEPS", 2),
+        evidence_per_step=_environment_int(
+            "PRA_RESEARCH_AGENT_EVIDENCE_PER_STEP",
+            3,
+        ),
+        max_tool_calls=_environment_int("PRA_RESEARCH_AGENT_MAX_TOOL_CALLS", 4),
+        timeout_seconds=_environment_float(
+            "PRA_RESEARCH_AGENT_TIMEOUT_SECONDS",
+            90,
+        ),
+    )
 
 
 def _safe_paper_metadata(papers: Sequence[FrozenPaper]) -> dict[str, SafePaperMetadata]:

@@ -127,7 +127,7 @@ test -f "${RELEASE_DIR}/data/indexes/retrieval-v1/manifest.json"
 install -d -m 0700 -o paper-rag -g paper-rag "${RELEASE_DIR}/data/runtime"
 
 "${PYTHON_BIN}" -m venv "${RELEASE_DIR}/.venv"
-"${RELEASE_DIR}/.venv/bin/python" -m pip install --disable-pip-version-check --no-input "${RELEASE_DIR}[retrieval,web]"
+"${RELEASE_DIR}/.venv/bin/python" -m pip install --disable-pip-version-check --no-input "${RELEASE_DIR}[retrieval,web,agent]"
 chown -R paper-rag:paper-rag "${RELEASE_DIR}"
 chmod -R o-rwx "${RELEASE_DIR}"
 

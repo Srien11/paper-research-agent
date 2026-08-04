@@ -15,6 +15,7 @@ from paper_research_agent.agent.models import (
     ResearchPlan,
     SearchCorpusInput,
 )
+from paper_research_agent.agent.policy import ResearchRuntimePolicy
 from paper_research_agent.agent.service import ResearchToolService
 
 
@@ -40,6 +41,7 @@ class ResearchGraphState(TypedDict, total=False):
     question: str
     plan: dict[str, Any]
     current_step: int
+    tool_call_count: int
     observations: list[dict[str, Any]]
     evidence_records: list[dict[str, Any]]
 
@@ -50,6 +52,7 @@ def build_research_graph(
     service: ResearchToolService,
     max_steps: int = 4,
     evidence_per_step: int = 4,
+    policy: ResearchRuntimePolicy | None = None,
     checkpointer: Any | None = None,
 ) -> CompiledStateGraph[Any, Any, Any, Any]:
     """Compile a fixed planner-executor loop over the two read-only domain tools."""
@@ -57,6 +60,12 @@ def build_research_graph(
         raise ValueError("max_steps must be between 1 and 6")
     if evidence_per_step <= 0 or evidence_per_step > 20:
         raise ValueError("evidence_per_step must be between 1 and 20")
+    runtime_policy = policy or ResearchRuntimePolicy(
+        max_steps=max_steps,
+        evidence_per_step=evidence_per_step,
+    )
+    max_steps = runtime_policy.max_steps
+    evidence_per_step = runtime_policy.evidence_per_step
 
     async def create_plan(state: ResearchGraphState) -> ResearchGraphState:
         graph_input = ResearchGraphInput(question=state["question"])
@@ -67,6 +76,7 @@ def build_research_graph(
             "question": graph_input.question,
             "plan": plan.model_dump(mode="json"),
             "current_step": 0,
+            "tool_call_count": 0,
             "observations": [],
             "evidence_records": [],
         }
@@ -75,11 +85,16 @@ def build_research_graph(
         step_index = state["current_step"]
         plan = ResearchPlan.model_validate(state["plan"])
         step = plan.steps[step_index]
+        tool_call_count = runtime_policy.consume(
+            "search_corpus",
+            state["tool_call_count"],
+        )
         search = await service.search_corpus(
             SearchCorpusInput(query=step.query, top_k=step.top_k)
         )
         selected_ids = tuple(hit.chunk_id for hit in search.hits[:evidence_per_step])
         if selected_ids:
+            tool_call_count = runtime_policy.consume("get_evidence", tool_call_count)
             evidence = await service.get_evidence(GetEvidenceInput(chunk_ids=selected_ids))
         else:
             evidence = GetEvidenceResult(records=())
@@ -98,6 +113,7 @@ def build_research_graph(
                 seen.add(record.chunk_id)
         return {
             "current_step": step_index + 1,
+            "tool_call_count": tool_call_count,
             "observations": [*state["observations"], observation.model_dump(mode="json")],
             "evidence_records": merged,
         }

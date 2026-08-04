@@ -14,6 +14,7 @@ from paper_research_agent.agent.models import (
     SearchCorpusHit,
     SearchCorpusResult,
 )
+from paper_research_agent.agent.policy import ResearchRuntimePolicy
 
 
 def _hit(chunk_id: str, corpus_id: str, rank: int) -> SearchCorpusHit:
@@ -106,6 +107,7 @@ class ResearchGraphTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(planner.calls, [("比较 RAG 评测方法的标注需求", 4)])
         self.assertEqual(state["current_step"], 2)
+        self.assertEqual(state["tool_call_count"], 4)
         self.assertEqual(len(state["observations"]), 2)
         self.assertEqual(
             [record["chunk_id"] for record in state["evidence_records"]],
@@ -156,6 +158,32 @@ class ResearchGraphTests(unittest.IsolatedAsyncioTestCase):
         service.get_evidence.assert_not_awaited()
         self.assertEqual(state["observations"][0]["evidence"]["records"], [])
         self.assertEqual(state["evidence_records"], [])
+        self.assertEqual(state["tool_call_count"], 1)
+
+    async def test_rejects_evidence_call_above_runtime_tool_budget(self) -> None:
+        planner = FakePlanner(
+            ResearchPlan(
+                steps=(
+                    ResearchStep(step_id="search", objective="查找证据", query="bounded tools"),
+                )
+            )
+        )
+        service = AsyncMock()
+        service.search_corpus.return_value = SearchCorpusResult(
+            query="bounded tools",
+            index_id="idx-test",
+            degraded=False,
+            hits=(_hit("chunk-1", "C001", 1),),
+        )
+        graph = build_research_graph(
+            planner=planner,
+            service=service,
+            policy=ResearchRuntimePolicy(max_tool_calls=1),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "tool call budget"):
+            await graph.ainvoke({"question": "预算受限的问题"})
+        service.get_evidence.assert_not_awaited()
 
     async def test_checkpoint_can_restore_completed_thread_state(self) -> None:
         planner = FakePlanner(
@@ -184,6 +212,7 @@ class ResearchGraphTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(snapshot.values["question"], "验证检查点")
         self.assertEqual(snapshot.values["current_step"], 1)
+        self.assertEqual(snapshot.values["tool_call_count"], 1)
         self.assertEqual(snapshot.next, ())
 
 
