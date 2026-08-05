@@ -18,9 +18,11 @@ class ResearchRuntimePolicy(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     allowed_tools: frozenset[ResearchToolName] = READ_ONLY_RESEARCH_TOOLS
+    # This bounds the initial plan only. Evidence-driven replans may continue
+    # until the tool, timeout, repetition, or stagnation guards stop the run.
     max_steps: int = Field(default=4, ge=1, le=6)
     evidence_per_step: int = Field(default=4, ge=1, le=20)
-    max_tool_calls: int = Field(default=8, ge=1, le=12)
+    max_tool_calls: int = Field(default=12, ge=1, le=12)
     timeout_seconds: float = Field(default=90, gt=0, le=300)
 
     @field_validator("allowed_tools")

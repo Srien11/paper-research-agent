@@ -24,6 +24,9 @@ class FakeRuntime:
         self.questions: list[tuple[str, str]] = []
         self.cleared: list[str] = []
         self.error: Exception | None = None
+        self.tool_runs: list[tuple[str, str]] = []
+        self.approvals: list[tuple[str, bool]] = []
+        self.memory_lists = 0
 
     async def ask(self, question: str, *, session_id: str) -> object:
         if self.error is not None:
@@ -78,6 +81,68 @@ class FakeRuntime:
     async def clear_conversation(self, session_id: str) -> int:
         self.cleared.append(session_id)
         return 1
+
+    async def run_tool_research(self, question: str, *, session_id: str) -> object:
+        self.tool_runs.append((question, session_id))
+        return SimpleNamespace(
+            run_id="a" * 32,
+            status="approval_required",
+            observations=(),
+            final_summary=None,
+            termination_reason=None,
+            pending_approval=SimpleNamespace(
+                tool_name="save_research_note",
+                purpose="Save a confirmed finding",
+                arguments={"content": "must not cross Web"},
+                approval_request_id="b" * 32,
+                arguments_sha256="c" * 64,
+                expires_at_epoch=2_000_000_000,
+            ),
+        )
+
+    async def resume_tool_research(self, *, session_id: str, approved: bool) -> object:
+        self.approvals.append((session_id, approved))
+        return SimpleNamespace(
+            run_id="a" * 32,
+            status="completed",
+            observations=(
+                SimpleNamespace(
+                    sequence=1,
+                    tool_name="save_research_note",
+                    purpose="Save a confirmed finding",
+                    result=SimpleNamespace(
+                        status="denied" if not approved else "ok",
+                        trust="side_effect",
+                        items=(),
+                    ),
+                ),
+            ),
+            final_summary="Sensitive tool request was denied." if not approved else "Saved.",
+            termination_reason="approval_denied" if not approved else "router_finished",
+            pending_approval=None,
+        )
+
+    async def list_long_term_memories(self, *, limit: int = 20) -> object:
+        self.memory_lists += 1
+        return SimpleNamespace(
+            items=(
+                {
+                    "memory_id": "d" * 32,
+                    "kind": "preference",
+                    "content": "优先使用中文回答",
+                    "source_chunk_ids": (),
+                    "version": 2,
+                    "created_at": "2026-08-01T00:00:00+00:00",
+                    "updated_at": "2026-08-04T00:00:00+00:00",
+                    "expires_at": None,
+                    "supersedes_memory_id": "e" * 32,
+                    "content_sha256": "f" * 64,
+                    "scope_id": "global",
+                    "status": "active",
+                    "internal_path": "must-not-leak",
+                },
+            )[:limit]
+        )
 
     async def aclose(self) -> None:
         return None
@@ -142,11 +207,15 @@ class AppTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["conversation_id"], logged_in["conversation_id"])
 
-        cookie_header = self.client.post(
-            "/paper-research/api/login",
-            headers={"Origin": ORIGIN},
-            json={"username": "owner", "password": "correct-password"},
-        ).headers["set-cookie"].lower()
+        cookie_header = (
+            self.client.post(
+                "/paper-research/api/login",
+                headers={"Origin": ORIGIN},
+                json={"username": "owner", "password": "correct-password"},
+            )
+            .headers["set-cookie"]
+            .lower()
+        )
         self.assertIn("httponly", cookie_header)
         self.assertIn("secure", cookie_header)
         self.assertIn("samesite=strict", cookie_header)
@@ -230,6 +299,59 @@ class AppTests(unittest.TestCase):
         )
         self.assertEqual(busy.status_code, 409)
         self.assertNotIn("must not leak", busy.text)
+
+    def test_dynamic_tool_approval_is_authenticated_and_redacted(self) -> None:
+        unauthorized = self.client.post(
+            "/paper-research/api/tools/run",
+            headers={"Origin": ORIGIN},
+            json={"question": "Save this finding"},
+        )
+        self.assertEqual(unauthorized.status_code, 401)
+        session = self.login()
+
+        paused = self.client.post(
+            "/paper-research/api/tools/run",
+            headers={"Origin": ORIGIN},
+            json={"question": "Save this finding"},
+        )
+
+        self.assertEqual(paused.status_code, 200, paused.text)
+        self.assertEqual(paused.json()["status"], "approval_required")
+        self.assertEqual(paused.json()["pending_approval"]["tool_name"], "save_research_note")
+        self.assertNotIn('"arguments":', paused.text)
+        self.assertNotIn("must not cross Web", paused.text)
+        self.assertNotIn("approval_request_id", paused.text)
+        self.assertEqual(
+            self.runtime.tool_runs,
+            [("Save this finding", session["conversation_id"])],
+        )
+
+        denied = self.client.post(
+            "/paper-research/api/tools/approval",
+            headers={"Origin": ORIGIN},
+            json={"approved": False},
+        )
+        self.assertEqual(denied.status_code, 200, denied.text)
+        self.assertEqual(denied.json()["termination_reason"], "approval_denied")
+        self.assertEqual(
+            self.runtime.approvals,
+            [(session["conversation_id"], False)],
+        )
+
+    def test_long_term_memory_list_requires_auth_and_whitelists_fields(self) -> None:
+        path = "/paper-research/api/memories"
+        self.assertEqual(self.client.get(path).status_code, 401)
+        self.login()
+
+        response = self.client.get(path)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["memories"][0]["content"], "优先使用中文回答")
+        self.assertEqual(response.json()["memories"][0]["version"], 2)
+        self.assertNotIn("content_sha256", response.text)
+        self.assertNotIn("scope_id", response.text)
+        self.assertNotIn("internal_path", response.text)
+        self.assertEqual(self.runtime.memory_lists, 1)
 
     def test_new_conversation_clears_memory_and_rotates_id(self) -> None:
         initial = self.login()

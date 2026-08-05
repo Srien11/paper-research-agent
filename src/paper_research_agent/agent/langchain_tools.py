@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from langchain_core.tools import BaseTool, StructuredTool
 
 from paper_research_agent.agent.models import GetEvidenceInput, SearchCorpusInput
 from paper_research_agent.agent.service import ResearchToolService
 
+if TYPE_CHECKING:
+    from paper_research_agent.agent.tooling.service import ExtendedResearchToolkit
 
-def build_langchain_tools(service: ResearchToolService) -> tuple[BaseTool, BaseTool]:
-    """Return the fixed, read-only tool set exposed to a research Agent."""
+
+def build_langchain_tools(
+    service: ResearchToolService,
+    extended: ExtendedResearchToolkit | None = None,
+) -> tuple[BaseTool, ...]:
+    """Return the core RAG pair and, when configured, the 19 extended tools."""
 
     async def search_corpus(query: str, top_k: int = 10) -> dict[str, Any]:
         result = await service.search_corpus(SearchCorpusInput(query=query, top_k=top_k))
@@ -39,4 +45,11 @@ def build_langchain_tools(service: ResearchToolService) -> tuple[BaseTool, BaseT
         ),
         args_schema=GetEvidenceInput,
     )
-    return search_tool, evidence_tool
+    tools: tuple[BaseTool, ...] = (search_tool, evidence_tool)
+    if extended is not None:
+        from paper_research_agent.agent.tooling.langchain import (
+            build_extended_langchain_tools,
+        )
+
+        tools += build_extended_langchain_tools(extended)
+    return tools

@@ -1,0 +1,12 @@
+{"case_id":"route-001","question":"查看 chunk-17 前后各两个文本块","expected_tool":"get_adjacent_chunks","expected_risk":"local_read","expected_trust":"citation_evidence","approval_required":false}
+{"case_id":"route-002","question":"查询 C001 和 C002 的标题及出版元数据","expected_tool":"get_paper_metadata","expected_risk":"local_read","expected_trust":"research_context","approval_required":false}
+{"case_id":"route-003","question":"追踪 chunk-17 的论文、页码和哈希来源","expected_tool":"trace_evidence_source","expected_risk":"local_read","expected_trust":"citation_evidence","approval_required":false}
+{"case_id":"route-004","question":"比较 C001、C002 在评测指标上的证据","expected_tool":"compare_papers","expected_risk":"local_read","expected_trust":"citation_evidence","approval_required":false}
+{"case_id":"route-005","question":"在学术来源中搜索 2024 年后的 RAG 评测论文","expected_tool":"search_scholarly_sources","expected_risk":"network_read","expected_trust":"research_context","approval_required":false}
+{"case_id":"route-006","question":"读取 DOI 10.1000/example 的参考文献图","expected_tool":"get_citation_graph","expected_risk":"network_read","expected_trust":"research_context","approval_required":false}
+{"case_id":"route-007","question":"提取 C001 第 8 页的表格","expected_tool":"extract_table","expected_risk":"local_read","expected_trust":"citation_evidence","approval_required":false}
+{"case_id":"route-008","question":"计算 (18 + 6) / 3","expected_tool":"calculate","expected_risk":"restricted_compute","expected_trust":"computed_result","approval_required":false}
+{"case_id":"route-009","question":"核验 claim：该方法在所有数据集上都更好","expected_tool":"verify_claim","expected_risk":"local_read","expected_trust":"citation_evidence","approval_required":false}
+{"case_id":"route-010","question":"把已确认结论保存成研究笔记","expected_tool":"save_research_note","expected_risk":"write","expected_trust":"side_effect","approval_required":true}
+{"case_id":"route-011","question":"导出 markdown 研究报告","expected_tool":"export_research_report","expected_risk":"write","expected_trust":"side_effect","approval_required":true}
+{"case_id":"route-012","question":"把我的研究偏好写入长期记忆","expected_tool":"manage_long_term_memory","expected_risk":"write","expected_trust":"side_effect","approval_required":true}

@@ -4,11 +4,14 @@ import hashlib
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
+from paper_research_agent.agent.dynamic.memory import MemoryProposal
+from paper_research_agent.agent.dynamic.models import ToolDecision
 from paper_research_agent.agent.factory import create_research_agent_runtime
-from paper_research_agent.agent.models import ResearchPlan, ResearchStep
+from paper_research_agent.agent.models import EvidenceAssessment, ResearchPlan, ResearchStep
 from paper_research_agent.agent.policy import ResearchRuntimePolicy
 from paper_research_agent.chunking.models import EvidenceChunk
 from paper_research_agent.retrieval.contracts import (
@@ -75,27 +78,51 @@ class ResearchAgentFactoryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(kwargs["model"], "qwen-test-2026-01-01")
             self.assertEqual(kwargs["base_url"], "https://dashscope.example/v1")
             self.assertEqual(kwargs["extra_body"], {"enable_thinking": False})
+            self.assertEqual(model.with_structured_output.call_count, 4)
+            self.assertEqual(
+                [call.args[0] for call in model.with_structured_output.call_args_list],
+                [ResearchPlan, EvidenceAssessment, ToolDecision, MemoryProposal],
+            )
             self.assertEqual(runtime.policy.max_steps, 2)
+            self.assertTrue(runtime.extended_tools_enabled)
             self.assertTrue(checkpoint.exists())
+            self.assertTrue(checkpoint.with_name("agent-events-v1.sqlite3").exists())
+
+            calculation = await runtime.execute_tool("calculate", {"expression": "6 * 7"})
+            self.assertEqual(calculation.items[0]["value"], 42)
+            with self.assertRaisesRegex(PermissionError, "unknown extended"):
+                await runtime.execute_tool("run_shell", {"command": "blocked"})
 
             await runtime.aclose()
             model.root_async_client.close.assert_awaited_once()
 
     async def test_persists_completed_graph_state_in_sqlite(self) -> None:
         chunk = _chunk()
-        structured = AsyncMock()
-        structured.ainvoke.return_value = ResearchPlan(
-                steps=(
-                    ResearchStep(
-                        step_id="search",
-                        objective="查找本地证据",
-                        query="bounded evidence",
-                        top_k=2,
-                    ),
-                )
+        planner_structured = AsyncMock()
+        planner_structured.ainvoke.return_value = ResearchPlan(
+            steps=(
+                ResearchStep(
+                    step_id="search",
+                    objective="Find local evidence",
+                    query="bounded evidence",
+                    top_k=2,
+                ),
             )
+        )
+        reasoner_structured = AsyncMock()
+        reasoner_structured.ainvoke.return_value = EvidenceAssessment(
+            evidence_sufficient=True,
+            status="sufficient",
+        )
+        router_structured = AsyncMock()
+        memory_structured = AsyncMock()
         model = Mock()
-        model.with_structured_output.return_value = structured
+        model.with_structured_output.side_effect = (
+            planner_structured,
+            reasoner_structured,
+            router_structured,
+            memory_structured,
+        )
         model.root_async_client = Mock(close=AsyncMock())
         retriever = FakeRetriever(chunk)
         with tempfile.TemporaryDirectory() as directory:
@@ -116,6 +143,7 @@ class ResearchAgentFactoryTests(unittest.IsolatedAsyncioTestCase):
 
             result = await runtime.run("验证持久化", thread_id="thread-sqlite")
             self.assertEqual(result.tool_call_count, 2)
+            self.assertEqual(result.termination_reason, "evidence_sufficient")
             connection = sqlite3.connect(checkpoint)
             try:
                 checkpoint_count = connection.execute(
@@ -124,14 +152,23 @@ class ResearchAgentFactoryTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 connection.close()
             self.assertGreater(checkpoint_count, 0)
+            event_path = checkpoint.with_name("agent-events-v1.sqlite3")
+            with closing(sqlite3.connect(event_path)) as event_connection:
+                event_types = [
+                    row[0]
+                    for row in event_connection.execute(
+                        "SELECT event_type FROM agent_events ORDER BY event_id"
+                    ).fetchall()
+                ]
+            self.assertEqual(event_types[0], "run_started")
+            self.assertEqual(event_types[-1], "run_completed")
+            self.assertIn("tool_completed", event_types)
 
             await runtime.clear("thread-sqlite")
             await runtime.aclose()
             connection = sqlite3.connect(checkpoint)
             try:
-                remaining = connection.execute(
-                    "SELECT COUNT(*) FROM checkpoints"
-                ).fetchone()[0]
+                remaining = connection.execute("SELECT COUNT(*) FROM checkpoints").fetchone()[0]
             finally:
                 connection.close()
             self.assertEqual(remaining, 0)

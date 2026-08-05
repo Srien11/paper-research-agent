@@ -6,15 +6,23 @@ const API = Object.freeze({
   logout: "api/logout",
   conversation: "api/conversation",
   ask: "api/ask",
-  recommendations: "api/recommended-questions",
+  chatStream: "api/chat/stream",
+  files: "api/files",
+  toolRun: "api/tools/run",
+  toolApproval: "api/tools/approval",
+  memories: "api/memories",
 });
 
 const STORAGE_KEY = "paper-research.current-dialogue.v1";
+const HISTORY_KEY = "paper-research.dialogue-history.v1";
 const state = {
   busy: false,
   citations: new Map(),
   history: [],
   phaseTimer: null,
+  pendingTool: null,
+  viewingArchive: false,
+  attachments: [],
 };
 
 const elements = {
@@ -26,10 +34,15 @@ const elements = {
   loginError: document.querySelector("#login-error"),
   logout: document.querySelector("#logout"),
   newConversation: document.querySelector("#new-conversation"),
-  questionList: document.querySelector("#recommended-questions"),
+  memoriesButton: document.querySelector("#memories-button"),
+  conversationHistory: document.querySelector("#conversation-history"),
   askForm: document.querySelector("#ask-form"),
   question: document.querySelector("#question"),
   askButton: document.querySelector("#ask-button"),
+  fileInput: document.querySelector("#file-input"),
+  fileButton: document.querySelector("#file-button"),
+  fileList: document.querySelector("#file-list"),
+  toolMode: document.querySelector("#tool-mode"),
   messages: document.querySelector("#messages"),
   emptyState: document.querySelector("#empty-state"),
   loadingTemplate: document.querySelector("#loading-message-template"),
@@ -48,15 +61,16 @@ const elements = {
   evidenceDialog: document.querySelector("#evidence-dialog"),
   evidenceClose: document.querySelector("#evidence-close"),
   evidenceContent: document.querySelector("#evidence-content"),
+  toolApprovalDialog: document.querySelector("#tool-approval-dialog"),
+  toolApprovalDetails: document.querySelector("#tool-approval-details"),
+  toolApprovalReject: document.querySelector("#tool-approval-reject"),
+  toolApprovalAccept: document.querySelector("#tool-approval-accept"),
+  memoriesDialog: document.querySelector("#memories-dialog"),
+  memoriesClose: document.querySelector("#memories-close"),
+  memoriesList: document.querySelector("#memories-list"),
   toastRegion: document.querySelector("#toast-region"),
   conversationLabel: document.querySelector("#conversation-label"),
 };
-
-const fallbackQuestions = [
-  { category: "RAG 可靠性", title: "降低检索增强生成的幻觉", prompt: "现有研究中，哪些方法能降低 RAG 系统的幻觉，并如何评估效果？" },
-  { category: "评测方法", title: "大模型评测的可信度", prompt: "大语言模型评测中常见的可靠性威胁有哪些？" },
-  { category: "检索基准", title: "BEIR 与 MTEB 的区别", prompt: "BEIR 和 MTEB 分别覆盖哪些任务，它们的设计目标有什么区别？" },
-];
 
 function createElement(tag, className, text) {
   const node = document.createElement(tag);
@@ -98,7 +112,6 @@ function setAuthenticated(authenticated) {
   elements.appView.hidden = !authenticated;
   if (authenticated) {
     restoreHistory();
-    loadRecommendedQuestions();
     window.requestAnimationFrame(() => elements.question.focus());
   } else {
     elements.username.value = "";
@@ -162,41 +175,13 @@ async function handleLogout() {
   setAuthenticated(false);
 }
 
-async function loadRecommendedQuestions() {
-  let questions = fallbackQuestions;
-  try {
-    const payload = await request(API.recommendations, { method: "GET" });
-    if (Array.isArray(payload) && payload.length) questions = payload;
-    else if (Array.isArray(payload.questions) && payload.questions.length) questions = payload.questions;
-  } catch (_error) {
-    // The static fallback keeps the interface useful during API degradation.
-  }
-  renderRecommendedQuestions(questions);
-}
-
-function renderRecommendedQuestions(questions) {
-  elements.questionList.replaceChildren();
-  questions.slice(0, 8).forEach((item) => {
-    const button = createElement("button", "question-card");
-    button.type = "button";
-    button.dataset.prompt = String(item.prompt || item.title || "");
-    button.append(
-      createElement("small", "", item.category || "推荐问题"),
-      createElement("strong", "", item.title || item.prompt || "开始研究"),
-    );
-    button.addEventListener("click", () => {
-      elements.question.value = button.dataset.prompt;
-      elements.question.focus();
-    });
-    elements.questionList.append(button);
-  });
-}
-
 function setBusy(busy) {
   state.busy = busy;
   elements.askButton.disabled = busy;
   elements.newConversation.disabled = busy;
   elements.question.disabled = busy;
+  elements.toolMode.disabled = busy;
+  elements.fileButton.disabled = busy;
   elements.askButton.classList.toggle("is-loading", busy);
   elements.messages.setAttribute("aria-busy", String(busy));
   elements.pipeline.hidden = !busy;
@@ -233,22 +218,22 @@ async function handleAsk(event) {
     return;
   }
   hideNotice();
+  if (state.viewingArchive) {
+    resetWorkspace();
+    state.history.forEach((item) => {
+      if (item.role === "user") appendUserMessage(item.text, false);
+      else appendRestoredAssistant(item.text, item.status);
+    });
+    state.viewingArchive = false;
+  }
   elements.emptyState.hidden = true;
   appendUserMessage(question, true);
-  const loadingMessage = elements.loadingTemplate.content.cloneNode(true).firstElementChild;
-  elements.messages.append(loadingMessage);
   elements.question.value = "";
   setBusy(true);
   scrollMessages();
   try {
-    const payload = await request(API.ask, {
-      method: "POST",
-      body: JSON.stringify({ question }),
-    });
-    loadingMessage.remove();
-    renderAnswer(payload, true);
+    await streamConversation(question);
   } catch (error) {
-    loadingMessage.remove();
     if (error.status === 401) {
       showToast("登录已过期，请重新登录。");
       setAuthenticated(false);
@@ -262,6 +247,305 @@ async function handleAsk(event) {
     scrollMessages();
     if (!elements.appView.hidden) elements.question.focus();
   }
+}
+
+async function streamConversation(question, sourceNote = "") {
+  const activeFiles = [...state.attachments];
+  const response = await fetch(API.chatStream, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      question,
+      attachment_ids: activeFiles.map((item) => item.attachment_id),
+      local_only: elements.toolMode.checked,
+    }),
+  });
+  if (!response.ok) {
+    let message = "请求暂时未完成，请稍后重试。";
+    try {
+      const payload = await response.json();
+      if (typeof payload.detail === "string") message = payload.detail;
+    } catch (_error) {
+      // Keep the safe fallback message.
+    }
+    const error = new Error(message);
+    error.status = response.status;
+    throw error;
+  }
+  if (!response.body) throw new Error("浏览器不支持流式输出。请升级浏览器后重试。");
+
+  const article = createElement("article", "message message-assistant");
+  const meta = createElement("div", "message-meta");
+  meta.append(
+    createElement("span", "assistant-mark", "研"),
+    createElement("strong", "", "智能路由中"),
+  );
+  if (sourceNote) meta.append(createElement("small", "source-note", sourceNote));
+  const copy = createElement("div", "answer-copy natural-answer");
+  copy.textContent = "正在判断最合适的处理方式…";
+  article.append(meta, copy);
+  elements.messages.append(article);
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let rawText = "";
+  let metrics = null;
+  let route = "normal_chat";
+  let ragHandled = false;
+  let lastPaint = 0;
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+    const lines = buffer.split("\n");
+    buffer = done ? "" : lines.pop();
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const event = JSON.parse(line);
+      if (event.type === "route") {
+        route = event.route;
+        meta.querySelector("strong").textContent = event.label || "研究助手";
+        meta.querySelector(".assistant-mark").textContent = route.startsWith("attachment") || route === "file_edit" ? "文" : "研";
+        copy.textContent = route === "file_edit" ? "正在修改文件，完成后可下载新文件…" : "";
+        if (event.reason) meta.append(createElement("small", "source-note", event.reason));
+      } else if (event.type === "rag_result" && event.payload) {
+        article.remove();
+        renderAnswer(event.payload, true);
+        ragHandled = true;
+      } else if (event.type === "approval_required" && event.payload) {
+        article.remove();
+        renderToolResearch(event.payload, true);
+        ragHandled = true;
+      } else if (event.type === "delta" && typeof event.text === "string") {
+        rawText += event.text;
+        const now = performance.now();
+        if (now - lastPaint >= 50) {
+          if (route !== "file_edit") {
+            copy.textContent = naturalText(rawText);
+            scrollMessages();
+          }
+          lastPaint = now;
+        }
+      } else if (event.type === "done") {
+        metrics = event.metrics || null;
+      } else if (event.type === "error") {
+        throw new Error(event.message || "生成回答时发生错误。");
+      }
+    }
+    if (done) break;
+  }
+  if (ragHandled) return;
+  const editMode = route === "file_edit";
+  const finalText = (editMode ? rawText : naturalText(rawText)).trim();
+  copy.textContent = editMode ? "文件修改完成，可以下载新文件。" : finalText;
+  if (editMode && activeFiles.length) {
+    article.append(createDownloadButton(finalText, activeFiles[0].filename));
+  }
+  if (metrics) article.append(renderStreamMetrics(metrics));
+  saveHistoryItem({ role: "assistant", text: finalText, metrics });
+}
+
+function createDownloadButton(content, originalName) {
+  const button = createElement("button", "download-file", "下载修改后的文件");
+  button.type = "button";
+  button.addEventListener("click", () => {
+    const pdf = originalName.toLowerCase().endsWith(".pdf");
+    const name = pdf
+      ? `${originalName.replace(/\.pdf$/i, "")}_修改版.txt`
+      : originalName.replace(/(\.[^.]+)?$/, "_修改版$1");
+    const url = URL.createObjectURL(new Blob([content], { type: "text/plain;charset=utf-8" }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = name;
+    link.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  });
+  return button;
+}
+
+async function uploadSelectedFile(file) {
+  if (!file || state.busy) return;
+  if (state.attachments.length >= 1) {
+    showNotice("第一版每次修改 1 个文件，请先移除当前文件。", "error");
+    return;
+  }
+  elements.fileButton.disabled = true;
+  try {
+    const response = await fetch(`${API.files}?filename=${encodeURIComponent(file.name)}`, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": file.type || "application/octet-stream" },
+      body: file,
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.detail || "文件上传失败。");
+    state.attachments.push(payload);
+    renderFiles();
+    elements.question.placeholder = "说明你希望怎样修改这个文件…";
+  } catch (error) {
+    showNotice(error.message, "error");
+  } finally {
+    elements.fileButton.disabled = false;
+    elements.fileInput.value = "";
+  }
+}
+
+function renderFiles() {
+  elements.fileList.replaceChildren();
+  state.attachments.forEach((item) => {
+    const chip = createElement("span", "file-chip");
+    const remove = createElement("button", "", "×");
+    remove.type = "button";
+    remove.setAttribute("aria-label", `移除 ${item.filename}`);
+    remove.addEventListener("click", async () => {
+      try {
+        await request(`${API.files}/${item.attachment_id}`, { method: "DELETE", body: "{}" });
+      } catch (_error) {
+        // The local reference can still be removed if cleanup is unavailable.
+      }
+      state.attachments = state.attachments.filter((file) => file.attachment_id !== item.attachment_id);
+      renderFiles();
+    });
+    chip.append(createElement("span", "", item.filename), remove);
+    elements.fileList.append(chip);
+  });
+  if (!state.attachments.length) {
+    elements.question.placeholder = "输入一个关于大模型评测、RAG 或检索研究的问题…";
+  }
+}
+
+function naturalText(value) {
+  return String(value || "")
+    .replace(/^\s*#{1,6}\s*/gm, "")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/__([^_]+)__/g, "$1")
+    .replace(/```[^\n]*\n?/g, "")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/^\s*[-*+]\s+/gm, "")
+    .replace(/\n{3,}/g, "\n\n");
+}
+
+function renderStreamMetrics(metrics) {
+  const box = createElement("div", "stream-metrics");
+  const seconds = (Number(metrics.elapsed_ms || 0) / 1000).toFixed(1);
+  const first = (Number(metrics.first_token_ms || 0) / 1000).toFixed(1);
+  box.textContent = `总耗时 ${seconds} 秒 · 首字等待（近似思考）${first} 秒 · 输入 ${Number(metrics.input_tokens || 0)} Token · 输出 ${Number(metrics.output_tokens || 0)} Token`;
+  return box;
+}
+
+function renderToolResearch(payload, persist) {
+  const article = createElement("article", "message message-assistant");
+  const meta = createElement("div", "message-meta");
+  meta.append(createElement("span", "assistant-mark", "工"), createElement("strong", "", "动态工具 Agent"));
+  article.append(meta);
+  const observations = Array.isArray(payload.observations) ? payload.observations : [];
+  if (observations.length) {
+    const list = createElement("ol", "tool-observations");
+    observations.forEach((item) => {
+      const row = createElement("li");
+      row.append(
+        createElement("strong", "", item.tool_name || "unknown_tool"),
+        createElement("small", "", ` · ${item.status || "unknown"} · ${item.trust || "unclassified"}`),
+        createElement("p", "", item.purpose || ""),
+      );
+      list.append(row);
+    });
+    article.append(list);
+  }
+  const text = payload.status === "approval_required"
+    ? "敏感工具已暂停，等待你的批准或拒绝。"
+    : payload.final_summary || "工具研究已完成。";
+  article.append(createElement("p", payload.status === "approval_required" ? "insufficient" : "", text));
+  elements.messages.append(article);
+  if (persist) saveHistoryItem({ role: "assistant", text, status: payload.status });
+  if (payload.status === "approval_required" && payload.pending_approval) {
+    openToolApproval(payload.pending_approval);
+  } else {
+    state.pendingTool = null;
+    showNotice("动态工具研究已完成；只有 citation_evidence 可作为论文引用依据。", "success");
+  }
+}
+
+function openToolApproval(pending) {
+  state.pendingTool = pending;
+  elements.toolApprovalDetails.replaceChildren();
+  appendDetail(elements.toolApprovalDetails, "工具", pending.tool_name);
+  appendDetail(elements.toolApprovalDetails, "用途", pending.purpose);
+  appendDetail(elements.toolApprovalDetails, "参数指纹", pending.arguments_sha256);
+  appendDetail(elements.toolApprovalDetails, "有效期", new Date(pending.expires_at_epoch * 1000).toLocaleString());
+  elements.toolApprovalDialog.showModal();
+}
+
+async function resolveToolApproval(approved) {
+  if (!state.pendingTool || state.busy) return;
+  setBusy(true);
+  elements.toolApprovalAccept.disabled = true;
+  elements.toolApprovalReject.disabled = true;
+  try {
+    const payload = await request(API.toolApproval, {
+      method: "POST",
+      body: JSON.stringify({ approved }),
+    });
+    elements.toolApprovalDialog.close();
+    renderToolResearch(payload, true);
+  } catch (error) {
+    showNotice(error.message, "error");
+  } finally {
+    elements.toolApprovalAccept.disabled = false;
+    elements.toolApprovalReject.disabled = false;
+    setBusy(false);
+  }
+}
+
+async function openMemories() {
+  elements.memoriesButton.disabled = true;
+  elements.memoriesList.replaceChildren(createElement("p", "insufficient", "正在读取长期记忆…"));
+  elements.memoriesDialog.showModal();
+  try {
+    const payload = await request(API.memories, { method: "GET" });
+    const memories = Array.isArray(payload.memories) ? payload.memories : [];
+    elements.memoriesList.replaceChildren();
+    if (!memories.length) {
+      elements.memoriesList.append(createElement("p", "insufficient", "当前没有有效的长期记忆。"));
+      return;
+    }
+    memories.forEach((memory) => {
+      const card = createElement("article", "memory-card");
+      const header = createElement("header");
+      header.append(
+        createElement("strong", "", memoryKindLabel(memory.kind)),
+        createElement("small", "", `v${memory.version || 1}`),
+      );
+      card.append(
+        header,
+        createElement("p", "", memory.content || ""),
+        createElement(
+          "small",
+          "",
+          `更新：${formatMemoryTime(memory.updated_at)} · 来源：${(memory.source_chunk_ids || []).length} 条`,
+        ),
+      );
+      elements.memoriesList.append(card);
+    });
+  } catch (error) {
+    elements.memoriesList.replaceChildren(createElement("p", "insufficient", error.message));
+  } finally {
+    elements.memoriesButton.disabled = false;
+  }
+}
+
+function memoryKindLabel(kind) {
+  return {
+    preference: "研究偏好",
+    project_context: "项目背景",
+    confirmed_conclusion: "确认结论",
+  }[kind] || "长期记忆";
+}
+
+function formatMemoryTime(value) {
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? "未知" : parsed.toLocaleString();
 }
 
 function appendUserMessage(text, persist) {
@@ -314,7 +598,11 @@ function renderAnswer(payload, persist) {
 
   const article = createElement("article", "message message-assistant");
   const meta = createElement("div", "message-meta");
-  meta.append(createElement("span", "assistant-mark", "研"), createElement("strong", "", "论文研究 Agent"));
+  meta.append(
+    createElement("span", "assistant-mark", "研"),
+    createElement("strong", "", "论文研究 Agent"),
+    createElement("small", "source-note source-note-rag", "本地论文库依据"),
+  );
   article.append(meta);
 
   if (normalized.status === "insufficient_evidence") {
@@ -345,7 +633,7 @@ function renderAnswer(payload, persist) {
 
 function renderClaim(claim) {
   const item = createElement("li", "claim");
-  item.append(createElement("p", "", claim.text || ""));
+  item.append(renderCompactText(claim.text || ""));
   const ids = Array.isArray(claim.citation_ids) ? claim.citation_ids : [];
   if (ids.length) {
     const buttons = createElement("div", "citation-buttons");
@@ -359,6 +647,40 @@ function renderClaim(claim) {
     item.append(buttons);
   }
   return item;
+}
+
+function renderCompactText(value) {
+  const container = createElement("div", "answer-copy");
+  const lines = String(value).replace(/\r\n?/g, "\n").split("\n");
+  let list = null;
+  let listType = "";
+
+  lines.forEach((line) => {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      list = null;
+      listType = "";
+      return;
+    }
+    const unordered = trimmed.match(/^[-*]\s+(.+)$/);
+    const ordered = trimmed.match(/^\d+[.)]\s+(.+)$/);
+    const nextListType = ordered ? "ol" : unordered ? "ul" : "";
+    if (nextListType) {
+      if (!list || listType !== nextListType) {
+        list = document.createElement(nextListType);
+        listType = nextListType;
+        container.append(list);
+      }
+      list.append(createElement("li", "", (ordered || unordered)[1]));
+      return;
+    }
+    list = null;
+    listType = "";
+    container.append(createElement("p", "", trimmed));
+  });
+
+  if (!container.childElementCount) container.append(createElement("p", "", "—"));
+  return container;
 }
 
 function renderInspector(normalized) {
@@ -504,8 +826,10 @@ async function startNewConversation() {
   if (state.busy) return;
   elements.newConversation.disabled = true;
   try {
+    archiveCurrentDialogue();
     await request(API.conversation, { method: "DELETE" });
     clearLocalDialogue();
+    renderHistoryList();
     resetWorkspace();
     showToast("已开始新对话，上一轮短期记忆不再参与检索。 ");
   } catch (error) {
@@ -533,6 +857,7 @@ function saveHistoryItem(item) {
   state.history = state.history.slice(-24);
   try {
     sessionStorage.setItem(STORAGE_KEY, JSON.stringify(state.history));
+    renderHistoryList();
   } catch (_error) {
     // Browsers may deny storage in private contexts; the live view remains functional.
   }
@@ -542,6 +867,7 @@ function restoreHistory() {
   if (state.history.length) return;
   try {
     const stored = JSON.parse(sessionStorage.getItem(STORAGE_KEY) || "[]");
+    renderHistoryList();
     if (!Array.isArray(stored) || !stored.length) return;
     elements.emptyState.hidden = true;
     stored.slice(-24).forEach((item) => {
@@ -556,11 +882,90 @@ function restoreHistory() {
   }
 }
 
+function archiveCurrentDialogue() {
+  if (!state.history.length) return;
+  let archives = [];
+  try {
+    archives = JSON.parse(sessionStorage.getItem(HISTORY_KEY) || "[]");
+    if (!Array.isArray(archives)) archives = [];
+  } catch (_error) {
+    archives = [];
+  }
+  const firstQuestion = state.history.find((item) => item.role === "user")?.text || "未命名对话";
+  archives.unshift({ id: crypto.randomUUID(), title: firstQuestion, createdAt: Date.now(), items: state.history });
+  try {
+    sessionStorage.setItem(HISTORY_KEY, JSON.stringify(archives.slice(0, 20)));
+  } catch (_error) {
+    // The live conversation still works when storage is unavailable.
+  }
+  renderHistoryList();
+}
+
+function renderHistoryList() {
+  let archives = [];
+  try {
+    archives = JSON.parse(sessionStorage.getItem(HISTORY_KEY) || "[]");
+  } catch (_error) {
+    archives = [];
+  }
+  elements.conversationHistory.replaceChildren();
+  const currentQuestion = state.history.find((item) => item.role === "user")?.text;
+  if (currentQuestion) {
+    const current = createElement("button", "history-card history-card-current");
+    current.type = "button";
+    current.append(
+      createElement("strong", "", currentQuestion),
+      createElement("small", "", "当前对话"),
+    );
+    current.addEventListener("click", showCurrentDialogue);
+    elements.conversationHistory.append(current);
+  }
+  if ((!Array.isArray(archives) || !archives.length) && !currentQuestion) {
+    elements.conversationHistory.append(createElement("p", "history-empty", "开始新对话后，上一轮会保留在这里。"));
+    return;
+  }
+  archives.forEach((archive) => {
+    const button = createElement("button", "history-card");
+    button.type = "button";
+    button.append(
+      createElement("strong", "", archive.title || "未命名对话"),
+      createElement("small", "", new Date(archive.createdAt).toLocaleString()),
+    );
+    button.addEventListener("click", () => showArchivedDialogue(archive));
+    elements.conversationHistory.append(button);
+  });
+}
+
+function showCurrentDialogue() {
+  elements.messages.replaceChildren();
+  state.history.forEach((item) => {
+    if (item.role === "user") appendUserMessage(item.text, false);
+    else appendRestoredAssistant(item.text, item.status);
+  });
+  state.viewingArchive = false;
+  elements.conversationLabel.textContent = "当前对话";
+  hideNotice();
+  scrollMessages();
+}
+
+function showArchivedDialogue(archive) {
+  const items = Array.isArray(archive.items) ? archive.items : [];
+  elements.messages.replaceChildren();
+  items.forEach((item) => {
+    if (item.role === "user") appendUserMessage(item.text, false);
+    else appendRestoredAssistant(item.text, item.status);
+  });
+  state.viewingArchive = true;
+  elements.conversationLabel.textContent = "正在查看历史对话";
+  showNotice("这是历史记录；继续提问时会返回当前对话。", "warning");
+  scrollMessages();
+}
+
 function appendRestoredAssistant(text, status) {
   const article = createElement("article", "message message-assistant");
   const meta = createElement("div", "message-meta");
   meta.append(createElement("span", "assistant-mark", "研"), createElement("strong", "", "论文研究 Agent"));
-  article.append(meta, createElement("p", status === "error" ? "insufficient" : "", text));
+  article.append(meta, status === "error" ? createElement("p", "insufficient", text) : renderCompactText(text));
   elements.messages.append(article);
 }
 
@@ -580,7 +985,20 @@ function scrollMessages() {
 elements.loginForm.addEventListener("submit", handleLogin);
 elements.logout.addEventListener("click", handleLogout);
 elements.newConversation.addEventListener("click", startNewConversation);
+elements.memoriesButton.addEventListener("click", openMemories);
 elements.askForm.addEventListener("submit", handleAsk);
+elements.fileButton.addEventListener("click", () => elements.fileInput.click());
+elements.fileInput.addEventListener("change", () => uploadSelectedFile(elements.fileInput.files[0]));
+elements.askForm.addEventListener("dragover", (event) => {
+  event.preventDefault();
+  elements.askForm.classList.add("is-dragging");
+});
+elements.askForm.addEventListener("dragleave", () => elements.askForm.classList.remove("is-dragging"));
+elements.askForm.addEventListener("drop", (event) => {
+  event.preventDefault();
+  elements.askForm.classList.remove("is-dragging");
+  uploadSelectedFile(event.dataTransfer.files[0]);
+});
 elements.question.addEventListener("keydown", (event) => {
   if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
     event.preventDefault();
@@ -593,6 +1011,12 @@ elements.inspectorScrim.addEventListener("click", closeInspector);
 elements.evidenceClose.addEventListener("click", () => elements.evidenceDialog.close());
 elements.evidenceDialog.addEventListener("click", (event) => {
   if (event.target === elements.evidenceDialog) elements.evidenceDialog.close();
+});
+elements.toolApprovalAccept.addEventListener("click", () => resolveToolApproval(true));
+elements.toolApprovalReject.addEventListener("click", () => resolveToolApproval(false));
+elements.memoriesClose.addEventListener("click", () => elements.memoriesDialog.close());
+elements.memoriesDialog.addEventListener("click", (event) => {
+  if (event.target === elements.memoriesDialog) elements.memoriesDialog.close();
 });
 
 checkSession();

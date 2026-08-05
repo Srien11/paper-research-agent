@@ -37,6 +37,32 @@ def evidence(chunk_id: str, text: str, rank: int) -> ContextEvidence:
 
 
 class ContextAssemblerTests(unittest.TestCase):
+    def test_partial_answer_policy_is_a_trusted_opt_in(self) -> None:
+        default_context = assemble_context(
+            ContextRequest(
+                system_rules="Use citations.",
+                user_question="Broad question",
+                evidence=(evidence("c1", "supported subset", 1),),
+                token_budget=2000,
+            )
+        )
+        partial_context = assemble_context(
+            ContextRequest(
+                system_rules="Use citations.",
+                user_question="Broad question",
+                evidence=(evidence("c1", "supported subset", 1),),
+                allow_partial_answer=True,
+                token_budget=2000,
+            )
+        )
+
+        self.assertNotIn("PARTIAL COVERAGE POLICY", default_context.messages[0].content)
+        self.assertIn("PARTIAL COVERAGE POLICY", partial_context.messages[0].content)
+        self.assertIn(
+            'Do not return "insufficient_evidence" solely because the full question is not covered.',
+            partial_context.messages[0].content,
+        )
+
     def test_layers_are_ordered_and_deterministic(self) -> None:
         request = ContextRequest(
             system_rules="Use citations.",

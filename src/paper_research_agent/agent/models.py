@@ -10,6 +10,39 @@ from paper_research_agent.ingestion.models import Sha256
 
 StorageClass = Literal["redistributable", "internal_research_only"]
 EvidenceType = Literal["text", "figure_summary"]
+AssessmentStatus = Literal[
+    "sufficient",
+    "missing_coverage",
+    "conflicting_evidence",
+    "no_hits",
+]
+TerminationReason = Literal[
+    "evidence_sufficient",
+    "tool_budget",
+    "no_new_evidence",
+    "plan_exhausted",
+    "repeated_query",
+]
+ResearchActionName = Literal[
+    "search_corpus",
+    "get_evidence",
+    "assess_evidence",
+    "replan",
+    "finish",
+]
+
+ASSESSMENT_STATUSES: frozenset[str] = frozenset(
+    {"sufficient", "missing_coverage", "conflicting_evidence", "no_hits"}
+)
+TERMINATION_REASONS: frozenset[str] = frozenset(
+    {
+        "evidence_sufficient",
+        "tool_budget",
+        "no_new_evidence",
+        "plan_exhausted",
+        "repeated_query",
+    }
+)
 
 
 class FrozenContract(BaseModel):
@@ -169,3 +202,103 @@ class ResearchObservation(FrozenContract):
     objective: str = Field(min_length=1)
     search: SearchCorpusResult
     evidence: GetEvidenceResult
+
+
+class EvidenceAssessment(FrozenContract):
+    """One bounded reflection over accumulated local evidence."""
+
+    schema_version: Literal["research-evidence-assessment-v1"] = "research-evidence-assessment-v1"
+    evidence_sufficient: bool
+    status: AssessmentStatus
+    next_query: str | None = Field(default=None, min_length=1, max_length=2000)
+    next_objective: str | None = Field(default=None, min_length=1, max_length=500)
+
+    @field_validator("next_query", "next_objective")
+    @classmethod
+    def normalize_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("next search text must not be blank")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_decision(self) -> EvidenceAssessment:
+        has_next_query = self.next_query is not None
+        has_next_objective = self.next_objective is not None
+        if self.evidence_sufficient:
+            if self.status != "sufficient":
+                raise ValueError("sufficient evidence requires sufficient status")
+            if has_next_query or has_next_objective:
+                raise ValueError("sufficient evidence cannot request another search")
+        else:
+            if self.status == "sufficient":
+                raise ValueError("insufficient evidence cannot use sufficient status")
+            if has_next_query != has_next_objective:
+                raise ValueError("next query and objective must be present together")
+        return self
+
+
+class ResearchActionRecord(FrozenContract):
+    """Safe, body-free audit record for one ReAct transition."""
+
+    sequence: int = Field(ge=1)
+    action: ResearchActionName
+    step_id: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+    )
+    query: str | None = Field(default=None, min_length=1, max_length=2000)
+    chunk_ids: tuple[str, ...] = Field(default=(), max_length=20)
+    outcome: str | None = Field(default=None, min_length=1, max_length=64)
+
+    @field_validator("query", "outcome")
+    @classmethod
+    def normalize_optional_value(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("action text must not be blank")
+        return normalized
+
+    @field_validator("chunk_ids")
+    @classmethod
+    def validate_action_chunk_ids(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(value.strip() for value in values)
+        if any(not value for value in normalized):
+            raise ValueError("action chunk IDs must not be blank")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("action chunk IDs must be unique")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_action_fields(self) -> ResearchActionRecord:
+        has_step = self.step_id is not None
+        has_query = self.query is not None
+        has_chunks = bool(self.chunk_ids)
+        has_outcome = self.outcome is not None
+        if self.action == "search_corpus":
+            valid = has_step and has_query and not has_chunks and not has_outcome
+        elif self.action == "get_evidence":
+            valid = has_step and not has_query and has_chunks and not has_outcome
+        elif self.action == "assess_evidence":
+            valid = (
+                has_step
+                and not has_query
+                and not has_chunks
+                and self.outcome in ASSESSMENT_STATUSES
+            )
+        elif self.action == "replan":
+            valid = has_step and has_query and not has_chunks and not has_outcome
+        else:
+            valid = (
+                not has_step
+                and not has_query
+                and not has_chunks
+                and self.outcome in TERMINATION_REASONS
+            )
+        if not valid:
+            raise ValueError(f"invalid fields for research action: {self.action}")
+        return self

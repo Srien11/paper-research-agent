@@ -41,8 +41,19 @@ def _canonical_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def _system_message(system_rules: str) -> PromptMessage:
-    return PromptMessage(role="system", content=f"{system_rules.rstrip()}\n\n{CONTEXT_POLICY}")
+PARTIAL_ANSWER_POLICY = """\
+PARTIAL COVERAGE POLICY:
+- Research coverage is incomplete, but verified citations are available.
+- Return status "answered" with only claims directly supported by the provided citations.
+- Omit uncovered aspects of the question.
+- Do not return "insufficient_evidence" solely because the full question is not covered."""
+
+
+def _system_message(system_rules: str, *, allow_partial_answer: bool) -> PromptMessage:
+    content = f"{system_rules.rstrip()}\n\n{CONTEXT_POLICY}"
+    if allow_partial_answer:
+        content = f"{content}\n\n{PARTIAL_ANSWER_POLICY}"
+    return PromptMessage(role="system", content=content)
 
 
 def _request_message(request: ContextRequest) -> PromptMessage:
@@ -147,7 +158,10 @@ def assemble_context(
 ) -> AssembledContext:
     """Build complete messages without truncating trusted rules or evidence."""
     required_messages = (
-        _system_message(request.system_rules),
+        _system_message(
+            request.system_rules,
+            allow_partial_answer=request.allow_partial_answer,
+        ),
         *request.conversation_history,
         _request_message(request),
     )

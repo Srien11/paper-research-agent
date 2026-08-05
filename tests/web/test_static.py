@@ -23,14 +23,20 @@ class StaticWebContractTests(unittest.TestCase):
             "username",
             "password",
             "main-content",
-            "recommended-questions",
+            "conversation-history",
             "messages",
             "ask-form",
+            "file-input",
+            "file-button",
+            "file-list",
             "question",
             "pipeline-status",
             "inspector",
             "generation-metrics",
             "evidence-dialog",
+            "memories-button",
+            "memories-dialog",
+            "memories-list",
             "new-conversation",
         }
         all_ids = re.findall(r'id="([^"]+)"', self.html)
@@ -47,7 +53,7 @@ class StaticWebContractTests(unittest.TestCase):
     def test_ui_contains_all_visible_operational_states(self) -> None:
         for text in (
             "可视化测试",
-            "推荐问题",
+            "知识库包含什么",
             "检索证据",
             "重排与组装",
             "生成回答",
@@ -84,11 +90,25 @@ class StaticWebContractTests(unittest.TestCase):
             'logout: "api/logout"',
             'conversation: "api/conversation"',
             'ask: "api/ask"',
+            'memories: "api/memories"',
         ):
             self.assertIn(path, self.javascript)
         self.assertNotIn("api/conversations", self.javascript)
         self.assertIn('method: "DELETE"', self.javascript)
         self.assertIn("JSON.stringify({ username, password })", self.javascript)
+
+    def test_frontend_submits_unified_request_and_displays_server_route(self) -> None:
+        self.assertIn("优先参考本地论文库（有依据时标注）", self.html)
+        self.assertIn("await streamConversation(question)", self.javascript)
+        self.assertIn("local_only: elements.toolMode.checked", self.javascript)
+        self.assertIn('event.type === "route"', self.javascript)
+        self.assertIn('event.type === "rag_result"', self.javascript)
+        self.assertIn('id="conversation-history"', self.html)
+        self.assertIn("archiveCurrentDialogue", self.javascript)
+        self.assertNotIn("isFileEditInstruction", self.javascript)
+        self.assertNotIn("file_action", self.javascript)
+        self.assertIn('chatStream: "api/chat/stream"', self.javascript)
+        self.assertNotIn("isCasualGreeting", self.javascript)
 
     def test_browser_storage_excludes_citation_and_evidence_objects(self) -> None:
         self.assertIn("sessionStorage", self.javascript)
@@ -149,6 +169,8 @@ class DeploymentAssetContractTests(unittest.TestCase):
         self.assertIn("location ^~ /paper-research/", locations)
         self.assertIn("127.0.0.1:8092", locations)
         self.assertIn("client_max_body_size 16k", locations)
+        self.assertIn("client_max_body_size 10m", locations)
+        self.assertIn("location = /paper-research/api/files", locations)
         self.assertIn("limit_req zone=paper_research_ask", locations)
         self.assertNotIn("limit_req_zone", locations)
         self.assertNotIn("location ^~ /research/", locations)

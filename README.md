@@ -2,7 +2,7 @@
 
 一个面向小型、高质量论文集合的可复现 RAG 与研究 Agent 工程。
 
-当前阶段聚焦于把冻结论文语料转换成可追溯、可评测的检索基线。Agent 编排、反思和产品界面将在检索基线稳定后迭代，避免把解析、检索和推理误差混在一起。
+当前阶段已经形成从冻结语料、可追溯检索、上下文与短期记忆，到受控 ReAct 研究 Agent 和私有研究界面的本地闭环。
 
 ## 当前里程碑
 
@@ -21,9 +21,10 @@
 - [x] 私人研究模式下的结构化回答生成与严格引用验证
 - [x] 24 小时、按 session 隔离的本地短期记忆与多轮追问上下文
 - [x] 框架无关的只读论文搜索与证据读取工具
-- [x] LangChain 工具适配与最小 LangGraph 研究计划工作流
+- [x] LangChain 工具适配与受控 LangGraph ReAct 研究工作流
 - [x] 可选启用、带 SQLite State Checkpoint 的受控多步研究 Agent Runtime
-- [ ] 动态 ReAct、反思与重新规划
+- [x] 证据充分性反思、提前终止、重复查询防护与有界重新规划
+- [x] 不保存问题、查询和证据正文的 Agent 节点、工具、耗时与 Runtime 拦截日志
 
 详细安排见[RAG 检索基线实施计划](docs/plans/2026-07-26-RAG检索基线实施计划.md)。
 
@@ -129,26 +130,104 @@ Reranker。改写总截止时间默认 2 秒，超时、网络错误、限流或
 检索元数据与源 chunk 不一致、版权映射缺失或请求越界时关闭失败。
 
 安装 `agent` 可选依赖后，`build_langchain_tools` 将这两个方法包装为固定名称和 Pydantic
-参数契约的 LangChain 工具；`build_research_graph` 使用 LangGraph 执行
-`plan -> execute_step -> route`。Planner 最多产生 6 个只读检索子问题，Graph 限制每步
-证据数量、总工具调用次数并按 chunk ID 去重。
+参数契约的 LangChain 工具；`build_research_graph` 通过这些工具执行受控
+`plan -> reason -> execute_tools -> assess_evidence -> reason/finalize` 循环。Planner 最多产生
+6 个只读检索子问题；结构化 Evidence Reasoner 可在证据充分时提前结束，或在证据不足时
+提出一条新的本地检索，但不能扩展工具白名单。Graph 同时限制每步证据数、总工具调用次数、
+重规划次数和重复查询，并按 chunk ID 去重。
 
-`ResearchAgentRuntime` 负责总超时、`session_id -> thread_id` 映射，并将 Graph 终态中的正文、
-哈希、页码和版权分类再次与本地不可变 chunk 校验。通过后，证据才会进入现有
+`ResearchAgentRuntime` 负责总超时、`session_id -> thread_id` 映射，并重新核对终态中的动作
+序列、工具计数、重规划计数、终止原因，以及正文、哈希、页码和版权分类。通过后，证据才会进入现有
 `assemble_context -> answer_context`、引用白名单和回答验证器。SQLite Checkpoint 只保存在
 `data/runtime/`，其中可能包含研究 State 和内部证据正文，禁止提交或公开。
 
 ```powershell
 python -m pip install -e ".[retrieval,web,agent]"
 $env:PRA_RESEARCH_AGENT_ENABLED = 'true'
-$env:PRA_RESEARCH_AGENT_MAX_STEPS = '2'
+$env:PRA_RESEARCH_AGENT_MAX_STEPS = '4'
 $env:PRA_RESEARCH_AGENT_EVIDENCE_PER_STEP = '3'
-$env:PRA_RESEARCH_AGENT_MAX_TOOL_CALLS = '4'
+$env:PRA_RESEARCH_AGENT_MAX_TOOL_CALLS = '12'
 $env:PRA_RESEARCH_AGENT_TIMEOUT_SECONDS = '90'
+# 可选：让目录、表格、图片和公式工具读取当前解析产物
+$env:PRA_SECTIONS_PATH = 'data/processed/<current-build>/sections.jsonl'
+$env:PRA_ELEMENTS_PATH = 'data/processed/<current-build>/elements.jsonl'
 ```
 
-默认不开启 Agent，原单次 RAG 路径保持不变。启用后仍只允许 `search_corpus` 和
-`get_evidence`；Shell、任意 Python、写文件、数据库修改和任意外网访问均未注册。
+默认不开启 Agent，原单次 RAG 路径保持不变。启用后有两条彼此独立的 Graph：默认问答仍只用
+`search_corpus / get_evidence` 形成可验证引用；Web 中手动开启“动态工具模式”后，模型才可在
+固定 19 项扩展工具中逐步选择。两条路径都不是自由工具 Agent；Shell、任意 Python 和任意
+网络/文件能力均未注册，写工具必须经过 Runtime 审批。
+
+Agent 启用后，结构化事件默认写入与 State Checkpoint 同目录的
+`data/runtime/agent-events-v1.sqlite3`。每次运行生成独立 `run_id`，覆盖运行开始/完成/失败、
+每个 Graph 节点开始/完成/失败、工具调用开始/完成/失败、总超时、工具白名单/预算拦截和
+终态输出拒绝。事件只保存组件名、状态、耗时、数量、预算、错误类型、固定原因码，以及问题、
+查询、步骤和 thread 的 SHA-256 指纹；不保存 API Key、问题正文、查询正文、chunk ID、证据
+正文、Provider 请求/响应或自由文本异常消息。日志写入采用 best-effort，SQLite 暂时不可写
+不会改变研究结果或放宽 fail-closed 安全策略。
+
+可按一次运行查看安全轨迹：
+
+```sql
+SELECT event_id, event_type, component, name, status, duration_ms, reason_code
+FROM agent_events
+WHERE run_id = '<run_id>'
+ORDER BY event_id;
+```
+
+### 扩展研究工具平台
+
+生产 Agent Runtime 现在除核心 `search_corpus / get_evidence` 外，还注册 19 项严格 Schema
+工具。核心可引用证据循环仍用原两工具关闭失败；扩展工具通过
+`ResearchAgentRuntime.execute_tool` 或完整 LangChain registry 调用，结果不会绕过现有引用验证。
+
+- 本地证据：`get_adjacent_chunks`、`get_paper_metadata`、`trace_evidence_source`、
+  `get_paper_outline`、`compare_papers`
+- 学术网络：`search_scholarly_sources`、`resolve_paper_identifier`、`get_citation_graph`、
+  `check_paper_status`
+- 非文本理解：`extract_table`、`inspect_figure`、`extract_equation`
+- 计算核验：`calculate`、`analyze_experiment_data`、`verify_claim`、
+  `check_reproducibility`
+- 成果管理：`save_research_note`、`export_research_report`、`manage_long_term_memory`
+
+工具目录为每项能力固定风险级别、默认超时和最大结果数。本地读取直接执行；学术网络只向
+Semantic Scholar 或 Crossref 发送当前检索式/论文标识符，不发送本地 chunk 或论文正文；
+计算器只解释算术 AST，实验分析只支持最多 1000 行、20 列和固定统计白名单；笔记、报告、
+长期记忆新增、更新、删除必须使用与工具名、参数哈希绑定的 5 分钟一次性审批令牌；搜索和
+列举是只读操作，无需审批。记录按作用域隔离，支持内容去重、版本替代、软删除和可选过期；
+所有文件和 SQLite 只写入 `data/runtime/`，默认拒绝路径逃逸与静默覆盖。
+
+动态工具 Graph 会先执行只读记忆召回，再进入
+`recall_memory -> route -> execute -> route/propose_memory/finalize`；记忆写入路径为
+`propose_memory -> execute(仅生成请求) -> interrupt -> 用户批准/拒绝 -> execute/finalize`。只有
+用户明确表达“记住、更新记忆、忘记”等意图时才会生成结构化候选，普通问答不会自动写入。
+模型只负责
+返回结构化 `ToolDecision`，Runtime 再校验工具名、参数 Schema、风险策略、超时、重复调用和
+初始计划、重复调用、连续无新证据、工具次数与总时长预算。观察结果额外标注四类信任等级：`citation_evidence`、`research_context`、
+`computed_result`、`side_effect`，长期记忆始终属于低信任 `research_context`，只有第一类可作为
+论文事实的引用候选；确认结论还必须绑定当前语料中真实存在的不可变 chunk ID。
+
+Owner Web API 提供 `POST /paper-research/api/tools/run` 与
+`POST /paper-research/api/tools/approval`。两者都要求登录 Cookie 和允许的 `Origin`；待审批响应
+只返回工具名、用途、参数 SHA-256 与过期时间，不返回完整参数、正文、一次性令牌或内部审批 ID。
+登录后的 `GET /paper-research/api/memories` 只投影当前有效记录的内容、类型、来源 ID、版本和
+生命周期字段；页面可查看记忆，修改和删除仍需通过动态工具审批。
+路由冒烟基线位于 `evaluation/datasets/tool-routing-v1.jsonl`，覆盖本地读取、网络读取、受限计算
+和三类写入审批场景。
+
+```python
+result = await runtime.execute_tool("calculate", {"expression": "(2 + 3) * 4"})
+
+pending = await runtime.execute_tool(
+    "save_research_note",
+    {"title": "结论", "content": "已确认的研究结论"},
+)
+token = runtime.approve_tool_request(pending.summary["approval_request_id"])
+saved = await runtime.execute_tool(
+    "save_research_note",
+    {"title": "结论", "content": "已确认的研究结论", "approval_token": token},
+)
+```
 
 图片语义入库分为三个阶段。裁剪阶段不调用视觉模型，也不会上传图片：
 

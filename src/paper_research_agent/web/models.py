@@ -20,6 +20,8 @@ class LoginRequest(WebModel):
 
 class QuestionRequest(WebModel):
     question: str = Field(min_length=1, max_length=10_000)
+    attachment_ids: tuple[str, ...] = Field(default=(), max_length=5)
+    local_only: bool = False
 
     @field_validator("question")
     @classmethod
@@ -28,6 +30,10 @@ class QuestionRequest(WebModel):
         if not normalized:
             raise ValueError("question cannot be blank")
         return normalized
+
+
+class ToolApprovalRequest(WebModel):
+    approved: bool
 
 
 class SessionResponse(WebModel):
@@ -42,6 +48,13 @@ class AnonymousSessionResponse(WebModel):
 
 class OperationResponse(WebModel):
     ok: Literal[True] = True
+
+
+class AttachmentResponse(WebModel):
+    attachment_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    filename: str = Field(min_length=1, max_length=180)
+    content_type: str = Field(max_length=120)
+    size_bytes: int = Field(gt=0, le=10 * 1024 * 1024)
 
 
 class HealthResponse(WebModel):
@@ -119,3 +132,44 @@ class AskResponse(WebModel):
     retrieval: SafeRetrievalTrace
     context: SafeContextTrace
     generation: SafeGenerationTrace
+
+
+class SafeToolObservation(WebModel):
+    sequence: int = Field(ge=1)
+    tool_name: str = Field(pattern=r"^[a-z][a-z0-9_]{1,63}$")
+    purpose: str = Field(min_length=1, max_length=500)
+    status: Literal["ok", "not_found", "insufficient", "approval_required", "denied"]
+    trust: Literal["citation_evidence", "research_context", "computed_result", "side_effect"]
+    item_count: int = Field(ge=0, le=100)
+
+
+class SafePendingToolApproval(WebModel):
+    tool_name: str = Field(pattern=r"^[a-z][a-z0-9_]{1,63}$")
+    purpose: str = Field(min_length=1, max_length=500)
+    arguments_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expires_at_epoch: float = Field(gt=0)
+
+
+class ToolResearchResponse(WebModel):
+    run_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    status: Literal["completed", "approval_required"]
+    observations: tuple[SafeToolObservation, ...]
+    final_summary: str | None = Field(default=None, max_length=2_000)
+    termination_reason: str | None = None
+    pending_approval: SafePendingToolApproval | None = None
+
+
+class SafeLongTermMemory(WebModel):
+    memory_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    kind: Literal["preference", "project_context", "confirmed_conclusion"]
+    content: str = Field(min_length=1, max_length=3_000)
+    source_chunk_ids: tuple[str, ...] = Field(max_length=20)
+    version: int = Field(ge=1)
+    created_at: str = Field(min_length=1, max_length=64)
+    updated_at: str = Field(min_length=1, max_length=64)
+    expires_at: str | None = Field(default=None, max_length=64)
+    supersedes_memory_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+
+
+class LongTermMemoryListResponse(WebModel):
+    memories: tuple[SafeLongTermMemory, ...]

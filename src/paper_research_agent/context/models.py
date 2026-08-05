@@ -129,6 +129,7 @@ class ContextRequest(FrozenContract):
     user_question: str = Field(min_length=1)
     evidence: tuple[ContextEvidence, ...]
     task_state: str | None = None
+    allow_partial_answer: bool = False
     conversation_history: tuple[PromptMessage, ...] = ()
     short_term_memory: tuple[ContextMemoryTurn, ...] = ()
     memory_token_budget: int = Field(default=0, ge=0)

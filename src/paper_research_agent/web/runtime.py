@@ -31,6 +31,7 @@ from paper_research_agent.context.adapters import join_retrieval_evidence
 from paper_research_agent.context.assembler import assemble_context
 from paper_research_agent.context.models import AssembledContext, ContextRequest
 from paper_research_agent.corpus import load_frozen_papers
+from paper_research_agent.ingestion.models import DocumentElement, SectionRecord
 from paper_research_agent.memory.config import ShortTermMemoryConfig, load_memory_config
 from paper_research_agent.memory.context import contextualize_retrieval_query, to_context_memory
 from paper_research_agent.memory.service import turn_from_answer
@@ -61,6 +62,7 @@ from paper_research_agent.retrieval.rights import CorpusRightsMap
 from paper_research_agent.retrieval.vector import FaissVectorIndex
 
 if TYPE_CHECKING:
+    from paper_research_agent.agent.dynamic.models import DynamicResearchResult
     from paper_research_agent.agent.runtime import (
         ResearchAgentRuntime,
         ResearchRuntimeResult,
@@ -175,6 +177,10 @@ class RuntimeDependencies:
         memory_config: ShortTermMemoryConfig,
         answer_audit: AnswerAuditLogger | None = None,
         research_agent: ResearchAgentRuntime | None = None,
+        project_root: Path | None = None,
+        frozen_papers: Sequence[FrozenPaper] = (),
+        sections: Sequence[SectionRecord] = (),
+        elements: Sequence[DocumentElement] = (),
     ) -> None:
         self.chunks = tuple(chunks)
         self.papers = dict(papers)
@@ -184,10 +190,17 @@ class RuntimeDependencies:
         self.memory_config = memory_config
         self.answer_audit = answer_audit
         self.research_agent = research_agent
+        self.project_root = project_root
+        self.frozen_papers = tuple(frozen_papers)
+        self.sections = tuple(sections)
+        self.elements = tuple(elements)
 
 
 class RAGRuntime:
     """Load expensive local models once and serialize complete question executions."""
+
+    rag_available = True
+    agent_available = True
 
     def __init__(
         self,
@@ -224,6 +237,10 @@ class RAGRuntime:
         self._memory_config = dependencies.memory_config
         self._answer_audit = dependencies.answer_audit
         self._research_agent = dependencies.research_agent
+        self._project_root = dependencies.project_root
+        self._frozen_papers = dependencies.frozen_papers
+        self._sections = dependencies.sections
+        self._elements = dependencies.elements
         self._top_k = top_k
         self._token_budget = token_budget
         self._output_reserve_tokens = output_reserve_tokens
@@ -257,6 +274,8 @@ class RAGRuntime:
         answer_config_path: Path | None = None,
         memory_config_path: Path | None = None,
         answer_audit_path: Path | None = None,
+        sections_path: Path | None = None,
+        elements_path: Path | None = None,
         top_k: int | None = None,
         token_budget: int = 8192,
         output_reserve_tokens: int = 1200,
@@ -319,10 +338,14 @@ class RAGRuntime:
         papers = load_frozen_papers(
             [corpus_dir / "core_frozen.jsonl", corpus_dir / "challenge_frozen.jsonl"]
         )
-        paper_metadata = _safe_paper_metadata(papers)
-        rights = CorpusRightsMap(
-            {paper.corpus_id: paper.storage_class for paper in papers}
+        sections = (
+            tuple(_load_sections(_project_path(root, sections_path, ""))) if sections_path else ()
         )
+        elements = (
+            tuple(_load_elements(_project_path(root, elements_path, ""))) if elements_path else ()
+        )
+        paper_metadata = _safe_paper_metadata(papers)
+        rights = CorpusRightsMap({paper.corpus_id: paper.storage_class for paper in papers})
 
         encoder = FastEmbedEncoder(
             retrieval_config.embedding_model,
@@ -387,6 +410,10 @@ class RAGRuntime:
                 memory_store=memory_store,
                 memory_config=memory_config,
                 answer_audit=answer_audit,
+                project_root=root,
+                frozen_papers=papers,
+                sections=sections,
+                elements=elements,
             ),
             top_k=top_k,
             token_budget=token_budget,
@@ -397,9 +424,7 @@ class RAGRuntime:
     @classmethod
     def from_environment(cls) -> RAGRuntime:
         """Load production paths from environment without reading a dotenv file."""
-        project_root = Path(
-            os.getenv("PRA_PROJECT_ROOT", str(Path(__file__).resolve().parents[3]))
-        )
+        project_root = Path(os.getenv("PRA_PROJECT_ROOT", str(Path(__file__).resolve().parents[3])))
         corpus_value = os.getenv("PRA_CORPUS_DIR", "").strip()
         if not corpus_value:
             raise RuntimeError("PRA_CORPUS_DIR is required")
@@ -413,6 +438,8 @@ class RAGRuntime:
             answer_config_path=_optional_env_path("PRA_ANSWER_CONFIG"),
             memory_config_path=_optional_env_path("PRA_MEMORY_CONFIG"),
             answer_audit_path=_optional_env_path("PRA_ANSWER_AUDIT_PATH"),
+            sections_path=_optional_env_path("PRA_SECTIONS_PATH"),
+            elements_path=_optional_env_path("PRA_ELEMENTS_PATH"),
         )
 
     @classmethod
@@ -423,9 +450,7 @@ class RAGRuntime:
     @classmethod
     async def from_environment_with_agent(cls) -> RAGRuntime:
         """Construct the normal runtime and then attach the optional Agent lane."""
-        project_root = Path(
-            os.getenv("PRA_PROJECT_ROOT", str(Path(__file__).resolve().parents[3]))
-        )
+        project_root = Path(os.getenv("PRA_PROJECT_ROOT", str(Path(__file__).resolve().parents[3])))
         answer_file = _project_path(
             project_root,
             _optional_env_path("PRA_ANSWER_CONFIG"),
@@ -457,7 +482,7 @@ class RAGRuntime:
         checkpoint_path: Path,
         policy: object,
     ) -> None:
-        """Attach one durable, read-only Agent without exposing its internals to Web."""
+        """Attach one durable, policy-gated Agent without exposing internals to Web."""
         if self._closed:
             raise RuntimeClosedError("RAG runtime is closed")
         if self._busy:
@@ -478,6 +503,10 @@ class RAGRuntime:
             model_id=model_id,
             checkpoint_path=checkpoint_path,
             policy=runtime_policy,
+            project_root=self._project_root,
+            papers=self._frozen_papers,
+            sections=self._sections,
+            elements=self._elements,
         )
 
     async def ask(self, question: str, *, session_id: str) -> RuntimeExecutionResult:
@@ -498,6 +527,67 @@ class RAGRuntime:
                 if self._closed:
                     raise RuntimeClosedError("RAG runtime is closed")
                 return await self._execute(normalized_question, session_id=session_id)
+        finally:
+            self._busy = False
+
+    async def run_tool_research(
+        self,
+        question: str,
+        *,
+        session_id: str,
+    ) -> DynamicResearchResult:
+        normalized_question = question.strip()
+        if not normalized_question:
+            raise ValueError("question cannot be blank")
+        if self._research_agent is None or not self._research_agent.dynamic_tools_enabled:
+            raise RuntimeError("dynamic research tools are unavailable")
+        if self._closed:
+            raise RuntimeClosedError("RAG runtime is closed")
+        if self._busy:
+            raise RuntimeBusyError("RAG runtime is busy")
+        self._busy = True
+        try:
+            async with self._execution_lock:
+                return await self._research_agent.run_dynamic_tools(
+                    normalized_question,
+                    thread_id=session_id,
+                )
+        finally:
+            self._busy = False
+
+    async def resume_tool_research(
+        self,
+        *,
+        session_id: str,
+        approved: bool,
+    ) -> DynamicResearchResult:
+        if self._research_agent is None or not self._research_agent.dynamic_tools_enabled:
+            raise RuntimeError("dynamic research tools are unavailable")
+        if self._closed:
+            raise RuntimeClosedError("RAG runtime is closed")
+        if self._busy:
+            raise RuntimeBusyError("RAG runtime is busy")
+        self._busy = True
+        try:
+            async with self._execution_lock:
+                return await self._research_agent.resume_dynamic_tools(
+                    thread_id=session_id,
+                    approved=approved,
+                )
+        finally:
+            self._busy = False
+
+    async def list_long_term_memories(self, *, limit: int = 20) -> object:
+        if self._research_agent is None or not self._research_agent.extended_tools_enabled:
+            raise RuntimeError("long-term memory is unavailable")
+        if self._closed:
+            raise RuntimeClosedError("RAG runtime is closed")
+        if self._busy:
+            raise RuntimeBusyError("RAG runtime is busy")
+        self._busy = True
+        try:
+            async with self._execution_lock:
+                return await self._research_agent.list_long_term_memories(limit=limit)
         finally:
             self._busy = False
 
@@ -573,6 +663,11 @@ class RAGRuntime:
                 user_question=question,
                 evidence=evidence,
                 task_state=task_state,
+                allow_partial_answer=(
+                    research is not None
+                    and bool(evidence)
+                    and not research.evidence_sufficient
+                ),
                 short_term_memory=to_context_memory(memory_turns),
                 memory_token_budget=policy.context_token_budget,
                 protected_evidence_count=policy.protected_evidence_count,
@@ -741,6 +836,22 @@ def _load_chunks(path: Path) -> list[EvidenceChunk]:
     ]
 
 
+def _load_sections(path: Path) -> list[SectionRecord]:
+    return [
+        SectionRecord.model_validate_json(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def _load_elements(path: Path) -> list[DocumentElement]:
+    return [
+        DocumentElement.model_validate_json(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
 def _project_path(root: Path, value: Path | None, default: str) -> Path:
     candidate = value if value is not None else Path(default)
     return candidate if candidate.is_absolute() else root / candidate
@@ -787,12 +898,12 @@ def _research_policy_from_environment() -> object:
     from paper_research_agent.agent.policy import ResearchRuntimePolicy
 
     return ResearchRuntimePolicy(
-        max_steps=_environment_int("PRA_RESEARCH_AGENT_MAX_STEPS", 2),
+        max_steps=_environment_int("PRA_RESEARCH_AGENT_MAX_STEPS", 4),
         evidence_per_step=_environment_int(
             "PRA_RESEARCH_AGENT_EVIDENCE_PER_STEP",
             3,
         ),
-        max_tool_calls=_environment_int("PRA_RESEARCH_AGENT_MAX_TOOL_CALLS", 4),
+        max_tool_calls=_environment_int("PRA_RESEARCH_AGENT_MAX_TOOL_CALLS", 12),
         timeout_seconds=_environment_float(
             "PRA_RESEARCH_AGENT_TIMEOUT_SECONDS",
             90,

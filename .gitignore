@@ -23,6 +23,7 @@ data/evaluations/runs/
 data/runtime/
 data/runtime/live-smoke-v1/
 data/runtime/live-smoke-memory-v1/
+logs/
 *.pdf
 *.faiss
 *.sqlite

@@ -7,8 +7,8 @@
     <meta name="theme-color" content="#f2eee5">
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%232f5142'/%3E%3Ctext x='32' y='43' text-anchor='middle' font-size='34' fill='white'%3E%E7%A0%94%3C/text%3E%3C/svg%3E">
     <title>论文研究台 · 可视化测试</title>
-    <link rel="stylesheet" href="app.css">
-    <script src="app.js" defer></script>
+    <link rel="stylesheet" href="app.css?v=20260805-9">
+    <script src="app.js?v=20260805-9" defer></script>
   </head>
   <body>
     <a class="skip-link" href="#main-content">跳到主要内容</a>
@@ -42,6 +42,7 @@
         <div class="topbar-actions">
           <span class="stage-badge"><span class="status-dot" aria-hidden="true"></span>可视化测试</span>
           <button id="inspector-toggle" class="button button-quiet mobile-only" type="button" aria-controls="inspector" aria-expanded="false">上下文</button>
+          <button id="memories-button" class="button button-quiet" type="button">长期记忆</button>
           <button id="new-conversation" class="button button-secondary" type="button">新对话</button>
           <button id="logout" class="button button-quiet" type="button">退出</button>
         </div>
@@ -58,12 +59,16 @@
               <div><strong>806</strong><span>图表摘要</span></div>
             </div>
           </div>
-          <section aria-labelledby="recommended-title">
+          <details class="corpus-guide">
+            <summary>知识库包含什么</summary>
+            <p>当前收录 80 篇大模型评测与可靠性研究，主要覆盖 LLM-as-a-Judge 及其位置偏差、自我偏好和谄媚问题，RAG 的检索、忠实度、引用与幻觉评估，BEIR、MTEB、MMLU 等基准，推理与自纠、事实性和校准、长上下文与工具使用、多语言和鲁棒性，以及训练数据污染、能力涌现和评测指标争议。适合询问方法比较、指标定义、实验结论、适用条件、论文间冲突，以及某项结论由哪些证据支持。</p>
+          </details>
+          <section aria-labelledby="history-title">
             <div class="section-heading">
-              <h3 id="recommended-title">推荐问题</h3>
-              <span>点击填入</span>
+              <h3 id="history-title">历史对话</h3>
+              <span>本标签页</span>
             </div>
-            <div id="recommended-questions" class="question-list" aria-live="polite"></div>
+            <div id="conversation-history" class="history-list" aria-live="polite"></div>
           </section>
           <div class="boundary-card">
             <strong>私人研究边界</strong>
@@ -99,10 +104,18 @@
           <form id="ask-form" class="composer">
             <label class="sr-only" for="question">研究问题</label>
             <textarea id="question" name="question" rows="2" maxlength="2000" placeholder="输入一个关于大模型评测、RAG 或检索研究的问题…" required></textarea>
+            <div class="file-row">
+              <input id="file-input" type="file" accept=".txt,.md,.json,.csv,.pdf" hidden>
+              <button id="file-button" class="file-button" type="button">＋ 添加文件</button>
+              <div id="file-list" class="file-list" aria-live="polite"></div>
+            </div>
             <div class="composer-footer">
-              <p><kbd>Ctrl</kbd> + <kbd>Enter</kbd> 发送</p>
+              <label class="tool-mode-toggle">
+                <input id="tool-mode" type="checkbox">
+                <span>优先参考本地论文库（有依据时标注）</span>
+              </label>
               <button id="ask-button" class="button button-primary" type="submit">
-                <span class="button-label">开始研究</span>
+                <span class="button-label">发送</span>
                 <span class="spinner" aria-hidden="true"></span>
               </button>
             </div>
@@ -152,6 +165,37 @@
         <button id="evidence-close" class="icon-button" type="button" aria-label="关闭引用证据">×</button>
       </div>
       <div id="evidence-content" class="evidence-content"></div>
+    </dialog>
+
+    <dialog id="tool-approval-dialog" class="evidence-dialog" aria-labelledby="tool-approval-title">
+      <div class="dialog-header">
+        <div>
+          <p class="eyebrow">SENSITIVE TOOL APPROVAL</p>
+          <h2 id="tool-approval-title">敏感工具需要确认</h2>
+        </div>
+      </div>
+      <div class="evidence-content">
+        <dl id="tool-approval-details"></dl>
+        <p class="privacy-note">页面不会显示或保存完整工具参数。批准仅对本次参数指纹有效。</p>
+        <div class="approval-actions">
+          <button id="tool-approval-reject" class="button button-secondary" type="button">拒绝并终止</button>
+          <button id="tool-approval-accept" class="button button-primary" type="button">批准本次执行</button>
+        </div>
+      </div>
+    </dialog>
+
+    <dialog id="memories-dialog" class="evidence-dialog" aria-labelledby="memories-title">
+      <div class="dialog-header">
+        <div>
+          <p class="eyebrow">LONG-TERM MEMORY</p>
+          <h2 id="memories-title">长期记忆</h2>
+        </div>
+        <button id="memories-close" class="icon-button" type="button" aria-label="关闭长期记忆">×</button>
+      </div>
+      <div class="evidence-content">
+        <p class="privacy-note">这里只显示当前有效记忆。修改或删除请在动态工具模式中明确提出，系统会再次请求审批。</p>
+        <div id="memories-list" class="memories-list" aria-live="polite"></div>
+      </div>
     </dialog>
 
     <div id="toast-region" class="toast-region" role="status" aria-live="polite" aria-atomic="true"></div>

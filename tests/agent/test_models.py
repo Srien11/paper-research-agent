@@ -5,9 +5,11 @@ import unittest
 from pydantic import ValidationError
 
 from paper_research_agent.agent.models import (
+    EvidenceAssessment,
     EvidenceRecord,
     GetEvidenceInput,
     GetEvidenceResult,
+    ResearchActionRecord,
     SearchCorpusHit,
     SearchCorpusInput,
     SearchCorpusResult,
@@ -84,6 +86,84 @@ class ResearchToolModelTests(unittest.TestCase):
         self.assertEqual(result.records[0].text, "Evidence text.")
         with self.assertRaises(ValidationError):
             GetEvidenceResult(records=(record,), missing_chunk_ids=("chunk-1",))
+
+    def test_evidence_assessment_requires_consistent_next_search(self) -> None:
+        sufficient = EvidenceAssessment(
+            evidence_sufficient=True,
+            status="sufficient",
+        )
+
+        self.assertIsNone(sufficient.next_query)
+        with self.assertRaises(ValidationError):
+            EvidenceAssessment(
+                evidence_sufficient=True,
+                status="sufficient",
+                next_query="another query",
+                next_objective="find more evidence",
+            )
+        with self.assertRaises(ValidationError):
+            EvidenceAssessment(
+                evidence_sufficient=False,
+                status="missing_coverage",
+                next_query="missing comparison",
+            )
+
+        retry = EvidenceAssessment(
+            evidence_sufficient=False,
+            status="missing_coverage",
+            next_query="  missing comparison  ",
+            next_objective="  cover the missing dimension  ",
+        )
+        self.assertEqual(retry.next_query, "missing comparison")
+
+    def test_action_record_enforces_fields_for_each_action(self) -> None:
+        search = ResearchActionRecord(
+            sequence=1,
+            action="search_corpus",
+            step_id="methods",
+            query="RAG evaluation",
+        )
+        evidence = ResearchActionRecord(
+            sequence=2,
+            action="get_evidence",
+            step_id="methods",
+            chunk_ids=("chunk-1",),
+        )
+        assessment = ResearchActionRecord(
+            sequence=3,
+            action="assess_evidence",
+            step_id="methods",
+            outcome="missing_coverage",
+        )
+        finish = ResearchActionRecord(
+            sequence=4,
+            action="finish",
+            outcome="plan_exhausted",
+        )
+
+        self.assertEqual(
+            [search.action, evidence.action, assessment.action, finish.action],
+            ["search_corpus", "get_evidence", "assess_evidence", "finish"],
+        )
+        with self.assertRaises(ValidationError):
+            ResearchActionRecord(
+                sequence=1,
+                action="search_corpus",
+                step_id="methods",
+            )
+        with self.assertRaises(ValidationError):
+            ResearchActionRecord(
+                sequence=1,
+                action="get_evidence",
+                step_id="methods",
+                chunk_ids=(),
+            )
+        with self.assertRaises(ValidationError):
+            ResearchActionRecord(
+                sequence=1,
+                action="finish",
+                outcome="sufficient",
+            )
 
 
 if __name__ == "__main__":

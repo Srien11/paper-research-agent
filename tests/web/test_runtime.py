@@ -6,9 +6,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
+from paper_research_agent.agent.dynamic.models import DynamicResearchResult
 from paper_research_agent.agent.models import (
+    EvidenceAssessment,
     EvidenceRecord,
     GetEvidenceResult,
+    ResearchActionRecord,
     ResearchObservation,
     ResearchPlan,
     ResearchStep,
@@ -16,6 +19,7 @@ from paper_research_agent.agent.models import (
     SearchCorpusResult,
 )
 from paper_research_agent.agent.runtime import ResearchRuntimeResult
+from paper_research_agent.agent.tooling.contracts import ToolExecutionResult
 from paper_research_agent.answering.models import AnswerRequest, GenerationResult
 from paper_research_agent.chunking.models import EvidenceChunk
 from paper_research_agent.context.models import ContextEvidence
@@ -207,6 +211,37 @@ def _research_result(chunk: EvidenceChunk) -> ResearchRuntimeResult:
                 evidence=GetEvidenceResult(records=(record,)),
             ),
         ),
+        assessments=(
+            EvidenceAssessment(
+                evidence_sufficient=True,
+                status="sufficient",
+            ),
+        ),
+        action_history=(
+            ResearchActionRecord(
+                sequence=1,
+                action="search_corpus",
+                step_id="methods",
+                query="grounded RAG",
+            ),
+            ResearchActionRecord(
+                sequence=2,
+                action="get_evidence",
+                step_id="methods",
+                chunk_ids=(chunk.chunk_id,),
+            ),
+            ResearchActionRecord(
+                sequence=3,
+                action="assess_evidence",
+                step_id="methods",
+                outcome="sufficient",
+            ),
+            ResearchActionRecord(
+                sequence=4,
+                action="finish",
+                outcome="evidence_sufficient",
+            ),
+        ),
         evidence=(
             ContextEvidence(
                 chunk_id=chunk.chunk_id,
@@ -223,6 +258,9 @@ def _research_result(chunk: EvidenceChunk) -> ResearchRuntimeResult:
             ),
         ),
         tool_call_count=2,
+        replan_count=0,
+        evidence_sufficient=True,
+        termination_reason="evidence_sufficient",
         task_state='{"kind":"untrusted_research_task_state","step_id":"methods"}',
     )
 
@@ -233,6 +271,16 @@ class FakeResearchAgent:
         self.calls: list[tuple[str, str]] = []
         self.clear_calls: list[str] = []
         self.closed = 0
+        self.dynamic_calls: list[tuple[str, str]] = []
+        self.dynamic_resumes: list[tuple[str, bool]] = []
+
+    @property
+    def dynamic_tools_enabled(self) -> bool:
+        return True
+
+    @property
+    def extended_tools_enabled(self) -> bool:
+        return True
 
     async def run(self, question: str, *, thread_id: str) -> ResearchRuntimeResult:
         self.calls.append((question, thread_id))
@@ -240,6 +288,54 @@ class FakeResearchAgent:
 
     async def clear(self, thread_id: str) -> None:
         self.clear_calls.append(thread_id)
+
+    async def run_dynamic_tools(
+        self,
+        question: str,
+        *,
+        thread_id: str,
+    ) -> DynamicResearchResult:
+        self.dynamic_calls.append((question, thread_id))
+        return DynamicResearchResult(
+            run_id="e" * 32,
+            thread_id=thread_id,
+            status="completed",
+            final_summary="Done.",
+            termination_reason="router_finished",
+        )
+
+    async def resume_dynamic_tools(
+        self,
+        *,
+        thread_id: str,
+        approved: bool,
+    ) -> DynamicResearchResult:
+        self.dynamic_resumes.append((thread_id, approved))
+        return DynamicResearchResult(
+            run_id="e" * 32,
+            thread_id=thread_id,
+            status="completed",
+            final_summary="Denied." if not approved else "Approved.",
+            termination_reason="approval_denied" if not approved else "router_finished",
+        )
+
+    async def list_long_term_memories(self, *, limit: int = 20) -> ToolExecutionResult:
+        return ToolExecutionResult(
+            tool_name="manage_long_term_memory",
+            items=(
+                {
+                    "memory_id": "a" * 32,
+                    "kind": "preference",
+                    "content": "Concise answers",
+                    "source_chunk_ids": (),
+                    "version": 1,
+                    "created_at": "2026-08-01T00:00:00+00:00",
+                    "updated_at": "2026-08-01T00:00:00+00:00",
+                    "expires_at": None,
+                    "supersedes_memory_id": None,
+                },
+            )[:limit],
+        )
 
     async def aclose(self) -> None:
         self.closed += 1
@@ -293,6 +389,8 @@ class RAGRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "PRA_ANSWER_CONFIG": "private/answer.json",
             "PRA_MEMORY_CONFIG": "private/memory.json",
             "PRA_ANSWER_AUDIT_PATH": "private/answer-audit.sqlite3",
+            "PRA_SECTIONS_PATH": "private/sections.jsonl",
+            "PRA_ELEMENTS_PATH": "private/elements.jsonl",
         }
         with (
             patch.dict("os.environ", environment, clear=True),
@@ -304,6 +402,8 @@ class RAGRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["corpus_dir"], Path("project-root/corpus"))
         self.assertEqual(kwargs["chunks_path"], Path("private/chunks.jsonl"))
         self.assertEqual(kwargs["answer_audit_path"], Path("private/answer-audit.sqlite3"))
+        self.assertEqual(kwargs["sections_path"], Path("private/sections.jsonl"))
+        self.assertEqual(kwargs["elements_path"], Path("private/elements.jsonl"))
 
     def test_agent_environment_flag_is_explicit_and_fail_closed(self) -> None:
         with patch.dict("os.environ", {}, clear=True):
@@ -326,9 +426,7 @@ class RAGRuntimeTests(unittest.IsolatedAsyncioTestCase):
         environment = {
             "PRA_PROJECT_ROOT": "project-root",
             "PRA_RESEARCH_AGENT_CHECKPOINT_PATH": "private/agent.sqlite3",
-            "PRA_RESEARCH_AGENT_MAX_STEPS": "2",
             "PRA_RESEARCH_AGENT_EVIDENCE_PER_STEP": "3",
-            "PRA_RESEARCH_AGENT_MAX_TOOL_CALLS": "4",
             "PRA_RESEARCH_AGENT_TIMEOUT_SECONDS": "45",
         }
         with (
@@ -349,9 +447,9 @@ class RAGRuntimeTests(unittest.IsolatedAsyncioTestCase):
             kwargs["checkpoint_path"],
             Path("project-root/private/agent.sqlite3"),
         )
-        self.assertEqual(kwargs["policy"].max_steps, 2)
+        self.assertEqual(kwargs["policy"].max_steps, 4)
         self.assertEqual(kwargs["policy"].evidence_per_step, 3)
-        self.assertEqual(kwargs["policy"].max_tool_calls, 4)
+        self.assertEqual(kwargs["policy"].max_tool_calls, 12)
         self.assertEqual(kwargs["policy"].timeout_seconds, 45)
 
     async def test_reuses_dependencies_and_returns_only_safe_trace(self) -> None:
@@ -391,15 +489,34 @@ class RAGRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.retrieval.index_id, "idx-agent")
         self.assertEqual(result.retrieval.hits[0].route_ranks, {"agent": 1})
         self.assertEqual(result.answer.citations[0].chunk_id, "chunk-1")
-        prompt = "\n".join(
-            message.content for message in generator.requests[0].context.messages
-        )
+        prompt = "\n".join(message.content for message in generator.requests[0].context.messages)
         self.assertIn("untrusted_research_task_state", prompt)
 
         await runtime.clear_conversation("d" * 32)
         self.assertEqual(agent.clear_calls, ["d" * 32])
         await runtime.aclose()
         self.assertEqual(agent.closed, 1)
+
+    async def test_dynamic_tool_lane_uses_agent_checkpoint_thread(self) -> None:
+        agent = FakeResearchAgent(_research_result(_chunk()))
+        runtime, _, _ = _runtime(research_agent=agent)
+
+        started = await runtime.run_tool_research(
+            "  Compare the papers  ",
+            session_id="f" * 32,
+        )
+        resumed = await runtime.resume_tool_research(
+            session_id="f" * 32,
+            approved=False,
+        )
+
+        self.assertEqual(started.status, "completed")
+        self.assertEqual(resumed.termination_reason, "approval_denied")
+        self.assertEqual(agent.dynamic_calls, [("Compare the papers", "f" * 32)])
+        self.assertEqual(agent.dynamic_resumes, [("f" * 32, False)])
+        memories = await runtime.list_long_term_memories()
+        self.assertEqual(memories.items[0]["content"], "Concise answers")
+        await runtime.aclose()
 
     async def test_rejects_concurrent_question_as_busy(self) -> None:
         gate = asyncio.Event()
