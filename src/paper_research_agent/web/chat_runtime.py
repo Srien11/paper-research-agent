@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import time
 import uuid
@@ -13,12 +14,19 @@ from dataclasses import dataclass
 from typing import Any
 
 import httpx
+from pydantic import ValidationError
 
-from paper_research_agent.web.routing import RouteDecision
+from paper_research_agent.web.routing import RAGMode, RouteDecision
+
+logger = logging.getLogger(__name__)
 
 
 class RAGUnavailableError(RuntimeError):
     """Raised when the user explicitly requests RAG without a configured corpus."""
+
+
+class RouteOutputError(RuntimeError):
+    """Raised after the routing model repeatedly returns an invalid contract."""
 
 
 @dataclass(frozen=True)
@@ -91,30 +99,45 @@ class ConversationRuntime:
         question: str,
         *,
         has_attachments: bool,
+        rag_mode: RAGMode,
     ) -> RouteDecision:
         """Use the model as an intent classifier; policy enforcement happens separately."""
-        response = await self._client.post(
-            self._endpoint,
-            json={
-                "model": self._model,
-                "messages": [
-                    {"role": "system", "content": _router_prompt()},
-                    {
-                        "role": "user",
-                        "content": json.dumps(
-                            {"question": question.strip(), "has_attachments": has_attachments},
-                            ensure_ascii=False,
-                        ),
-                    },
-                ],
-                "temperature": 0,
-                "enable_thinking": False,
-                "max_tokens": 160,
-                "response_format": {"type": "json_object"},
-            },
-        )
-        response.raise_for_status()
-        return RouteDecision.model_validate_json(_chat_content(response.json()))
+        request_payload = {
+            "model": self._model,
+            "messages": [
+                {"role": "system", "content": _router_prompt()},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "question": question.strip(),
+                            "has_attachments": has_attachments,
+                            "rag_mode": rag_mode,
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+            "temperature": 0,
+            "enable_thinking": False,
+            "max_tokens": 160,
+            "response_format": {"type": "json_object"},
+        }
+        last_error: Exception | None = None
+        for attempt in range(1, 3):
+            response = await self._client.post(self._endpoint, json=request_payload)
+            response.raise_for_status()
+            try:
+                return _parse_route_decision(_chat_content(response.json()))
+            except (TypeError, ValueError) as error:
+                last_error = error
+                logger.warning(
+                    "route model returned invalid structured output (attempt=%d/2, error=%s, fields=%s)",
+                    attempt,
+                    type(error).__name__,
+                    _route_error_fields(error),
+                )
+        raise RouteOutputError("routing model returned invalid structured output") from last_error
 
     async def run_tool_research(self, question: str, *, session_id: str) -> ConversationResult:
         normalized = question.strip()
@@ -314,6 +337,29 @@ def _chat_content(payload: Any) -> str:
     return content.strip()
 
 
+def _parse_route_decision(content: str) -> RouteDecision:
+    """Parse common provider wrappers while retaining strict route-field validation."""
+    normalized = content.strip()
+    if normalized.startswith("```") and normalized.endswith("```"):
+        lines = normalized.splitlines()
+        if len(lines) >= 3 and lines[0].strip().lower() in {"```", "```json"}:
+            normalized = "\n".join(lines[1:-1]).strip()
+    payload = json.loads(normalized)
+    if isinstance(payload, dict) and isinstance(payload.get("reason"), str):
+        payload["reason"] = payload["reason"].strip()[:160]
+    return RouteDecision.model_validate(payload)
+
+
+def _route_error_fields(error: Exception) -> str:
+    """Return safe validation metadata without logging prompts or model output."""
+    if isinstance(error, ValidationError):
+        return ",".join(
+            f"{'.'.join(str(part) for part in item['loc'])}:{item['type']}"
+            for item in error.errors(include_input=False)
+        )
+    return "json" if isinstance(error, json.JSONDecodeError) else "response"
+
+
 def _system_prompt() -> str:
     return (
         "你是一个自然、可靠的中文研究助手。普通交流直接回答。"
@@ -326,11 +372,13 @@ def _system_prompt() -> str:
 
 def _router_prompt() -> str:
     return (
-        "你是后端请求路由器，只输出 JSON，字段为 route、confidence、reason。"
+        "你是后端请求路由器，只输出 JSON，字段仅为 route、confidence、reason。"
         "route 只能是 normal_chat、local_rag、web_research、attachment_qa、file_edit。"
         "有附件时，询问、查看、总结、解释、分析附件属于 attachment_qa；"
         "只有明确要求改变附件内容或格式并产出修改版时才是 file_edit；"
         "询问为什么修改、讨论修改方案仍是 attachment_qa。"
-        "需要本地论文证据的问题选 local_rag；明确要求最新外部资料或联网检索选 web_research；"
-        "其余选 normal_chat。不得执行任务，只做分类。"
+        "rag_mode=disabled 时禁止选择 local_rag；rag_mode=required 且无附件时必须选择 local_rag；"
+        "rag_mode=preferred 时，需要论文证据、知识库与外部信息冲突或知识库可回答的问题优先选择 local_rag，"
+        "但普通聊天仍选 normal_chat，明确要求最新外部资料或联网检索仍可选 web_research；"
+        "reason 必须是 1 至 80 个汉字的单行短句。其余选 normal_chat。不得执行任务，只做分类。"
     )

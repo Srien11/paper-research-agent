@@ -15,7 +15,7 @@ class RoutePolicyTests(unittest.TestCase):
             RouteDecision(route="web_research", confidence=0.9, reason="model choice"),
             RouteContext(
                 has_attachments=True,
-                local_only=False,
+                rag_mode="disabled",
                 rag_available=True,
                 web_available=True,
             ),
@@ -27,19 +27,19 @@ class RoutePolicyTests(unittest.TestCase):
             RouteDecision(route="file_edit", confidence=0.9, reason="model choice"),
             RouteContext(
                 has_attachments=False,
-                local_only=False,
+                rag_mode="disabled",
                 rag_available=True,
                 web_available=True,
             ),
         )
         self.assertEqual(decision.route, "normal_chat")
 
-    def test_local_only_overrides_model_and_never_falls_back_to_web(self) -> None:
+    def test_required_rag_overrides_model_and_never_falls_back_to_web(self) -> None:
         decision = enforce_route_policy(
             RouteDecision(route="web_research", confidence=0.9, reason="model choice"),
             RouteContext(
                 has_attachments=False,
-                local_only=True,
+                rag_mode="required",
                 rag_available=True,
                 web_available=True,
             ),
@@ -51,7 +51,7 @@ class RoutePolicyTests(unittest.TestCase):
             RouteDecision(route="local_rag", confidence=0.7, reason="model choice"),
             RouteContext(
                 has_attachments=False,
-                local_only=False,
+                rag_mode="preferred",
                 rag_available=False,
                 web_available=False,
             ),
@@ -64,11 +64,35 @@ class RoutePolicyTests(unittest.TestCase):
                 RouteDecision(route="normal_chat", confidence=0.8, reason="model choice"),
                 RouteContext(
                     has_attachments=False,
-                    local_only=True,
+                    rag_mode="required",
                     rag_available=False,
                     web_available=True,
                 ),
             )
+
+    def test_disabled_rag_rejects_model_local_route(self) -> None:
+        decision = enforce_route_policy(
+            RouteDecision(route="local_rag", confidence=0.8, reason="model choice"),
+            RouteContext(
+                has_attachments=False,
+                rag_mode="disabled",
+                rag_available=True,
+                web_available=True,
+            ),
+        )
+        self.assertEqual(decision.route, "normal_chat")
+
+    def test_preferred_rag_keeps_non_rag_route_available(self) -> None:
+        decision = enforce_route_policy(
+            RouteDecision(route="web_research", confidence=0.8, reason="latest sources"),
+            RouteContext(
+                has_attachments=False,
+                rag_mode="preferred",
+                rag_available=True,
+                web_available=True,
+            ),
+        )
+        self.assertEqual(decision.route, "web_research")
 
 
 if __name__ == "__main__":

@@ -112,7 +112,11 @@
             <div class="composer-footer">
               <label class="tool-mode-toggle">
                 <input id="tool-mode" type="checkbox">
-                <span>优先参考本地论文库（有依据时标注）</span>
+                <span>使用本地论文知识库</span>
+              </label>
+              <label id="rag-required-option" class="tool-mode-toggle rag-required-option" hidden>
+                <input id="rag-required" type="checkbox">
+                <span>仅依据本地论文回答</span>
               </label>
               <button id="ask-button" class="button button-primary" type="submit">
                 <span class="button-label">发送</span>

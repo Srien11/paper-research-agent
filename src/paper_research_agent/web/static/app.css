@@ -398,6 +398,7 @@ kbd { padding: .1rem .3rem; background: #ebe6dc; border: 1px solid var(--line); 
 
 .tool-mode-toggle { display: inline-flex; align-items: center; gap: .5rem; color: var(--muted); font-size: .875rem; }
 .tool-mode-toggle input { width: 1rem; height: 1rem; accent-color: var(--accent); }
+.rag-required-option { margin-left: .75rem; padding-left: .75rem; border-left: 1px solid var(--line); }
 .approval-actions { display: flex; justify-content: flex-end; gap: .75rem; margin-top: 1.25rem; }
 .tool-observations { display: grid; gap: .5rem; margin: .75rem 0 0; padding-left: 1.25rem; }
 .tool-observations small { color: var(--muted); }

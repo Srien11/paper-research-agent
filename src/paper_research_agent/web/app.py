@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from paper_research_agent.web.auth import CredentialVerifier, OwnerSession, SessionManager
+from paper_research_agent.web.chat_runtime import RouteOutputError
 from paper_research_agent.web.config import WebConfig
 from paper_research_agent.web.files import AttachmentStore
 from paper_research_agent.web.models import (
@@ -488,15 +489,27 @@ def create_app(
                         reason="模型路由器不可用，采用最小权限默认路由",
                     )
                 else:
-                    raw_decision = await classifier(
-                        payload.question,
-                        has_attachments=bool(payload.attachment_ids),
-                    )
+                    try:
+                        raw_decision = await classifier(
+                            payload.question,
+                            has_attachments=bool(payload.attachment_ids),
+                            rag_mode=payload.rag_mode,
+                        )
+                    except RouteOutputError:
+                        raw_decision = RouteDecision(
+                            route=(
+                                "attachment_qa"
+                                if payload.attachment_ids
+                                else "normal_chat"
+                            ),
+                            confidence=0,
+                            reason="模型路由结果无效，采用最小权限默认路由",
+                        )
                 decision = enforce_route_policy(
                     raw_decision,
                     RouteContext(
                         has_attachments=bool(payload.attachment_ids),
-                        local_only=payload.local_only,
+                        rag_mode=payload.rag_mode,
                         rag_available=bool(rag_runtime and getattr(rag_runtime, "rag_available", True)),
                         web_available=bool(
                             rag_runtime and getattr(rag_runtime, "agent_available", False)

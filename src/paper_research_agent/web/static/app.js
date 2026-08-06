@@ -43,6 +43,8 @@ const elements = {
   fileButton: document.querySelector("#file-button"),
   fileList: document.querySelector("#file-list"),
   toolMode: document.querySelector("#tool-mode"),
+  ragRequired: document.querySelector("#rag-required"),
+  ragRequiredOption: document.querySelector("#rag-required-option"),
   messages: document.querySelector("#messages"),
   emptyState: document.querySelector("#empty-state"),
   loadingTemplate: document.querySelector("#loading-message-template"),
@@ -77,6 +79,16 @@ function createElement(tag, className, text) {
   if (className) node.className = className;
   if (text !== undefined && text !== null) node.textContent = String(text);
   return node;
+}
+
+function selectedRagMode() {
+  if (!elements.toolMode.checked) return "disabled";
+  return elements.ragRequired.checked ? "required" : "preferred";
+}
+
+function syncRagControls() {
+  elements.ragRequiredOption.hidden = !elements.toolMode.checked;
+  if (!elements.toolMode.checked) elements.ragRequired.checked = false;
 }
 
 async function request(path, options = {}) {
@@ -181,6 +193,7 @@ function setBusy(busy) {
   elements.newConversation.disabled = busy;
   elements.question.disabled = busy;
   elements.toolMode.disabled = busy;
+  elements.ragRequired.disabled = busy;
   elements.fileButton.disabled = busy;
   elements.askButton.classList.toggle("is-loading", busy);
   elements.messages.setAttribute("aria-busy", String(busy));
@@ -258,7 +271,7 @@ async function streamConversation(question, sourceNote = "") {
     body: JSON.stringify({
       question,
       attachment_ids: activeFiles.map((item) => item.attachment_id),
-      local_only: elements.toolMode.checked,
+      rag_mode: selectedRagMode(),
     }),
   });
   if (!response.ok) {
@@ -330,6 +343,7 @@ async function streamConversation(question, sourceNote = "") {
       } else if (event.type === "done") {
         metrics = event.metrics || null;
       } else if (event.type === "error") {
+        article.remove();
         throw new Error(event.message || "生成回答时发生错误。");
       }
     }
@@ -987,6 +1001,7 @@ elements.logout.addEventListener("click", handleLogout);
 elements.newConversation.addEventListener("click", startNewConversation);
 elements.memoriesButton.addEventListener("click", openMemories);
 elements.askForm.addEventListener("submit", handleAsk);
+elements.toolMode.addEventListener("change", syncRagControls);
 elements.fileButton.addEventListener("click", () => elements.fileInput.click());
 elements.fileInput.addEventListener("change", () => uploadSelectedFile(elements.fileInput.files[0]));
 elements.askForm.addEventListener("dragover", (event) => {

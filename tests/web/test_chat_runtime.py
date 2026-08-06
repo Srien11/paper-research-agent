@@ -5,7 +5,11 @@ import unittest
 
 import httpx
 
-from paper_research_agent.web.chat_runtime import ConversationRuntime, RAGUnavailableError
+from paper_research_agent.web.chat_runtime import (
+    ConversationRuntime,
+    RAGUnavailableError,
+    RouteOutputError,
+)
 
 
 class ConversationRuntimeTests(unittest.IsolatedAsyncioTestCase):
@@ -37,11 +41,78 @@ class ConversationRuntimeTests(unittest.IsolatedAsyncioTestCase):
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         runtime = ConversationRuntime(api_key="test", model="qwen-test", client=client)
 
-        decision = await runtime.classify_route("把第二段改短", has_attachments=True)
+        decision = await runtime.classify_route(
+            "把第二段改短", has_attachments=True, rag_mode="preferred"
+        )
 
         self.assertEqual(decision.route, "file_edit")
         self.assertEqual(requests[0]["response_format"], {"type": "json_object"})
         self.assertIn("has_attachments", requests[0]["messages"][-1]["content"])
+        self.assertIn('"rag_mode": "preferred"', requests[0]["messages"][-1]["content"])
+        await client.aclose()
+
+    async def test_model_router_repairs_code_fence_and_long_reason(self) -> None:
+        reason = "说明" * 100
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            content = "```json\n" + json.dumps(
+                {"route": "normal_chat", "confidence": 0.8, "reason": reason},
+                ensure_ascii=False,
+            ) + "\n```"
+            return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        runtime = ConversationRuntime(api_key="test", model="qwen-test", client=client)
+
+        decision = await runtime.classify_route(
+            "大模型测评方法", has_attachments=False, rag_mode="disabled"
+        )
+
+        self.assertEqual(decision.route, "normal_chat")
+        self.assertEqual(len(decision.reason), 160)
+        await client.aclose()
+
+    async def test_model_router_retries_invalid_contract_once(self) -> None:
+        calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            content = "not-json" if calls == 1 else json.dumps(
+                {"route": "normal_chat", "confidence": 0.9, "reason": "普通知识问题"}
+            )
+            return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        runtime = ConversationRuntime(api_key="test", model="qwen-test", client=client)
+
+        decision = await runtime.classify_route(
+            "大模型测评方法", has_attachments=False, rag_mode="disabled"
+        )
+
+        self.assertEqual(decision.route, "normal_chat")
+        self.assertEqual(calls, 2)
+        await client.aclose()
+
+    async def test_model_router_raises_distinct_error_after_retry(self) -> None:
+        calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            return httpx.Response(
+                200, json={"choices": [{"message": {"content": '{"route":"unknown"}'}}]}
+            )
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        runtime = ConversationRuntime(api_key="test", model="qwen-test", client=client)
+
+        with self.assertRaises(RouteOutputError):
+            await runtime.classify_route(
+                "大模型测评方法", has_attachments=False, rag_mode="disabled"
+            )
+
+        self.assertEqual(calls, 2)
         await client.aclose()
 
     async def test_calls_chat_contract_and_keeps_context(self) -> None:

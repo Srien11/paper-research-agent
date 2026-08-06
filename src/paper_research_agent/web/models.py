@@ -8,6 +8,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from paper_research_agent.answering.models import RAGAnswer, StorageClass
 
+RAGMode = Literal["disabled", "preferred", "required"]
+
 
 class WebModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, from_attributes=True)
@@ -21,7 +23,7 @@ class LoginRequest(WebModel):
 class QuestionRequest(WebModel):
     question: str = Field(min_length=1, max_length=10_000)
     attachment_ids: tuple[str, ...] = Field(default=(), max_length=5)
-    local_only: bool = False
+    rag_mode: RAGMode = "disabled"
 
     @field_validator("question")
     @classmethod

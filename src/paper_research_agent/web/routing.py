@@ -14,6 +14,7 @@ RouteKind = Literal[
     "attachment_qa",
     "file_edit",
 ]
+RAGMode = Literal["disabled", "preferred", "required"]
 
 
 class RouteDecision(BaseModel):
@@ -27,7 +28,7 @@ class RouteDecision(BaseModel):
 @dataclass(frozen=True)
 class RouteContext:
     has_attachments: bool
-    local_only: bool
+    rag_mode: RAGMode
     rag_available: bool
     web_available: bool
 
@@ -51,14 +52,18 @@ def enforce_route_policy(decision: RouteDecision, context: RouteContext) -> Rout
             route = "attachment_qa"
             reason = "附件存在，策略层限制为只读附件问答"
     elif route in {"attachment_qa", "file_edit"}:
-        route = "local_rag" if context.local_only else "normal_chat"
+        route = "local_rag" if context.rag_mode == "required" else "normal_chat"
         reason = "没有附件，策略层拒绝文件操作"
 
-    if context.local_only and not context.has_attachments:
+    if context.rag_mode == "required" and not context.has_attachments:
         if not context.rag_available:
             raise RuntimeError("local RAG is required but unavailable")
         route = "local_rag"
         reason = "用户明确要求仅使用本地论文库"
+
+    if context.rag_mode == "disabled" and route == "local_rag":
+        route = "normal_chat"
+        reason = "用户已关闭本地论文库，策略层禁止本地检索"
 
     if route == "local_rag" and not context.rag_available:
         route = "normal_chat"

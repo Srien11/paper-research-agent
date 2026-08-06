@@ -98,10 +98,12 @@ class StaticWebContractTests(unittest.TestCase):
         self.assertIn("JSON.stringify({ username, password })", self.javascript)
 
     def test_frontend_submits_unified_request_and_displays_server_route(self) -> None:
-        self.assertIn("优先参考本地论文库（有依据时标注）", self.html)
+        self.assertIn("使用本地论文知识库", self.html)
+        self.assertIn("仅依据本地论文回答", self.html)
         self.assertIn("await streamConversation(question)", self.javascript)
-        self.assertIn("local_only: elements.toolMode.checked", self.javascript)
+        self.assertIn("rag_mode: selectedRagMode()", self.javascript)
         self.assertIn('event.type === "route"', self.javascript)
+        self.assertIn("article.remove();", self.javascript)
         self.assertIn('event.type === "rag_result"', self.javascript)
         self.assertIn('id="conversation-history"', self.html)
         self.assertIn("archiveCurrentDialogue", self.javascript)
