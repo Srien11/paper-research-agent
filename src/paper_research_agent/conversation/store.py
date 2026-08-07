@@ -15,6 +15,7 @@ from typing import Protocol, cast
 
 from paper_research_agent.agent.orchestrator.models import (
     AgentRunStart,
+    CommitOutcome,
     ConversationWorkspace,
     MainAgentResult,
 )
@@ -57,6 +58,21 @@ class ConversationStore(Protocol):
     def load_workspace(self, conversation_id: str) -> ConversationWorkspace: ...
 
     def load_agent_run(self, request_id: str) -> MainAgentResult | None: ...
+
+    def commit_agent_run(
+        self,
+        *,
+        run_id: str,
+        turn_id: str,
+        expected_workspace_version: int,
+        workspace: ConversationWorkspace,
+        route: str,
+        status: ConversationStatus,
+        resolution: ConversationResolution,
+        assistant_summary: str | None,
+        source_ids: Sequence[str],
+        result: MainAgentResult,
+    ) -> CommitOutcome: ...
 
     def clear(self, conversation_id: str) -> int: ...
 
@@ -223,6 +239,124 @@ class SQLiteConversationStore:
         if row is None or str(row[0]) != "completed" or row[1] is None:
             return None
         return MainAgentResult.model_validate_json(str(row[1]))
+
+    def commit_agent_run(
+        self,
+        *,
+        run_id: str,
+        turn_id: str,
+        expected_workspace_version: int,
+        workspace: ConversationWorkspace,
+        route: str,
+        status: ConversationStatus,
+        resolution: ConversationResolution,
+        assistant_summary: str | None,
+        source_ids: Sequence[str],
+        result: MainAgentResult,
+    ) -> CommitOutcome:
+        completed = datetime.now(UTC)
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            run = connection.execute(
+                "SELECT status FROM main_agent_runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if run is None:
+                connection.commit()
+                return CommitOutcome(
+                    committed=False,
+                    reason="run_not_found",
+                    workspace_version=expected_workspace_version,
+                )
+            if str(run[0]) == "completed":
+                connection.commit()
+                return CommitOutcome(
+                    committed=False,
+                    reason="already_completed",
+                    workspace_version=expected_workspace_version,
+                )
+            current = self._workspace_row(connection, workspace.conversation_id)
+            if current.version != expected_workspace_version:
+                connection.commit()
+                return CommitOutcome(
+                    committed=False,
+                    reason="version_conflict",
+                    workspace_version=current.version,
+                )
+            turn_row = connection.execute(
+                "SELECT conversation_id, sequence FROM conversation_turns WHERE turn_id = ?",
+                (turn_id,),
+            ).fetchone()
+            cursor = connection.execute(
+                """UPDATE conversation_turns
+                   SET standalone_question = ?, route = ?, status = ?, assistant_summary = ?,
+                       source_ids_json = ?, episode_id = ?, selected_history_turn_ids_json = ?,
+                       selected_history_relevances_json = ?, rewrite_confidence = ?, completed_at = ?
+                   WHERE turn_id = ? AND status = 'pending'""",
+                (
+                    resolution.standalone_question,
+                    route,
+                    status,
+                    _summary(assistant_summary),
+                    json.dumps(tuple(dict.fromkeys(source_ids)), ensure_ascii=False),
+                    resolution.episode_id,
+                    json.dumps(resolution.selected_turn_ids, ensure_ascii=False),
+                    json.dumps(
+                        tuple(item.relevance for item in resolution.selected_candidates),
+                        ensure_ascii=False,
+                    ),
+                    resolution.confidence,
+                    completed.isoformat(),
+                    turn_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                connection.commit()
+                return CommitOutcome(
+                    committed=False,
+                    reason="turn_conflict",
+                    workspace_version=current.version,
+                )
+            next_version = current.version + 1
+            updated = workspace.model_copy(
+                update={"version": next_version, "updated_at": completed}
+            )
+            connection.execute(
+                """UPDATE conversation_workspaces
+                   SET version = ?, state_json = ?, updated_at = ?
+                   WHERE conversation_id = ?""",
+                (
+                    next_version,
+                    updated.model_dump_json(),
+                    completed.isoformat(),
+                    workspace.conversation_id,
+                ),
+            )
+            connection.execute(
+                """UPDATE main_agent_runs
+                   SET status = 'completed', committed_workspace_version = ?, result_json = ?,
+                       updated_at = ?
+                   WHERE run_id = ?""",
+                (next_version, result.model_dump_json(), completed.isoformat(), run_id),
+            )
+            if resolution.episode_id is not None and turn_row is not None:
+                connection.execute(
+                    """INSERT INTO conversation_episodes (
+                           conversation_id, episode_id, summary, last_sequence, updated_at
+                       ) VALUES (?, ?, ?, ?, ?)
+                       ON CONFLICT(conversation_id, episode_id) DO UPDATE SET
+                           summary = excluded.summary,
+                           last_sequence = excluded.last_sequence,
+                           updated_at = excluded.updated_at""",
+                    (
+                        str(turn_row[0]),
+                        resolution.episode_id,
+                        resolution.standalone_question[:2_000],
+                        int(turn_row[1]),
+                        completed.isoformat(),
+                    ),
+                )
+            connection.commit()
+        return CommitOutcome(committed=True, reason="committed", workspace_version=next_version)
 
     def complete_turn(
         self,
@@ -469,6 +603,7 @@ class _AgentRunRecord:
     status: str
     base_workspace_version: int
     result: MainAgentResult | None = None
+    committed_workspace_version: int | None = None
 
 
 class InMemoryConversationStore:
@@ -591,6 +726,76 @@ class InMemoryConversationStore:
         if record is None or record.status != "completed":
             return None
         return record.result
+
+    def commit_agent_run(
+        self,
+        *,
+        run_id: str,
+        turn_id: str,
+        expected_workspace_version: int,
+        workspace: ConversationWorkspace,
+        route: str,
+        status: ConversationStatus,
+        resolution: ConversationResolution,
+        assistant_summary: str | None,
+        source_ids: Sequence[str],
+        result: MainAgentResult,
+    ) -> CommitOutcome:
+        created = datetime.now(UTC)
+        with self._lock:
+            record = next(
+                (item for item in self._runs.values() if item.run_id == run_id), None
+            )
+            if record is None:
+                return CommitOutcome(
+                    committed=False,
+                    reason="run_not_found",
+                    workspace_version=expected_workspace_version,
+                )
+            if record.status == "completed":
+                return CommitOutcome(
+                    committed=False,
+                    reason="already_completed",
+                    workspace_version=expected_workspace_version,
+                )
+            current = self._workspaces.get(workspace.conversation_id)
+            if current is None or current.version != expected_workspace_version:
+                return CommitOutcome(
+                    committed=False,
+                    reason="version_conflict",
+                    workspace_version=current.version if current is not None else 0,
+                )
+            turn = self._turns.get(turn_id)
+            if turn is None or turn.status != "pending":
+                return CommitOutcome(
+                    committed=False,
+                    reason="turn_conflict",
+                    workspace_version=current.version,
+                )
+            next_version = current.version + 1
+            self._workspaces[workspace.conversation_id] = workspace.model_copy(
+                update={"version": next_version, "updated_at": created}
+            )
+            self._turns[turn_id] = turn.model_copy(
+                update={
+                    "standalone_question": resolution.standalone_question,
+                    "route": route,
+                    "status": status,
+                    "assistant_summary": _summary(assistant_summary),
+                    "source_ids": tuple(dict.fromkeys(source_ids)),
+                    "episode_id": resolution.episode_id,
+                    "selected_history_turn_ids": resolution.selected_turn_ids,
+                    "selected_history_relevances": tuple(
+                        item.relevance for item in resolution.selected_candidates
+                    ),
+                    "rewrite_confidence": resolution.confidence,
+                    "completed_at": created,
+                }
+            )
+            record.status = "completed"
+            record.result = result
+            record.committed_workspace_version = next_version
+        return CommitOutcome(committed=True, reason="committed", workspace_version=next_version)
 
     def complete_turn(
         self,

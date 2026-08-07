@@ -7,6 +7,7 @@ from contextlib import closing
 from pathlib import Path
 
 from paper_research_agent.agent.orchestrator.models import MainAgentResult
+from paper_research_agent.conversation.models import ConversationResolution
 from paper_research_agent.conversation.store import (
     InMemoryConversationStore,
     SQLiteConversationStore,
@@ -22,6 +23,16 @@ def _cached_result(request_id: str, run_id: str) -> MainAgentResult:
         answer="已缓存回答",
         route_trace=("local_rag",),
         workspace_version=1,
+    )
+
+
+def _resolution() -> ConversationResolution:
+    return ConversationResolution(
+        original_question="比较 RAG 与 GraphRAG",
+        standalone_question="比较 RAG 与 GraphRAG",
+        chinese_query="比较 RAG 与 GraphRAG",
+        confidence=1,
+        episode_id="a" * 16,
     )
 
 
@@ -148,6 +159,97 @@ class AgentRunRepositoryTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     store.load_workspace("conversation-1")  # type: ignore[attr-defined]
                 self.assertIsNone(store.load_agent_run("request-1"))  # type: ignore[attr-defined]
+
+    def _commit_args(self, start: object) -> dict[str, object]:
+        workspace = start.workspace.model_copy(update={"summary": "更新后的摘要"})
+        return {
+            "run_id": start.run_id,
+            "turn_id": start.turn_id,
+            "expected_workspace_version": start.workspace.version,
+            "workspace": workspace,
+            "route": "local_rag",
+            "status": "completed",
+            "resolution": _resolution(),
+            "assistant_summary": "已给出回答",
+            "source_ids": ("source-1",),
+            "result": _cached_result(start.request_id, start.run_id),
+        }
+
+    def test_commit_agent_run_updates_turn_workspace_and_run_atomically(self) -> None:
+        for label, store in self._stores():
+            with self.subTest(store=label):
+                start = store.begin_agent_run(  # type: ignore[attr-defined]
+                    request_id="request-1",
+                    conversation_id="conversation-1",
+                    user_question="比较 RAG 与 GraphRAG",
+                )
+                args = self._commit_args(start)
+                outcome = store.commit_agent_run(**args)  # type: ignore[attr-defined]
+                self.assertTrue(outcome.committed)
+                self.assertEqual(outcome.workspace_version, 1)
+                loaded = store.load_workspace("conversation-1")  # type: ignore[attr-defined]
+                self.assertEqual(loaded.version, 1)
+                self.assertEqual(loaded.summary, "更新后的摘要")
+                history = store.history("conversation-1")
+                self.assertEqual(len(history), 1)
+                self.assertEqual(history[0].status, "completed")
+                self.assertEqual(len(store.episodes("conversation-1")), 1)
+                cached = store.load_agent_run("request-1")  # type: ignore[attr-defined]
+                self.assertIsNotNone(cached)
+                self.assertEqual(cached.answer, "已缓存回答")
+
+    def test_commit_with_stale_workspace_version_is_rejected(self) -> None:
+        for label, store in self._stores():
+            with self.subTest(store=label):
+                start = store.begin_agent_run(  # type: ignore[attr-defined]
+                    request_id="request-1",
+                    conversation_id="conversation-1",
+                    user_question="比较 RAG 与 GraphRAG",
+                )
+                args = self._commit_args(start)
+                args["expected_workspace_version"] = 5
+                outcome = store.commit_agent_run(**args)  # type: ignore[attr-defined]
+                self.assertFalse(outcome.committed)
+                self.assertEqual(outcome.reason, "version_conflict")
+                self.assertEqual(store.load_workspace("conversation-1").version, 0)  # type: ignore[attr-defined]
+                self.assertEqual(store.history("conversation-1"), ())
+                self.assertIsNone(store.load_agent_run("request-1"))  # type: ignore[attr-defined]
+
+    def test_injected_failure_rolls_back_entire_commit(self) -> None:
+        start = self.sqlite.begin_agent_run(
+            request_id="request-1",
+            conversation_id="conversation-1",
+            user_question="比较 RAG 与 GraphRAG",
+        )
+        with closing(sqlite3.connect(self.sqlite.path)) as connection:
+            connection.execute(
+                "CREATE TRIGGER boom BEFORE UPDATE ON conversation_workspaces "
+                "BEGIN SELECT RAISE(ABORT, 'boom'); END;"
+            )
+            connection.commit()
+        with self.assertRaises(sqlite3.Error):
+            self.sqlite.commit_agent_run(**self._commit_args(start))
+        self.assertEqual(self.sqlite.load_workspace("conversation-1").version, 0)
+        self.assertEqual(self.sqlite.history("conversation-1"), ())
+        self.assertIsNone(self.sqlite.load_agent_run("request-1"))
+
+    def test_duplicate_commit_is_idempotent(self) -> None:
+        for label, store in self._stores():
+            with self.subTest(store=label):
+                start = store.begin_agent_run(  # type: ignore[attr-defined]
+                    request_id="request-1",
+                    conversation_id="conversation-1",
+                    user_question="比较 RAG 与 GraphRAG",
+                )
+                args = self._commit_args(start)
+                first = store.commit_agent_run(**args)  # type: ignore[attr-defined]
+                second = store.commit_agent_run(**args)  # type: ignore[attr-defined]
+                self.assertTrue(first.committed)
+                self.assertFalse(second.committed)
+                self.assertEqual(second.reason, "already_completed")
+                self.assertEqual(len(store.history("conversation-1")), 1)
+                self.assertEqual(len(store.episodes("conversation-1")), 1)
+                self.assertEqual(store.load_workspace("conversation-1").version, 1)  # type: ignore[attr-defined]
 
 
 if __name__ == "__main__":

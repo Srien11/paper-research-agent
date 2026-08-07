@@ -5,9 +5,11 @@ from __future__ import annotations
 from paper_research_agent.agent.orchestrator.models import (
     AcceptanceCriterion,
     AgentContextEnvelope,
+    AgentRunStart,
     AgentTask,
     ChildTaskRequest,
     ChildTaskResult,
+    CommitOutcome,
     ContextMessage,
     ConversationWorkspace,
     GoalDecision,
@@ -24,9 +26,11 @@ from paper_research_agent.agent.orchestrator.state import MainAgentGraphState
 __all__ = [
     "AcceptanceCriterion",
     "AgentContextEnvelope",
+    "AgentRunStart",
     "AgentTask",
     "ChildTaskRequest",
     "ChildTaskResult",
+    "CommitOutcome",
     "ContextMessage",
     "ConversationWorkspace",
     "GoalDecision",

@@ -392,3 +392,17 @@ class AgentRunStart(FrozenModel):
     workspace: ConversationWorkspace
     outcome: Literal["created", "running_reused", "completed_cached"]
     result: MainAgentResult | None = None
+
+
+class CommitOutcome(FrozenModel):
+    """Result of one atomic workspace + turn + run commit."""
+
+    committed: bool
+    reason: Literal[
+        "committed",
+        "already_completed",
+        "version_conflict",
+        "run_not_found",
+        "turn_conflict",
+    ] = "committed"
+    workspace_version: int = Field(default=0, ge=0)
