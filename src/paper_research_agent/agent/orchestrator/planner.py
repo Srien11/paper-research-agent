@@ -4,23 +4,30 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
+from typing import Literal
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
-from pydantic import Field
+from pydantic import Field, ValidationError
 
 from paper_research_agent.agent.orchestrator.models import (
     AcceptanceCriterion,
     AgentContextEnvelope,
+    AgentTask,
+    Capability,
     ConversationWorkspace,
     FrozenModel,
     GoalDecision,
     GoalState,
+    TaskPlan,
+    TaskPlanDecision,
     TurnInterpretationV2,
 )
 from paper_research_agent.agent.orchestrator.prompts import (
     GOAL_RECONCILER_PROMPT_VERSION,
     GOAL_RECONCILER_SYSTEM,
+    TASK_PLANNER_PROMPT_VERSION,
+    TASK_PLANNER_SYSTEM,
 )
 
 
@@ -157,3 +164,196 @@ def _merge_constraints(
 ) -> tuple[str, ...]:
     merged = tuple(dict.fromkeys((*existing, *new)))
     return merged[:20]
+
+
+class _TaskDraft(FrozenModel):
+    task_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    title: str = Field(min_length=1, max_length=200)
+    objective: str = Field(min_length=1, max_length=1000)
+    success_criteria: tuple[str, ...] = Field(min_length=1, max_length=8)
+    capability: Capability
+    depends_on: tuple[str, ...] = Field(default=(), max_length=8)
+
+
+class _TaskPlanDraft(FrozenModel):
+    tasks: tuple[_TaskDraft, ...] = Field(min_length=1, max_length=12)
+
+
+class TaskPlanner:
+    """Builds and revises session-level task plans for the active goal."""
+
+    def __init__(
+        self,
+        model: BaseChatModel | None = None,
+        *,
+        version: str = TASK_PLANNER_PROMPT_VERSION,
+    ) -> None:
+        self.version = version
+        self._model = (
+            model.with_structured_output(_TaskPlanDraft, method="function_calling")
+            if model is not None
+            else None
+        )
+
+    async def plan(
+        self,
+        envelope: AgentContextEnvelope,
+        interpretation: TurnInterpretationV2,
+        goal_decision: GoalDecision,
+    ) -> TaskPlanDecision:
+        current = envelope.workspace.task_plan
+        if goal_decision.action == "keep":
+            return TaskPlanDecision(
+                action="keep", plan=current, rationale="目标未变，计划保持不变"
+            )
+        if goal_decision.action in {"abandon", "satisfy", "block"}:
+            return TaskPlanDecision(
+                action="keep", plan=current, rationale="目标结束，任务状态由结果评估更新"
+            )
+        model = self._model
+        if model is None:
+            return self._fallback_decision(goal_decision, current, envelope, interpretation)
+        system = SystemMessage(
+            content=f"{TASK_PLANNER_SYSTEM}\nPROMPT_VERSION={self.version}"
+        )
+        user = HumanMessage(content=_task_planner_user_content(envelope, interpretation))
+        try:
+            raw = await model.ainvoke([system, user])
+            draft = _TaskPlanDraft.model_validate(raw) if not isinstance(raw, _TaskPlanDraft) else raw
+        except Exception:  # noqa: BLE001 - single-task fallback on planner failure
+            return self._fallback_decision(goal_decision, current, envelope, interpretation)
+        try:
+            return self._build_decision(
+                goal_decision, current, envelope, draft
+            )
+        except ValidationError:
+            return self._fallback_decision(goal_decision, current, envelope, interpretation)
+
+    def _build_decision(
+        self,
+        goal_decision: GoalDecision,
+        current: TaskPlan | None,
+        envelope: AgentContextEnvelope,
+        draft: _TaskPlanDraft,
+    ) -> TaskPlanDecision:
+        goal_id = _goal_id(goal_decision, current, envelope)
+        completed = (
+            tuple(task for task in current.tasks if task.status == "completed")
+            if current is not None
+            else ()
+        )
+        kept_ids = {task.task_id for task in completed}
+        new_tasks = tuple(
+            AgentTask(
+                task_id=item.task_id,
+                goal_id=goal_id,
+                title=item.title,
+                objective=item.objective,
+                success_criteria=item.success_criteria,
+                capability=item.capability,
+                status="pending",
+                depends_on=item.depends_on,
+            )
+            for item in draft.tasks
+            if item.task_id not in kept_ids
+        )
+        tasks = (*completed, *new_tasks)
+        revision = (
+            1
+            if goal_decision.action == "create" or current is None
+            else current.revision + 1
+        )
+        now = datetime.now(UTC)
+        plan = TaskPlan(
+            plan_id=uuid.uuid4().hex,
+            goal_id=goal_id,
+            revision=revision,
+            tasks=tasks,
+            created_at=now,
+            updated_at=now,
+        )
+        action: Literal["create", "revise"] = (
+            "create" if current is None else "revise"
+        )
+        return TaskPlanDecision(
+            action=action,
+            plan=plan,
+            rationale="根据本轮目标修订会话任务计划",
+        )
+
+    def _fallback_decision(
+        self,
+        goal_decision: GoalDecision,
+        current: TaskPlan | None,
+        envelope: AgentContextEnvelope,
+        interpretation: TurnInterpretationV2,
+    ) -> TaskPlanDecision:
+        goal_id = _goal_id(goal_decision, current, envelope)
+        capability: Capability = (
+            "direct_chat" if envelope.rag_mode == "disabled" else "local_rag"
+        )
+        task = AgentTask(
+            task_id="single-research-task",
+            goal_id=goal_id,
+            title="完成当前请求",
+            objective=interpretation.resolved_request,
+            success_criteria=("完成当前请求",),
+            capability=capability,
+            status="pending",
+        )
+        now = datetime.now(UTC)
+        revision = (
+            1
+            if goal_decision.action == "create" or current is None
+            else current.revision + 1
+        )
+        plan = TaskPlan(
+            plan_id=uuid.uuid4().hex,
+            goal_id=goal_id,
+            revision=revision,
+            tasks=(task,),
+            created_at=now,
+            updated_at=now,
+        )
+        action: Literal["create", "revise"] = (
+            "create" if current is None else "revise"
+        )
+        return TaskPlanDecision(
+            action=action,
+            plan=plan,
+            rationale="模型规划不可用，使用单任务降级",
+        )
+
+
+def _goal_id(
+    goal_decision: GoalDecision,
+    current: TaskPlan | None,
+    envelope: AgentContextEnvelope,
+) -> str:
+    if goal_decision.goal is not None:
+        return goal_decision.goal.goal_id
+    if current is not None:
+        return current.goal_id
+    if envelope.workspace.active_goal is not None:
+        return envelope.workspace.active_goal.goal_id
+    raise ValueError("no active goal to plan tasks for")
+
+
+def _task_planner_user_content(
+    envelope: AgentContextEnvelope, interpretation: TurnInterpretationV2
+) -> str:
+    goal = envelope.workspace.active_goal
+    goal_text = f"{goal.objective}" if goal is not None else "（无）"
+    task_plan = envelope.workspace.task_plan
+    existing_tasks = (
+        "; ".join(f"{task.status}: {task.task_id}" for task in task_plan.tasks)
+        if task_plan is not None
+        else "（无）"
+    )
+    return (
+        f"CURRENT_MESSAGE\n{envelope.current_message}\n\n"
+        f"RESOLVED_REQUEST\n{interpretation.resolved_request}\n\n"
+        f"ACTIVE_GOAL\n{goal_text}\n\n"
+        f"EXISTING_TASKS\n{existing_tasks}\n\n"
+        f"RAG_MODE\n{envelope.rag_mode}\n"
+    )
