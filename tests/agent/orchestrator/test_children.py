@@ -12,6 +12,7 @@ from paper_research_agent.agent.dynamic.runtime import DynamicResearchRuntime
 from paper_research_agent.agent.orchestrator.children import ChildGraphDispatcher
 from paper_research_agent.agent.orchestrator.models import (
     ChildTaskRequest,
+    ContextMessage,
     RecalledContext,
 )
 
@@ -261,6 +262,31 @@ class ChildGraphDispatcherTests(unittest.TestCase):
             asyncio.run(
                 dispatcher.dispatch(_request(capability="direct_chat"))
             )
+
+    def test_direct_response_request_consumes_orchestrator_context(self) -> None:
+        from paper_research_agent.web.chat_runtime import DirectResponseRequest
+
+        request = DirectResponseRequest(
+            session_id="session-1",
+            current_message="继续",
+            recent_messages=(
+                ContextMessage(
+                    turn_id="t1", sequence=1, role="user", content="旧问题"
+                ),
+            ),
+            active_goal="比较 RAG 与 GraphRAG",
+            recalled_context=(
+                RecalledContext(
+                    source_id="m" * 32,
+                    kind="long_term_memory",
+                    content="偏好",
+                    relevance=0.5,
+                    trust="research_context",
+                ),
+            ),
+        )
+        self.assertEqual(request.recent_messages[0].content, "旧问题")
+        self.assertEqual(request.recalled_context[0].source_id, "m" * 32)
 
 
 if __name__ == "__main__":
