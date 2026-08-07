@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from typing import TypedDict
 
+from paper_research_agent.agent.orchestrator.evaluator import TaskEvaluation
 from paper_research_agent.agent.orchestrator.models import (
     AgentContextEnvelope,
     ChildTaskResult,
+    CommitOutcome,
     ConversationWorkspace,
     GoalDecision,
     MainAgentRequest,
@@ -19,6 +21,7 @@ class MainAgentGraphState(TypedDict, total=False):
     """Temporary graph container; every node boundary uses strict Pydantic models."""
 
     run_id: str
+    turn_id: str
     request: MainAgentRequest
     base_workspace_version: int
     context: AgentContextEnvelope
@@ -29,6 +32,8 @@ class MainAgentGraphState(TypedDict, total=False):
     active_task_id: str
     route: str
     child_results: list[ChildTaskResult]
+    child_result: ChildTaskResult
+    evaluation: TaskEvaluation
     direct_answer: str
     final_answer: str
     pending_approval: dict[str, object]
@@ -36,3 +41,6 @@ class MainAgentGraphState(TypedDict, total=False):
     remaining_replans: int
     termination_reason: str
     next_action: str
+    validation_errors: tuple[str, ...]
+    commit_outcome: CommitOutcome
+    route_trace: list[str]
