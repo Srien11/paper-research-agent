@@ -41,14 +41,6 @@ def evaluate_task(
     max_attempts: int = MAX_TASK_ATTEMPTS,
 ) -> TaskEvaluation:
     """Judge one child result against task criteria without relaxing citation safety."""
-    if child_calls_used >= max_child_calls:
-        return TaskEvaluation(
-            task_id=task.task_id,
-            outcome="fail",
-            missing_criteria=task.success_criteria,
-            summary=result.summary,
-            reason="本轮子图调用预算耗尽",
-        )
     if result.status == "waiting_approval":
         return TaskEvaluation(
             task_id=task.task_id,
@@ -58,10 +50,18 @@ def evaluate_task(
         )
     if result.status == "failed":
         return _retry_or_fail(
-            task, result, max_attempts, "子图执行失败"
+            task,
+            result,
+            child_calls_used,
+            max_child_calls,
+            max_attempts,
+            "子图执行失败",
         )
     if result.status == "insufficient_evidence":
-        if task.attempt_count + 1 < max_attempts:
+        if (
+            child_calls_used < max_child_calls
+            and task.attempt_count + 1 < max_attempts
+        ):
             return TaskEvaluation(
                 task_id=task.task_id,
                 outcome="retry",
@@ -69,7 +69,7 @@ def evaluate_task(
                 summary=result.summary,
                 reason="证据不足，重试任务",
             )
-        if replans_used < max_replans:
+        if child_calls_used < max_child_calls and replans_used < max_replans:
             return TaskEvaluation(
                 task_id=task.task_id,
                 outcome="replan",
@@ -104,10 +104,12 @@ def evaluate_task(
 def _retry_or_fail(
     task: AgentTask,
     result: ChildTaskResult,
+    child_calls_used: int,
+    max_child_calls: int,
     max_attempts: int,
     reason_prefix: str,
 ) -> TaskEvaluation:
-    if task.attempt_count + 1 < max_attempts:
+    if child_calls_used < max_child_calls and task.attempt_count + 1 < max_attempts:
         return TaskEvaluation(
             task_id=task.task_id,
             outcome="retry",

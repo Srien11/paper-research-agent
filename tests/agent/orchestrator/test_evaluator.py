@@ -150,9 +150,14 @@ class EvaluateTaskTests(unittest.TestCase):
         self.assertEqual(evaluation.outcome, "complete")
 
     def test_budget_exhausted_fails(self) -> None:
-        result = _result(status="completed")
+        result = _result(status="insufficient_evidence", citation_kind="none")
         evaluation = self._evaluate(_task(), result, child_calls_used=3)
         self.assertEqual(evaluation.outcome, "fail")
+
+    def test_completed_result_not_failed_by_budget(self) -> None:
+        result = _result(status="completed")
+        evaluation = self._evaluate(_task(), result, child_calls_used=3)
+        self.assertEqual(evaluation.outcome, "complete")
 
     def test_failed_task_retries_then_fails(self) -> None:
         result = _result(status="failed", citation_kind="none")
