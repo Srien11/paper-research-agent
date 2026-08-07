@@ -23,6 +23,10 @@ from paper_research_agent.agent.tooling.contracts import ToolExecutionResult
 from paper_research_agent.answering.models import AnswerRequest, GenerationResult
 from paper_research_agent.chunking.models import EvidenceChunk
 from paper_research_agent.context.models import ContextEvidence
+from paper_research_agent.conversation.models import (
+    ConversationCandidate,
+    ConversationResolution,
+)
 from paper_research_agent.memory.config import ShortTermMemoryConfig
 from paper_research_agent.memory.models import ShortTermMemoryTurn
 from paper_research_agent.retrieval.contracts import (
@@ -273,6 +277,7 @@ class FakeResearchAgent:
         self.closed = 0
         self.dynamic_calls: list[tuple[str, str]] = []
         self.dynamic_resumes: list[tuple[str, bool]] = []
+        self.planning_requirements: list[bool] = []
 
     @property
     def dynamic_tools_enabled(self) -> bool:
@@ -282,8 +287,15 @@ class FakeResearchAgent:
     def extended_tools_enabled(self) -> bool:
         return True
 
-    async def run(self, question: str, *, thread_id: str) -> ResearchRuntimeResult:
+    async def run(
+        self,
+        question: str,
+        *,
+        thread_id: str,
+        planning_required: bool = False,
+    ) -> ResearchRuntimeResult:
         self.calls.append((question, thread_id))
+        self.planning_requirements.append(planning_required)
         return self.result.model_copy(update={"question": question})
 
     async def clear(self, thread_id: str) -> None:
@@ -345,6 +357,7 @@ def _runtime(
     *,
     gate: asyncio.Event | None = None,
     research_agent: FakeResearchAgent | None = None,
+    research_agent_mode: str = "always",
 ) -> tuple[RAGRuntime, FakeRetriever, FakeGenerator]:
     chunk = _chunk()
     retriever = FakeRetriever(chunk)
@@ -367,6 +380,7 @@ def _runtime(
             research_agent=research_agent,
         ),
         excerpt_chars=48,
+        research_agent_mode=research_agent_mode,
     )
     return runtime, retriever, generator
 
@@ -420,6 +434,17 @@ class RAGRuntimeTests(unittest.IsolatedAsyncioTestCase):
         ):
             RAGRuntime.research_agent_enabled_from_environment()
 
+    def test_agent_mode_defaults_to_auto_and_rejects_unknown_values(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(RAGRuntime.research_agent_mode_from_environment(), "auto")
+        with patch.dict("os.environ", {"PRA_RESEARCH_AGENT_MODE": "always"}, clear=True):
+            self.assertEqual(RAGRuntime.research_agent_mode_from_environment(), "always")
+        with (
+            patch.dict("os.environ", {"PRA_RESEARCH_AGENT_MODE": "sometimes"}, clear=True),
+            self.assertRaisesRegex(ValueError, "PRA_RESEARCH_AGENT_MODE"),
+        ):
+            RAGRuntime.research_agent_mode_from_environment()
+
     async def test_from_environment_with_agent_maps_policy_and_checkpoint(self) -> None:
         runtime, _, _ = _runtime()
         answer_config = Mock(model="qwen-planner-2026-01-01")
@@ -451,6 +476,7 @@ class RAGRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["policy"].evidence_per_step, 3)
         self.assertEqual(kwargs["policy"].max_tool_calls, 12)
         self.assertEqual(kwargs["policy"].timeout_seconds, 45)
+        self.assertEqual(kwargs["mode"], "auto")
 
     async def test_reuses_dependencies_and_returns_only_safe_trace(self) -> None:
         runtime, retriever, generator = _runtime()
@@ -496,6 +522,66 @@ class RAGRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(agent.clear_calls, ["d" * 32])
         await runtime.aclose()
         self.assertEqual(agent.closed, 1)
+
+    async def test_shared_conversation_context_drives_retrieval_and_answer_prompt(self) -> None:
+        runtime, retriever, generator = _runtime()
+        turn_id = "a" * 32
+        candidate = ConversationCandidate(
+            turn_id=turn_id,
+            sequence=1,
+            user_question="大模型测评",
+            standalone_question="大模型测评",
+            route="normal_chat",
+            assistant_summary="讨论了评测指标与基准。",
+            status="completed",
+            episode_id="b" * 16,
+            relevance=0.96,
+        )
+        resolution = ConversationResolution(
+            original_question="结合一下知识库",
+            standalone_question="请基于本地论文知识库，继续分析大模型测评。",
+            chinese_query="大模型测评 方法 指标 基准 安全性 人工评审",
+            candidates=(candidate,),
+            selected_turn_ids=(turn_id,),
+            confidence=0.96,
+            inherited_across_route=True,
+            episode_id="b" * 16,
+        )
+
+        result = await runtime.ask(
+            "结合一下知识库",
+            session_id="conversation-a",
+            conversation_context=resolution,
+        )
+
+        self.assertEqual(retriever.queries, [resolution.standalone_question])
+        prompt = "\n".join(message.content for message in generator.requests[0].context.messages)
+        self.assertIn(resolution.standalone_question, prompt)
+        self.assertIn("大模型测评", prompt)
+        self.assertEqual(result.retrieval.selected_history_turn_ids, (turn_id,))
+        self.assertEqual(result.retrieval.selected_history_relevances, (0.96,))
+        self.assertTrue(result.retrieval.inherited_across_route)
+        await runtime.aclose()
+
+    async def test_auto_mode_uses_agent_only_for_scholarly_comparison(self) -> None:
+        chunk = _chunk()
+        agent = FakeResearchAgent(_research_result(chunk))
+        runtime, retriever, _ = _runtime(
+            research_agent=agent,
+            research_agent_mode="auto",
+        )
+
+        direct = await runtime.ask("RAG 如何改善事实性？", session_id="1" * 32)
+        comparison = await runtime.ask(
+            "比较这两篇论文的方法和实验指标",
+            session_id="2" * 32,
+        )
+
+        self.assertEqual(len(retriever.queries), 1)
+        self.assertEqual(agent.calls, [("比较这两篇论文的方法和实验指标", "2" * 32)])
+        self.assertEqual(direct.retrieval.rewrite_status, "success")
+        self.assertEqual(comparison.retrieval.rewrite_status, "agent")
+        self.assertEqual(agent.planning_requirements, [True])
 
     async def test_dynamic_tool_lane_uses_agent_checkpoint_thread(self) -> None:
         agent = FakeResearchAgent(_research_result(_chunk()))

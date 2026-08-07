@@ -10,6 +10,7 @@ from paper_research_agent.ingestion.models import Sha256
 
 StorageClass = Literal["redistributable", "internal_research_only"]
 EvidenceType = Literal["text", "figure_summary"]
+ResearchTaskType = Literal["direct", "comparison"]
 AssessmentStatus = Literal[
     "sufficient",
     "missing_coverage",
@@ -164,6 +165,79 @@ class GetEvidenceResult(FrozenContract):
         return self
 
 
+class ResearchTarget(FrozenContract):
+    """One named paper, method, model, or study being compared."""
+
+    target_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+    label: str = Field(min_length=1, max_length=200)
+
+    @field_validator("label")
+    @classmethod
+    def normalize_label(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("research target label must not be blank")
+        return normalized
+
+
+class ResearchDimension(FrozenContract):
+    """One explicit comparison axis such as method, dataset, metric, or limitation."""
+
+    dimension_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+    label: str = Field(min_length=1, max_length=200)
+
+    @field_validator("label")
+    @classmethod
+    def normalize_label(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("research dimension label must not be blank")
+        return normalized
+
+
+class EvidenceRequirement(FrozenContract):
+    """One required target-by-dimension evidence cell in a comparison plan."""
+
+    requirement_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+    target_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+    dimension_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+    description: str = Field(min_length=1, max_length=500)
+
+    @field_validator("description")
+    @classmethod
+    def normalize_description(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("evidence requirement description must not be blank")
+        return normalized
+
+
+class EvidenceCoverage(FrozenContract):
+    """Evidence IDs supporting one requirement without duplicating source text."""
+
+    requirement_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+    covered: bool
+    chunk_ids: tuple[str, ...] = Field(default=(), max_length=20)
+
+    @field_validator("chunk_ids")
+    @classmethod
+    def validate_chunk_ids(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(value.strip() for value in values)
+        if any(not value for value in normalized):
+            raise ValueError("coverage chunk IDs must not be blank")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("coverage chunk IDs must be unique")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_covered_state(self) -> EvidenceCoverage:
+        if self.covered and not self.chunk_ids:
+            raise ValueError("covered evidence requires chunk IDs")
+        if not self.covered and self.chunk_ids:
+            raise ValueError("uncovered evidence cannot include chunk IDs")
+        return self
+
+
 class ResearchStep(FrozenContract):
     """One bounded corpus-search objective produced by a research planner."""
 
@@ -171,6 +245,8 @@ class ResearchStep(FrozenContract):
     objective: str = Field(min_length=1, max_length=500)
     query: str = Field(min_length=1, max_length=2000)
     top_k: int = Field(default=10, ge=1, le=20)
+    target_ids: tuple[str, ...] = Field(default=(), max_length=4)
+    dimension_ids: tuple[str, ...] = Field(default=(), max_length=5)
 
     @field_validator("objective", "query")
     @classmethod
@@ -180,11 +256,25 @@ class ResearchStep(FrozenContract):
             raise ValueError("research step text must not be blank")
         return normalized
 
+    @field_validator("target_ids", "dimension_ids")
+    @classmethod
+    def validate_reference_ids(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(value.strip() for value in values)
+        if any(not value for value in normalized):
+            raise ValueError("research step reference IDs must not be blank")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("research step reference IDs must be unique")
+        return normalized
+
 
 class ResearchPlan(FrozenContract):
     """Ordered, auditable subquestions that stay within the read-only workflow."""
 
     schema_version: Literal["research-plan-v1"] = "research-plan-v1"
+    task_type: ResearchTaskType = "direct"
+    targets: tuple[ResearchTarget, ...] = Field(default=(), max_length=4)
+    dimensions: tuple[ResearchDimension, ...] = Field(default=(), max_length=5)
+    requirements: tuple[EvidenceRequirement, ...] = Field(default=(), max_length=20)
     steps: tuple[ResearchStep, ...] = Field(min_length=1, max_length=6)
 
     @model_validator(mode="after")
@@ -192,6 +282,56 @@ class ResearchPlan(FrozenContract):
         step_ids = [step.step_id for step in self.steps]
         if len(step_ids) != len(set(step_ids)):
             raise ValueError("research plan step IDs must be unique")
+        target_ids = [target.target_id for target in self.targets]
+        dimension_ids = [dimension.dimension_id for dimension in self.dimensions]
+        requirement_ids = [item.requirement_id for item in self.requirements]
+        if len(target_ids) != len(set(target_ids)):
+            raise ValueError("research plan target IDs must be unique")
+        if len(dimension_ids) != len(set(dimension_ids)):
+            raise ValueError("research plan dimension IDs must be unique")
+        if len(requirement_ids) != len(set(requirement_ids)):
+            raise ValueError("research plan requirement IDs must be unique")
+        if self.task_type == "direct":
+            if self.targets or self.dimensions or self.requirements:
+                raise ValueError("direct research plan cannot declare comparison metadata")
+            if any(step.target_ids or step.dimension_ids for step in self.steps):
+                raise ValueError("direct research steps cannot reference comparison metadata")
+            return self
+        if len(self.targets) < 2:
+            raise ValueError("comparison research plan requires at least two targets")
+        if not self.dimensions:
+            raise ValueError("comparison research plan requires at least one dimension")
+        known_targets = set(target_ids)
+        known_dimensions = set(dimension_ids)
+        if any(
+            item.target_id not in known_targets or item.dimension_id not in known_dimensions
+            for item in self.requirements
+        ):
+            raise ValueError("comparison requirement references an unknown target or dimension")
+        required_pairs = {
+            (target_id, dimension_id)
+            for target_id in known_targets
+            for dimension_id in known_dimensions
+        }
+        actual_pairs = {(item.target_id, item.dimension_id) for item in self.requirements}
+        if actual_pairs != required_pairs or len(self.requirements) != len(required_pairs):
+            raise ValueError("comparison requirements must form a complete target-dimension grid")
+        if any(
+            not step.target_ids
+            or not step.dimension_ids
+            or not set(step.target_ids) <= known_targets
+            or not set(step.dimension_ids) <= known_dimensions
+            for step in self.steps
+        ):
+            raise ValueError("comparison research step references are missing or unknown")
+        planned_pairs = {
+            (target_id, dimension_id)
+            for step in self.steps
+            for target_id in step.target_ids
+            for dimension_id in step.dimension_ids
+        }
+        if not required_pairs <= planned_pairs:
+            raise ValueError("comparison research steps do not cover every requirement cell")
         return self
 
 
@@ -210,8 +350,10 @@ class EvidenceAssessment(FrozenContract):
     schema_version: Literal["research-evidence-assessment-v1"] = "research-evidence-assessment-v1"
     evidence_sufficient: bool
     status: AssessmentStatus
+    coverage: tuple[EvidenceCoverage, ...] = Field(default=(), max_length=20)
     next_query: str | None = Field(default=None, min_length=1, max_length=2000)
     next_objective: str | None = Field(default=None, min_length=1, max_length=500)
+    next_requirement_ids: tuple[str, ...] = Field(default=(), max_length=20)
 
     @field_validator("next_query", "next_objective")
     @classmethod
@@ -223,20 +365,35 @@ class EvidenceAssessment(FrozenContract):
             raise ValueError("next search text must not be blank")
         return normalized
 
+    @field_validator("next_requirement_ids")
+    @classmethod
+    def validate_next_requirement_ids(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(value.strip() for value in values)
+        if any(not value for value in normalized):
+            raise ValueError("next requirement IDs must not be blank")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("next requirement IDs must be unique")
+        return normalized
+
     @model_validator(mode="after")
     def validate_decision(self) -> EvidenceAssessment:
+        coverage_ids = [item.requirement_id for item in self.coverage]
+        if len(coverage_ids) != len(set(coverage_ids)):
+            raise ValueError("evidence coverage requirement IDs must be unique")
         has_next_query = self.next_query is not None
         has_next_objective = self.next_objective is not None
         if self.evidence_sufficient:
             if self.status != "sufficient":
                 raise ValueError("sufficient evidence requires sufficient status")
-            if has_next_query or has_next_objective:
+            if has_next_query or has_next_objective or self.next_requirement_ids:
                 raise ValueError("sufficient evidence cannot request another search")
         else:
             if self.status == "sufficient":
                 raise ValueError("insufficient evidence cannot use sufficient status")
             if has_next_query != has_next_objective:
                 raise ValueError("next query and objective must be present together")
+            if not has_next_query and self.next_requirement_ids:
+                raise ValueError("next requirement IDs require another search")
         return self
 
 

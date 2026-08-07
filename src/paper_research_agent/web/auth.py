@@ -85,7 +85,7 @@ class SessionManager:
         now = int(self._clock())
         session = OwnerSession(
             session_id=secrets.token_urlsafe(32),
-            conversation_id=secrets.token_urlsafe(24),
+            conversation_id=secrets.token_hex(24),
             expires_at=now + self._ttl_seconds,
         )
         with self._lock:
@@ -126,7 +126,7 @@ class SessionManager:
             return None
         replacement = OwnerSession(
             session_id=current.session_id,
-            conversation_id=secrets.token_urlsafe(24),
+            conversation_id=secrets.token_hex(24),
             expires_at=current.expires_at,
         )
         with self._lock:

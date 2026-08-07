@@ -11,6 +11,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from paper_research_agent.agent.coverage import validate_evidence_assessment
 from paper_research_agent.agent.langchain_tools import build_langchain_tools
 from paper_research_agent.agent.models import (
     TERMINATION_REASONS,
@@ -36,7 +37,13 @@ if TYPE_CHECKING:
 
 
 class ResearchPlanner(Protocol):
-    async def plan(self, question: str, *, max_steps: int) -> ResearchPlan: ...
+    async def plan(
+        self,
+        question: str,
+        *,
+        max_steps: int,
+        planning_required: bool = False,
+    ) -> ResearchPlan: ...
 
 
 class ResearchReasoner(Protocol):
@@ -54,6 +61,7 @@ class ResearchGraphInput(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     question: str = Field(min_length=1, max_length=2000)
+    planning_required: bool = False
 
     @field_validator("question")
     @classmethod
@@ -67,6 +75,7 @@ class ResearchGraphInput(BaseModel):
 class ResearchGraphState(TypedDict, total=False):
     run_id: str
     question: str
+    planning_required: bool
     plan: dict[str, Any]
     current_step: int
     active_step: dict[str, Any] | None
@@ -110,13 +119,21 @@ def build_research_graph(
     evidence_tool = tools["get_evidence"]
 
     async def create_plan(state: ResearchGraphState) -> ResearchGraphState:
-        graph_input = ResearchGraphInput(question=state["question"])
-        plan = await planner.plan(graph_input.question, max_steps=initial_plan_steps)
+        graph_input = ResearchGraphInput(
+            question=state["question"],
+            planning_required=state.get("planning_required", False),
+        )
+        plan = await planner.plan(
+            graph_input.question,
+            max_steps=initial_plan_steps,
+            planning_required=graph_input.planning_required,
+        )
         if len(plan.steps) > initial_plan_steps:
             raise ValueError("research plan exceeds the graph step budget")
         return {
             "run_id": state.get("run_id", ""),
             "question": graph_input.question,
+            "planning_required": graph_input.planning_required,
             "plan": plan.model_dump(mode="json"),
             "current_step": 0,
             "active_step": None,
@@ -161,12 +178,34 @@ def build_research_graph(
 
         executed_queries = {_query_key(item.search.query) for item in observations}
         planned_next = plan.steps[current_step] if current_step < len(plan.steps) else None
+        if plan.task_type == "comparison" and planned_next is not None:
+            if _query_key(planned_next.query) in executed_queries:
+                return _finish_update("repeated_query")
+            return {
+                "active_step": planned_next.model_dump(mode="json"),
+                "next_action": "execute_tools",
+                "termination_reason": None,
+            }
         if latest.next_query is not None:
             if _query_key(latest.next_query) in executed_queries:
                 if planned_next is None or _query_key(planned_next.query) in executed_queries:
                     return _finish_update("repeated_query")
             else:
                 replan_count = state["replan_count"] + 1
+                target_ids: tuple[str, ...] = ()
+                dimension_ids: tuple[str, ...] = ()
+                if plan.task_type == "comparison":
+                    requirement_by_id = {
+                        item.requirement_id: item for item in plan.requirements
+                    }
+                    requested = [
+                        requirement_by_id[item]
+                        for item in latest.next_requirement_ids
+                    ]
+                    target_ids = tuple(dict.fromkeys(item.target_id for item in requested))
+                    dimension_ids = tuple(
+                        dict.fromkeys(item.dimension_id for item in requested)
+                    )
                 replacement = ResearchStep(
                     step_id=f"replan-{replan_count}",
                     objective=latest.next_objective or "Refine the evidence search",
@@ -176,13 +215,20 @@ def build_research_graph(
                         if planned_next is not None
                         else min(20, max(10, evidence_per_step))
                     ),
+                    target_ids=target_ids,
+                    dimension_ids=dimension_ids,
                 )
                 steps = list(plan.steps)
                 if current_step < len(steps):
                     steps[current_step] = replacement
                 else:
                     steps.append(replacement)
-                updated_plan = ResearchPlan(steps=tuple(steps))
+                updated_plan = ResearchPlan.model_validate(
+                    {
+                        **plan.model_dump(mode="json"),
+                        "steps": [item.model_dump(mode="json") for item in steps],
+                    }
+                )
                 action_history = _append_action(
                     state,
                     action="replan",
@@ -390,6 +436,7 @@ def build_research_graph(
                 ),
             ),
         )
+        assessment = validate_evidence_assessment(plan, observations, assessment)
         action_history = _append_action(
             state,
             action="assess_evidence",

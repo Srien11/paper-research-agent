@@ -6,10 +6,16 @@ from pydantic import ValidationError
 
 from paper_research_agent.agent.models import (
     EvidenceAssessment,
+    EvidenceCoverage,
     EvidenceRecord,
+    EvidenceRequirement,
     GetEvidenceInput,
     GetEvidenceResult,
     ResearchActionRecord,
+    ResearchDimension,
+    ResearchPlan,
+    ResearchStep,
+    ResearchTarget,
     SearchCorpusHit,
     SearchCorpusInput,
     SearchCorpusResult,
@@ -115,6 +121,113 @@ class ResearchToolModelTests(unittest.TestCase):
             next_objective="  cover the missing dimension  ",
         )
         self.assertEqual(retry.next_query, "missing comparison")
+
+    def test_comparison_plan_requires_complete_target_dimension_grid(self) -> None:
+        targets = (
+            ResearchTarget(target_id="ragas", label="RAGAS"),
+            ResearchTarget(target_id="ares", label="ARES"),
+        )
+        dimensions = (
+            ResearchDimension(dimension_id="method", label="评测方法"),
+            ResearchDimension(dimension_id="metrics", label="评测指标"),
+        )
+        requirements = tuple(
+            EvidenceRequirement(
+                requirement_id=f"{target.target_id}-{dimension.dimension_id}",
+                target_id=target.target_id,
+                dimension_id=dimension.dimension_id,
+                description=f"查明 {target.label} 的{dimension.label}",
+            )
+            for target in targets
+            for dimension in dimensions
+        )
+
+        plan = ResearchPlan(
+            task_type="comparison",
+            targets=targets,
+            dimensions=dimensions,
+            requirements=requirements,
+            steps=(
+                ResearchStep(
+                    step_id="ragas",
+                    objective="检索 RAGAS",
+                    query="RAGAS evaluation method metrics",
+                    target_ids=("ragas",),
+                    dimension_ids=("method", "metrics"),
+                ),
+                ResearchStep(
+                    step_id="ares",
+                    objective="检索 ARES",
+                    query="ARES evaluation method metrics",
+                    target_ids=("ares",),
+                    dimension_ids=("method", "metrics"),
+                ),
+            ),
+        )
+
+        self.assertEqual(len(plan.requirements), 4)
+        with self.assertRaisesRegex(ValidationError, "complete target-dimension grid"):
+            ResearchPlan(
+                task_type="comparison",
+                targets=targets,
+                dimensions=dimensions,
+                requirements=requirements[:-1],
+                steps=plan.steps,
+            )
+
+    def test_comparison_plan_rejects_unplanned_requirement_cells(self) -> None:
+        with self.assertRaisesRegex(ValidationError, "research steps do not cover"):
+            ResearchPlan(
+                task_type="comparison",
+                targets=(
+                    ResearchTarget(target_id="a", label="A"),
+                    ResearchTarget(target_id="b", label="B"),
+                ),
+                dimensions=(ResearchDimension(dimension_id="method", label="方法"),),
+                requirements=(
+                    EvidenceRequirement(
+                        requirement_id="a-method",
+                        target_id="a",
+                        dimension_id="method",
+                        description="A 的方法",
+                    ),
+                    EvidenceRequirement(
+                        requirement_id="b-method",
+                        target_id="b",
+                        dimension_id="method",
+                        description="B 的方法",
+                    ),
+                ),
+                steps=(
+                    ResearchStep(
+                        step_id="a",
+                        objective="检索 A",
+                        query="A method",
+                        target_ids=("a",),
+                        dimension_ids=("method",),
+                    ),
+                ),
+            )
+
+    def test_evidence_coverage_binds_covered_cells_to_chunks(self) -> None:
+        covered = EvidenceCoverage(
+            requirement_id="a-method",
+            covered=True,
+            chunk_ids=("chunk-1",),
+        )
+        missing = EvidenceCoverage(requirement_id="b-method", covered=False)
+        assessment = EvidenceAssessment(
+            evidence_sufficient=False,
+            status="missing_coverage",
+            coverage=(covered, missing),
+            next_query="B method",
+            next_objective="补齐 B 的方法",
+            next_requirement_ids=("b-method",),
+        )
+
+        self.assertEqual(assessment.next_requirement_ids, ("b-method",))
+        with self.assertRaisesRegex(ValidationError, "covered evidence requires chunk IDs"):
+            EvidenceCoverage(requirement_id="a-method", covered=True)
 
     def test_action_record_enforces_fields_for_each_action(self) -> None:
         search = ResearchActionRecord(

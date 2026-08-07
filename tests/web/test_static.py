@@ -67,6 +67,15 @@ class StaticWebContractTests(unittest.TestCase):
             "insufficient_evidence",
             "degraded_reason",
             "resolved_question",
+            "standalone_question",
+            "selected_history_turn_ids",
+            "selected_history_relevances",
+            "inherited_across_route",
+            "capability_plan",
+            'event.type === "tool_result"',
+            "recent_context_turn_count",
+            "recalled_candidate_count",
+            "interpretation_source",
             "included_memory_turn_count",
             "omitted_evidence_count",
             "is-loading",
@@ -119,6 +128,17 @@ class StaticWebContractTests(unittest.TestCase):
         self.assertNotRegex(
             self.javascript,
             r"sessionStorage\.setItem\([^\n]+(?:citation|evidence|payload)",
+        )
+
+    def test_hybrid_answer_citation_markers_open_evidence_dialog(self) -> None:
+        self.assertIn("function renderTextWithCitations", self.javascript)
+        self.assertIn(
+            'button.addEventListener("click", () => openEvidence(citationId))',
+            self.javascript,
+        )
+        self.assertIn(
+            "copy.replaceChildren(renderTextWithCitations(finalText))",
+            self.javascript,
         )
 
     def test_styles_cover_focus_reduced_motion_and_mobile_layout(self) -> None:

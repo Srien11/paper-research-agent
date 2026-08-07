@@ -306,7 +306,9 @@ async function streamConversation(question, sourceNote = "") {
   let rawText = "";
   let metrics = null;
   let route = "normal_chat";
+  let capabilities = {};
   let ragHandled = false;
+  let citationContextActive = false;
   let lastPaint = 0;
   while (true) {
     const { value, done } = await reader.read();
@@ -318,13 +320,28 @@ async function streamConversation(question, sourceNote = "") {
       const event = JSON.parse(line);
       if (event.type === "route") {
         route = event.route;
+        capabilities = event.capabilities && typeof event.capabilities === "object" ? event.capabilities : {};
         meta.querySelector("strong").textContent = event.label || "研究助手";
         meta.querySelector(".assistant-mark").textContent = route.startsWith("attachment") || route === "file_edit" ? "文" : "研";
         copy.textContent = route === "file_edit" ? "正在修改文件，完成后可下载新文件…" : "";
         if (event.reason) meta.append(createElement("small", "source-note", event.reason));
+      } else if (event.type === "rag_context" && event.payload) {
+        const normalized = normalizePayload(event.payload);
+        citationContextActive = true;
+        state.citations.clear();
+        normalized.citations.forEach((citation) => {
+          if (citation && citation.citation_id) state.citations.set(citation.citation_id, citation);
+        });
+        renderInspector(normalized);
+        const note = normalized.status === "answered" ? "已参考本地论文库" : "本地论文未命中，继续综合回答";
+        meta.append(createElement("small", "source-note source-note-rag", note));
       } else if (event.type === "rag_result" && event.payload) {
         article.remove();
-        renderAnswer(event.payload, true);
+        const retrieval = event.payload.retrieval && typeof event.payload.retrieval === "object" ? event.payload.retrieval : {};
+        renderAnswer({ ...event.payload, retrieval: { ...retrieval, capability_plan: capabilities } }, true);
+        ragHandled = true;
+      } else if (event.type === "tool_result" && event.payload) {
+        renderToolResearch(event.payload, true);
         ragHandled = true;
       } else if (event.type === "approval_required" && event.payload) {
         article.remove();
@@ -352,7 +369,13 @@ async function streamConversation(question, sourceNote = "") {
   if (ragHandled) return;
   const editMode = route === "file_edit";
   const finalText = (editMode ? rawText : naturalText(rawText)).trim();
-  copy.textContent = editMode ? "文件修改完成，可以下载新文件。" : finalText;
+  if (editMode) {
+    copy.textContent = "文件修改完成，可以下载新文件。";
+  } else if (citationContextActive) {
+    copy.replaceChildren(renderTextWithCitations(finalText));
+  } else {
+    copy.textContent = finalText;
+  }
   if (editMode && activeFiles.length) {
     article.append(createDownloadButton(finalText, activeFiles[0].filename));
   }
@@ -438,6 +461,31 @@ function naturalText(value) {
     .replace(/`([^`]+)`/g, "$1")
     .replace(/^\s*[-*+]\s+/gm, "")
     .replace(/\n{3,}/g, "\n\n");
+}
+
+function renderTextWithCitations(value) {
+  const fragment = document.createDocumentFragment();
+  const text = String(value || "");
+  const pattern = /\[E[1-9]\d*\]/g;
+  let cursor = 0;
+  for (const match of text.matchAll(pattern)) {
+    const index = match.index ?? 0;
+    if (index > cursor) fragment.append(document.createTextNode(text.slice(cursor, index)));
+    const marker = match[0];
+    const citationId = marker.slice(1, -1);
+    if (state.citations.has(citationId)) {
+      const button = createElement("button", "citation-button inline-citation", marker);
+      button.type = "button";
+      button.setAttribute("aria-label", `查看引用 ${citationId}`);
+      button.addEventListener("click", () => openEvidence(citationId));
+      fragment.append(button);
+    } else {
+      fragment.append(document.createTextNode(marker));
+    }
+    cursor = index + marker.length;
+  }
+  if (cursor < text.length) fragment.append(document.createTextNode(text.slice(cursor)));
+  return fragment;
 }
 
 function renderStreamMetrics(metrics) {
@@ -709,7 +757,24 @@ function renderInspector(normalized) {
   const generation = normalized.generation || {};
   appendMetric(elements.routeMetrics, "原始问题", trace.original_question || "—");
   appendMetric(elements.routeMetrics, "解析后问题", trace.resolved_question || trace.original_question || "—");
+  appendMetric(elements.routeMetrics, "独立问题", trace.standalone_question || trace.resolved_question || "—");
+  appendMetric(elements.routeMetrics, "中文检索式", trace.chinese_query || trace.resolved_question || "—");
   appendMetric(elements.routeMetrics, "英文检索式", trace.english_query || "未生成");
+  appendMetric(elements.routeMetrics, "会话记忆命中", trace.conversation_memory_hit_count ?? 0);
+  appendMetric(elements.routeMetrics, "最近窗口轮次", trace.recent_context_turn_count ?? 0);
+  appendMetric(elements.routeMetrics, "远距候选轮次", trace.recalled_candidate_count ?? 0);
+  appendMetric(elements.routeMetrics, "语义解释来源", trace.interpretation_source || "未提供");
+  appendMetric(elements.routeMetrics, "采用历史问题", Array.isArray(trace.selected_history_questions) && trace.selected_history_questions.length ? trace.selected_history_questions.join("；") : "未采用");
+  appendMetric(elements.routeMetrics, "历史 Turn ID", Array.isArray(trace.selected_history_turn_ids) && trace.selected_history_turn_ids.length ? trace.selected_history_turn_ids.join("，") : "未采用");
+  appendMetric(elements.routeMetrics, "历史相关度", Array.isArray(trace.selected_history_relevances) && trace.selected_history_relevances.length ? trace.selected_history_relevances.map((value) => Number(value).toFixed(2)).join("，") : "未采用");
+  appendMetric(elements.routeMetrics, "跨路由继承", trace.inherited_across_route ? "是" : "否");
+  appendMetric(elements.routeMetrics, "改写置信度", Number.isFinite(Number(trace.rewrite_confidence)) ? Number(trace.rewrite_confidence).toFixed(2) : "—");
+  appendMetric(elements.routeMetrics, "需要澄清", trace.needs_clarification ? "是" : "否");
+  const capabilities = trace.capability_plan || {};
+  appendMetric(elements.routeMetrics, "本地论文能力", capabilities.local_papers ? "已执行" : "未执行");
+  appendMetric(elements.routeMetrics, "网页研究能力", capabilities.web_research ? "已执行" : "未执行");
+  appendMetric(elements.routeMetrics, "动态工具能力", capabilities.dynamic_tools ? "已执行" : "未执行");
+  appendMetric(elements.routeMetrics, "附件能力", capabilities.attachments ? "已执行" : "未执行");
   appendMetric(elements.routeMetrics, "查询改写", trace.rewrite_status || trace.rewrite?.status || "未提供");
   appendMetric(elements.routeMetrics, "检索模式", trace.degraded ? "中文降级" : "中英双路");
   appendMetric(elements.routeMetrics, "索引版本", trace.index_id || "本地冻结索引");
@@ -789,7 +854,7 @@ function openEvidence(citationId) {
     preview.setAttribute("aria-label", "服务端提供的安全证据预览");
     elements.evidenceContent.append(preview);
   }
-  elements.evidenceDialog.showModal();
+  if (!elements.evidenceDialog.open) elements.evidenceDialog.showModal();
 }
 
 function appendDetail(list, label, value) {

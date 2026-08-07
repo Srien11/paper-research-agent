@@ -127,6 +127,7 @@ class ContextRequest(FrozenContract):
 
     system_rules: str = Field(min_length=1)
     user_question: str = Field(min_length=1)
+    standalone_question: str | None = None
     evidence: tuple[ContextEvidence, ...]
     task_state: str | None = None
     allow_partial_answer: bool = False
@@ -137,10 +138,10 @@ class ContextRequest(FrozenContract):
     token_budget: int = Field(gt=0)
     output_reserve_tokens: int = Field(default=0, ge=0)
 
-    @field_validator("system_rules", "user_question")
+    @field_validator("system_rules", "user_question", "standalone_question")
     @classmethod
-    def reject_blank_required_text(cls, value: str) -> str:
-        if not value.strip():
+    def reject_blank_required_text(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
             raise ValueError("required context text must not be blank")
         return value
 

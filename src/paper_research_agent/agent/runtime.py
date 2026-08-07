@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from paper_research_agent.agent.coverage import validate_evidence_assessment
 from paper_research_agent.agent.models import (
     TERMINATION_REASONS,
     EvidenceAssessment,
@@ -200,7 +201,13 @@ class ResearchAgentRuntime:
         )
         return ToolExecutionResult.model_validate(result)
 
-    async def run(self, question: str, *, thread_id: str) -> ResearchRuntimeResult:
+    async def run(
+        self,
+        question: str,
+        *,
+        thread_id: str,
+        planning_required: bool = False,
+    ) -> ResearchRuntimeResult:
         normalized_question = question.strip()
         normalized_thread = thread_id.strip()
         if not normalized_question:
@@ -239,7 +246,11 @@ class ResearchAgentRuntime:
         try:
             async with asyncio.timeout(self._policy.timeout_seconds):
                 raw_state = await self._graph.ainvoke(
-                    {"question": normalized_question, "run_id": run_id},
+                    {
+                        "question": normalized_question,
+                        "run_id": run_id,
+                        "planning_required": planning_required,
+                    },
                     config=config,
                 )
         except TimeoutError:
@@ -356,6 +367,8 @@ class ResearchAgentRuntime:
         assessments = tuple(EvidenceAssessment.model_validate(value) for value in raw_assessments)
         if len(assessments) != len(observations):
             raise ValueError("research assessments do not match observations")
+        for index, assessment in enumerate(assessments, start=1):
+            validate_evidence_assessment(plan, observations[:index], assessment)
 
         raw_actions = state.get("action_history")
         if not isinstance(raw_actions, list):
@@ -569,7 +582,7 @@ def _task_state(
 ) -> str:
     payload: dict[str, Any] = {
         "kind": "untrusted_research_task_state",
-        "plan": [step.model_dump(mode="json") for step in plan.steps],
+        "plan": plan.model_dump(mode="json"),
         "observations": [
             {
                 "degraded": item.search.degraded,
@@ -586,8 +599,10 @@ def _task_state(
         "assessments": [
             {
                 "evidence_sufficient": item.evidence_sufficient,
+                "coverage": [entry.model_dump(mode="json") for entry in item.coverage],
                 "next_objective": item.next_objective,
                 "next_query": item.next_query,
+                "next_requirement_ids": list(item.next_requirement_ids),
                 "status": item.status,
             }
             for item in assessments

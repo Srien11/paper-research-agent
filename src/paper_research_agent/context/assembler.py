@@ -36,6 +36,14 @@ CONTEXT TRUST POLICY:
 - Write every claim and insufficient-evidence response in Simplified Chinese.
 - Do not invent citation IDs or citation metadata."""
 
+COMPARISON_SYNTHESIS_POLICY = """\
+COMPARISON SYNTHESIS POLICY:
+- If task state declares plan.task_type as comparison, follow its target-by-dimension grid.
+- Organize claims by comparison dimension and identify the target covered by each claim.
+- Cite the evidence for each target separately; evidence for one target cannot support another.
+- Do not infer an uncovered cell, and explicitly omit or qualify dimensions without coverage.
+- Do not claim an overall winner unless evidence supports the same decision criteria."""
+
 
 def _canonical_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -49,16 +57,37 @@ PARTIAL COVERAGE POLICY:
 - Do not return "insufficient_evidence" solely because the full question is not covered."""
 
 
-def _system_message(system_rules: str, *, allow_partial_answer: bool) -> PromptMessage:
+def _system_message(
+    system_rules: str,
+    *,
+    allow_partial_answer: bool,
+    comparison_mode: bool,
+) -> PromptMessage:
     content = f"{system_rules.rstrip()}\n\n{CONTEXT_POLICY}"
+    if comparison_mode:
+        content = f"{content}\n\n{COMPARISON_SYNTHESIS_POLICY}"
     if allow_partial_answer:
         content = f"{content}\n\n{PARTIAL_ANSWER_POLICY}"
     return PromptMessage(role="system", content=content)
 
 
+def _is_comparison_task(task_state: str | None) -> bool:
+    if task_state is None:
+        return False
+    try:
+        payload = json.loads(task_state)
+    except (TypeError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    plan = payload.get("plan")
+    return isinstance(plan, dict) and plan.get("task_type") == "comparison"
+
+
 def _request_message(request: ContextRequest) -> PromptMessage:
     payload = {
         "kind": "untrusted_task_input",
+        "standalone_question": request.standalone_question or request.user_question,
         "task_state": request.task_state,
         "user_question": request.user_question,
     }
@@ -161,6 +190,7 @@ def assemble_context(
         _system_message(
             request.system_rules,
             allow_partial_answer=request.allow_partial_answer,
+            comparison_mode=_is_comparison_task(request.task_state),
         ),
         *request.conversation_history,
         _request_message(request),

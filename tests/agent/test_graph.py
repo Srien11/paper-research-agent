@@ -8,11 +8,15 @@ from langgraph.checkpoint.memory import InMemorySaver
 from paper_research_agent.agent.graph import build_research_graph
 from paper_research_agent.agent.models import (
     EvidenceAssessment,
+    EvidenceCoverage,
     EvidenceRecord,
+    EvidenceRequirement,
     GetEvidenceResult,
+    ResearchDimension,
     ResearchObservation,
     ResearchPlan,
     ResearchStep,
+    ResearchTarget,
     SearchCorpusHit,
     SearchCorpusResult,
 )
@@ -68,10 +72,16 @@ def _assessment(
 class FakePlanner:
     def __init__(self, plan: ResearchPlan):
         self.plan_value = plan
-        self.calls: list[tuple[str, int]] = []
+        self.calls: list[tuple[str, int, bool]] = []
 
-    async def plan(self, question: str, *, max_steps: int) -> ResearchPlan:
-        self.calls.append((question, max_steps))
+    async def plan(
+        self,
+        question: str,
+        *,
+        max_steps: int,
+        planning_required: bool = False,
+    ) -> ResearchPlan:
+        self.calls.append((question, max_steps, planning_required))
         return self.plan_value
 
 
@@ -102,6 +112,111 @@ class EventRecorder:
 
 
 class ResearchGraphTests(unittest.IsolatedAsyncioTestCase):
+    async def test_comparison_executes_each_planned_target_before_dynamic_replan(self) -> None:
+        planner = FakePlanner(
+            ResearchPlan(
+                task_type="comparison",
+                targets=(
+                    ResearchTarget(target_id="a", label="Paper A"),
+                    ResearchTarget(target_id="b", label="Paper B"),
+                ),
+                dimensions=(ResearchDimension(dimension_id="method", label="Method"),),
+                requirements=(
+                    EvidenceRequirement(
+                        requirement_id="a-method",
+                        target_id="a",
+                        dimension_id="method",
+                        description="Paper A method",
+                    ),
+                    EvidenceRequirement(
+                        requirement_id="b-method",
+                        target_id="b",
+                        dimension_id="method",
+                        description="Paper B method",
+                    ),
+                ),
+                steps=(
+                    ResearchStep(
+                        step_id="a",
+                        objective="Find A",
+                        query="Paper A method",
+                        top_k=1,
+                        target_ids=("a",),
+                        dimension_ids=("method",),
+                    ),
+                    ResearchStep(
+                        step_id="b",
+                        objective="Find B",
+                        query="Paper B method",
+                        top_k=1,
+                        target_ids=("b",),
+                        dimension_ids=("method",),
+                    ),
+                ),
+            )
+        )
+        reasoner = FakeReasoner(
+            EvidenceAssessment(
+                evidence_sufficient=False,
+                status="missing_coverage",
+                coverage=(
+                    EvidenceCoverage(
+                        requirement_id="a-method", covered=True, chunk_ids=("chunk-1",)
+                    ),
+                    EvidenceCoverage(requirement_id="b-method", covered=False),
+                ),
+                next_query="Paper B refined method",
+                next_objective="Refine Paper B method",
+                next_requirement_ids=("b-method",),
+            ),
+            EvidenceAssessment(
+                evidence_sufficient=True,
+                status="sufficient",
+                coverage=(
+                    EvidenceCoverage(
+                        requirement_id="a-method", covered=True, chunk_ids=("chunk-1",)
+                    ),
+                    EvidenceCoverage(
+                        requirement_id="b-method", covered=True, chunk_ids=("chunk-2",)
+                    ),
+                ),
+            ),
+        )
+        service = AsyncMock()
+        service.search_corpus.side_effect = (
+            SearchCorpusResult(
+                query="Paper A method",
+                index_id="idx-test",
+                degraded=False,
+                hits=(_hit("chunk-1", "C001", 1),),
+            ),
+            SearchCorpusResult(
+                query="Paper B method",
+                index_id="idx-test",
+                degraded=False,
+                hits=(_hit("chunk-2", "T001", 1),),
+            ),
+        )
+        service.get_evidence.side_effect = (
+            GetEvidenceResult(records=(_record("chunk-1", "C001"),)),
+            GetEvidenceResult(records=(_record("chunk-2", "T001"),)),
+        )
+        graph = build_research_graph(
+            planner=planner,
+            reasoner=reasoner,
+            service=service,
+            policy=ResearchRuntimePolicy(max_steps=2, max_tool_calls=4),
+        )
+
+        state = await graph.ainvoke({"question": "Compare Paper A and Paper B"})
+
+        self.assertEqual(
+            [item["search"]["query"] for item in state["observations"]],
+            ["Paper A method", "Paper B method"],
+        )
+        self.assertEqual(state["replan_count"], 0)
+        self.assertTrue(state["evidence_sufficient"])
+
     async def test_stops_early_when_first_observation_is_sufficient(self) -> None:
         planner = FakePlanner(
             ResearchPlan(
@@ -142,7 +257,7 @@ class ResearchGraphTests(unittest.IsolatedAsyncioTestCase):
 
         state = await graph.ainvoke({"question": "Compare RAG evaluation methods"})
 
-        self.assertEqual(planner.calls, [("Compare RAG evaluation methods", 4)])
+        self.assertEqual(planner.calls, [("Compare RAG evaluation methods", 4, False)])
         self.assertEqual(state["current_step"], 1)
         self.assertEqual(state["tool_call_count"], 2)
         self.assertTrue(state["evidence_sufficient"])

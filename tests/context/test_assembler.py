@@ -37,6 +37,22 @@ def evidence(chunk_id: str, text: str, rank: int) -> ContextEvidence:
 
 
 class ContextAssemblerTests(unittest.TestCase):
+    def test_comparison_task_state_has_a_trusted_synthesis_policy(self) -> None:
+        context = assemble_context(
+            ContextRequest(
+                system_rules="Use citations.",
+                user_question="Compare Paper A and Paper B",
+                task_state='{"plan":{"task_type":"comparison"}}',
+                evidence=(evidence("c1", "supported subset", 1),),
+                token_budget=2000,
+            )
+        )
+
+        system = context.messages[0].content
+        self.assertIn("COMPARISON SYNTHESIS POLICY", system)
+        self.assertIn("target-by-dimension", system)
+        self.assertIn("Do not infer an uncovered cell", system)
+
     def test_partial_answer_policy_is_a_trusted_opt_in(self) -> None:
         default_context = assemble_context(
             ContextRequest(

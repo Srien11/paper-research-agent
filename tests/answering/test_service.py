@@ -49,15 +49,16 @@ class FakeGenerator:
     model_id = "qwen3.7-plus-2026-05-26"
     prompt_version = "rag-answer-json-v1"
 
-    def __init__(self, content: str):
-        self.content = content
+    def __init__(self, content: str | tuple[str, ...]):
+        self.contents = (content,) if isinstance(content, str) else content
         self.calls = 0
 
     async def generate(self, answer_request: AnswerRequest) -> GenerationResult:
         del answer_request
         self.calls += 1
+        content = self.contents[min(self.calls - 1, len(self.contents) - 1)]
         return GenerationResult(
-            content=self.content,
+            content=content,
             requested_model=self.model_id,
             actual_model=self.model_id,
             prompt_version=self.prompt_version,
@@ -115,6 +116,21 @@ class AnswerServiceTests(unittest.IsolatedAsyncioTestCase):
         result = await answer_context(request(), generator, audit=FakeAudit(fail=True))
         self.assertEqual(result.status, "answered")
         self.assertFalse(result.audit_persisted)
+
+    async def test_retries_unknown_citation_and_accumulates_usage(self) -> None:
+        generator = FakeGenerator(
+            (
+                '{"status":"answered","claims":[{"text":"结论。","citation_ids":["E2"]}],"insufficient_reason":null}',
+                '{"status":"answered","claims":[{"text":"结论。","citation_ids":["E1"]}],"insufficient_reason":null}',
+            )
+        )
+
+        result = await answer_context(request(), generator)
+
+        self.assertEqual(generator.calls, 2)
+        self.assertEqual(result.input_tokens, 180)
+        self.assertEqual(result.output_tokens, 40)
+        self.assertEqual(result.attempts, 2)
 
 
 if __name__ == "__main__":
