@@ -174,3 +174,35 @@ async def create_research_agent_runtime(
                 await close_client()
         await connection.close()
         raise
+
+
+async def create_main_agent_runtime(
+    *,
+    store,
+    hydrator,
+    interpreter,
+    goal_reconciler,
+    task_planner,
+    dispatcher,
+    timeout_seconds: float = 180,
+    checkpointer=None,
+    approval_resumer=None,
+    close=None,
+    clear=None,
+):
+    """Assemble the cross-turn main Agent runtime from ready components."""
+    from paper_research_agent.agent.orchestrator.factory import build_main_agent_runtime
+
+    return build_main_agent_runtime(
+        store=store,
+        hydrator=hydrator,
+        interpreter=interpreter,
+        goal_reconciler=goal_reconciler,
+        task_planner=task_planner,
+        dispatcher=dispatcher,
+        timeout_seconds=timeout_seconds,
+        checkpointer=checkpointer,
+        approval_resumer=approval_resumer,
+        close=close,
+        clear=clear,
+    )

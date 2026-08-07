@@ -1,0 +1,67 @@
+"""Assembly helpers for the main Agent graph and runtime."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from paper_research_agent.agent.orchestrator.children import ChildGraphDispatcher
+from paper_research_agent.agent.orchestrator.evaluator import (
+    MAX_CHILD_CALLS_PER_RUN,
+    MAX_REPLANS_PER_RUN,
+)
+from paper_research_agent.agent.orchestrator.graph import build_main_agent_graph
+from paper_research_agent.agent.orchestrator.hydrator import ContextHydrator
+from paper_research_agent.agent.orchestrator.interpreter import TurnInterpreter
+from paper_research_agent.agent.orchestrator.models import MainAgentResult
+from paper_research_agent.agent.orchestrator.planner import GoalReconciler, TaskPlanner
+from paper_research_agent.agent.orchestrator.runtime import (
+    ApprovalResumer,
+    Closer,
+    ConversationClearer,
+    MainAgentRuntime,
+)
+from paper_research_agent.conversation.store import ConversationStore
+
+
+def build_main_agent_runtime(
+    *,
+    store: ConversationStore,
+    hydrator: ContextHydrator,
+    interpreter: TurnInterpreter,
+    goal_reconciler: GoalReconciler,
+    task_planner: TaskPlanner,
+    dispatcher: ChildGraphDispatcher,
+    timeout_seconds: float = 180,
+    max_child_calls: int = MAX_CHILD_CALLS_PER_RUN,
+    max_replans: int = MAX_REPLANS_PER_RUN,
+    checkpointer: Any | None = None,
+    approval_resumer: ApprovalResumer | None = None,
+    close: Closer | None = None,
+    clear: ConversationClearer | None = None,
+) -> MainAgentRuntime:
+    """Assemble one closable main Agent runtime with a strict Pydantic graph."""
+    graph = build_main_agent_graph(
+        repository=store,
+        hydrator=hydrator,
+        interpreter=interpreter,
+        goal_reconciler=goal_reconciler,
+        task_planner=task_planner,
+        dispatcher=dispatcher,
+        max_child_calls=max_child_calls,
+        max_replans=max_replans,
+        checkpointer=checkpointer,
+    )
+    return MainAgentRuntime(
+        graph=graph,
+        repository=store,
+        approval_resumer=approval_resumer,
+        timeout_seconds=timeout_seconds,
+        close=close,
+        clear=clear,
+    )
+
+
+async def noop_approval_resumer(request_id: str, approved: bool) -> MainAgentResult:
+    """Deterministic placeholder; production wiring supplies real resume."""
+    del request_id, approved
+    raise RuntimeError("approval resume is not configured")
