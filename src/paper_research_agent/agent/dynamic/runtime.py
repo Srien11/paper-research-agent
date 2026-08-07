@@ -42,7 +42,14 @@ class DynamicResearchRuntime:
         self._max_steps = max_steps
         self._timeout_seconds = timeout_seconds
 
-    async def run(self, question: str, *, thread_id: str) -> DynamicResearchResult:
+    async def run(
+        self,
+        question: str,
+        *,
+        thread_id: str,
+        memory_context: tuple[dict[str, object], ...] | None = None,
+        child_context: dict[str, object] | None = None,
+    ) -> DynamicResearchResult:
         normalized_question = _question(question)
         normalized_thread = _thread(thread_id)
         run_id = uuid.uuid4().hex
@@ -55,7 +62,11 @@ class DynamicResearchRuntime:
             "pending_approval": None,
             "final_summary": None,
             "termination_reason": None,
-            "memory_context": [],
+            "memory_context": (
+                list(memory_context) if memory_context is not None else []
+            ),
+            "memory_supplied": memory_context is not None,
+            "child_context": dict(child_context) if child_context else {},
             "memory_proposal_completed": False,
             "resume_after_execute": None,
             "next_action": "route",

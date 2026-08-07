@@ -27,7 +27,8 @@ class DynamicToolsChildExecutor(Protocol):
         question: str,
         *,
         thread_id: str,
-        request: ChildTaskRequest,
+        memory_context: tuple[dict[str, object], ...] = (),
+        child_context: dict[str, object] | None = None,
     ) -> DynamicResearchResult: ...
 
     async def resume(
@@ -35,7 +36,6 @@ class DynamicToolsChildExecutor(Protocol):
         *,
         thread_id: str,
         approved: bool,
-        request: ChildTaskRequest,
     ) -> DynamicResearchResult: ...
 
 
@@ -83,9 +83,33 @@ class ChildGraphDispatcher:
         result = await self.dynamic_tools.run(
             question,
             thread_id=_child_thread_id("dynamic", request),
-            request=request,
+            memory_context=_memory_context_from_request(request),
+            child_context=_child_context_from_request(request),
         )
         return _dynamic_result(request, result)
+
+
+def _memory_context_from_request(request: ChildTaskRequest) -> tuple[dict[str, object], ...]:
+    return tuple(
+        {
+            "memory_id": item.source_id,
+            "content": item.content,
+            "kind": "long_term_memory",
+            "trust": "research_context",
+        }
+        for item in request.selected_context
+        if item.kind == "long_term_memory"
+    )
+
+
+def _child_context_from_request(request: ChildTaskRequest) -> dict[str, object]:
+    return {
+        "goal_id": request.goal_id,
+        "task_id": request.task_id,
+        "objective": request.objective,
+        "success_criteria": list(request.success_criteria),
+        "constraints": list(request.constraints),
+    }
 
 
 def _local_summary(result: ResearchRuntimeResult) -> str:

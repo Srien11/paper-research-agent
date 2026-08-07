@@ -8,8 +8,12 @@ from paper_research_agent.agent.dynamic.models import (
     DynamicResearchResult,
     PendingApproval,
 )
+from paper_research_agent.agent.dynamic.runtime import DynamicResearchRuntime
 from paper_research_agent.agent.orchestrator.children import ChildGraphDispatcher
-from paper_research_agent.agent.orchestrator.models import ChildTaskRequest
+from paper_research_agent.agent.orchestrator.models import (
+    ChildTaskRequest,
+    RecalledContext,
+)
 
 
 def _request(**overrides: object) -> ChildTaskRequest:
@@ -58,17 +62,42 @@ class _FakeLocalExecutor:
 class _FakeDynamicExecutor:
     def __init__(self, result: DynamicResearchResult) -> None:
         self.result = result
-        self.calls: list[tuple[str, str, ChildTaskRequest]] = []
+        self.calls: list[
+            tuple[
+                str,
+                str,
+                tuple[dict[str, object], ...],
+                dict[str, object] | None,
+            ]
+        ] = []
 
     async def run(
         self,
         question: str,
         *,
         thread_id: str,
-        request: ChildTaskRequest,
+        memory_context: tuple[dict[str, object], ...] = (),
+        child_context: dict[str, object] | None = None,
     ) -> DynamicResearchResult:
-        self.calls.append((question, thread_id, request))
+        self.calls.append((question, thread_id, memory_context, child_context))
         return self.result
+
+
+class _FakeGraph:
+    def __init__(self) -> None:
+        self.inputs: list[dict[str, object]] = []
+
+    async def ainvoke(self, value: dict[str, object], config: object = None, **kwargs: object) -> object:
+        del config, kwargs
+        self.inputs.append(value)
+        return {
+            "run_id": "a" * 32,
+            "observations": [],
+            "pending_approval": None,
+            "final_summary": "已完成核验",
+            "termination_reason": "router_finished",
+            "next_action": "finish",
+        }
 
 
 def _pending() -> PendingApproval:
@@ -114,12 +143,77 @@ class ChildGraphDispatcherTests(unittest.TestCase):
         dispatcher = ChildGraphDispatcher(dynamic_tools=fake)
         request = _request(capability="dynamic_tools", task_id="task-2")
         child = asyncio.run(dispatcher.dispatch(request))
-        self.assertEqual(fake.calls[0][2].goal_id, "a" * 32)
-        self.assertEqual(fake.calls[0][2].constraints, ("只依据本地论文",))
-        self.assertEqual(fake.calls[0][2].success_criteria, ("找到至少两篇论文证据",))
+        child_context = fake.calls[0][3]
+        self.assertIsNotNone(child_context)
+        self.assertEqual(child_context["goal_id"], "a" * 32)
+        self.assertEqual(child_context["constraints"], ["只依据本地论文"])
+        self.assertEqual(child_context["success_criteria"], ["找到至少两篇论文证据"])
         self.assertIn("dynamic::", fake.calls[0][1])
         self.assertEqual(child.status, "completed")
         self.assertEqual(child.citation_kind, "external")
+
+    def test_dynamic_memory_context_projected_from_selected_context(self) -> None:
+        request = _request(
+            capability="dynamic_tools",
+            task_id="task-m",
+            selected_context=(
+                RecalledContext(
+                    source_id="m" * 32,
+                    kind="long_term_memory",
+                    content="用户偏好用中文回答",
+                    relevance=0.6,
+                    trust="research_context",
+                ),
+            ),
+        )
+        fake = _FakeDynamicExecutor(
+            DynamicResearchResult(
+                run_id="a" * 32,
+                thread_id="t",
+                status="completed",
+                final_summary="完成",
+            )
+        )
+        dispatcher = ChildGraphDispatcher(dynamic_tools=fake)
+        asyncio.run(dispatcher.dispatch(request))
+        self.assertEqual(fake.calls[0][2][0]["memory_id"], "m" * 32)
+        self.assertEqual(fake.calls[0][2][0]["content"], "用户偏好用中文回答")
+
+    def test_dynamic_without_memory_falls_back_to_internal_recall(self) -> None:
+        fake = _FakeDynamicExecutor(
+            DynamicResearchResult(
+                run_id="a" * 32,
+                thread_id="t",
+                status="completed",
+                final_summary="完成",
+            )
+        )
+        dispatcher = ChildGraphDispatcher(dynamic_tools=fake)
+        asyncio.run(dispatcher.dispatch(_request(capability="dynamic_tools", task_id="task-x")))
+        self.assertEqual(fake.calls[0][2], ())
+
+    def test_runtime_passes_memory_supplied_flag_when_provided(self) -> None:
+        graph = _FakeGraph()
+        runtime = DynamicResearchRuntime(graph=graph, max_steps=2)
+        result = asyncio.run(
+            runtime.run(
+                "核验最新维护状态",
+                thread_id="thread-1",
+                memory_context=({"memory_id": "m1", "content": "偏好"},),
+                child_context={"goal_id": "a" * 32},
+            )
+        )
+        self.assertTrue(graph.inputs[0]["memory_supplied"])
+        self.assertEqual(graph.inputs[0]["memory_context"], [{"memory_id": "m1", "content": "偏好"}])
+        self.assertEqual(graph.inputs[0]["child_context"], {"goal_id": "a" * 32})
+        self.assertEqual(result.status, "completed")
+
+    def test_runtime_without_memory_falls_back_to_internal_recall(self) -> None:
+        graph = _FakeGraph()
+        runtime = DynamicResearchRuntime(graph=graph, max_steps=2)
+        asyncio.run(runtime.run("核验最新维护状态", thread_id="thread-1"))
+        self.assertFalse(graph.inputs[0]["memory_supplied"])
+        self.assertEqual(graph.inputs[0]["memory_context"], [])
 
     def test_dynamic_approval_is_projected_as_waiting(self) -> None:
         result = DynamicResearchResult(

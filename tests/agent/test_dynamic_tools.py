@@ -27,8 +27,9 @@ class SequenceRouter:
         memory_context: tuple[dict[str, object], ...],
         *,
         remaining_steps: int,
+        child_context: dict[str, object] | None = None,
     ) -> ToolDecision:
-        del question, observations, memory_context, remaining_steps
+        del question, observations, memory_context, remaining_steps, child_context
         return self.decisions.popleft()
 
 
@@ -181,6 +182,52 @@ class DynamicToolGraphTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.termination_reason, "router_finished")
         self.assertEqual(toolkit.calls, [])
         self.assertIn("没有调用敏感工具", result.final_summary or "")
+
+    async def test_supplied_memory_skips_internal_recall(self) -> None:
+        toolkit = FakeToolkit()
+        graph = build_dynamic_tool_graph(
+            router=SequenceRouter(
+                ToolDecision(
+                    action="finish",
+                    purpose="Return answer",
+                    final_summary="收到已上移的记忆。",
+                )
+            ),
+            toolkit=toolkit,  # type: ignore[arg-type]
+            max_steps=2,
+        )
+        runtime = DynamicResearchRuntime(graph=graph, max_steps=2)
+
+        result = await runtime.run(
+            "继续",
+            thread_id="memory-supplied",
+            memory_context=(
+                {"memory_id": "m" * 32, "content": "偏好", "kind": "preference"},
+            ),
+        )
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(toolkit.memory_recalls, [])
+
+    async def test_without_supplied_memory_keeps_internal_recall(self) -> None:
+        toolkit = FakeToolkit()
+        graph = build_dynamic_tool_graph(
+            router=SequenceRouter(
+                ToolDecision(
+                    action="finish",
+                    purpose="Return answer",
+                    final_summary="默认内部召回。",
+                )
+            ),
+            toolkit=toolkit,  # type: ignore[arg-type]
+            max_steps=2,
+        )
+        runtime = DynamicResearchRuntime(graph=graph, max_steps=2)
+
+        result = await runtime.run("继续", thread_id="memory-fallback")
+
+        self.assertEqual(result.status, "completed")
+        self.assertTrue(toolkit.memory_recalls)
 
     async def test_routes_tool_then_finishes_with_trust_label(self) -> None:
         toolkit = FakeToolkit()

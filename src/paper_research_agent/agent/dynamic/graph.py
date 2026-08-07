@@ -40,6 +40,8 @@ class DynamicToolState(TypedDict, total=False):
     termination_reason: str | None
     next_action: str
     memory_context: list[dict[str, Any]]
+    memory_supplied: bool
+    child_context: dict[str, Any]
     memory_proposal_completed: bool
     resume_after_execute: str | None
 
@@ -60,6 +62,8 @@ def build_dynamic_tool_graph(
         raise ValueError("dynamic memory scope is invalid")
 
     async def recall_memory(state: DynamicToolState) -> DynamicToolState:
+        if state.get("memory_supplied", False):
+            return {"next_action": "route"}
         question = _required_text(state, "question")
         action = "list" if has_explicit_memory_intent(question) else "search"
         arguments: dict[str, Any] = {
@@ -93,6 +97,7 @@ def build_dynamic_tool_graph(
             observations,
             _memory_context(state),
             remaining_steps=max_steps - len(observations),
+            child_context=state.get("child_context"),
         )
         if decision.action == "finish":
             return {
