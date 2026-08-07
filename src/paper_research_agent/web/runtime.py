@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from paper_research_agent.agent.intent import requires_research_planning
 from paper_research_agent.answering.audit import SQLiteAnswerAuditLogger
 from paper_research_agent.answering.config import load_answering_config
 from paper_research_agent.answering.dashscope import (
@@ -29,7 +30,12 @@ from paper_research_agent.answering.service import AnswerAuditLogger, answer_con
 from paper_research_agent.chunking.models import EvidenceChunk
 from paper_research_agent.context.adapters import join_retrieval_evidence
 from paper_research_agent.context.assembler import assemble_context
-from paper_research_agent.context.models import AssembledContext, ContextRequest
+from paper_research_agent.context.models import (
+    AssembledContext,
+    ContextMemoryTurn,
+    ContextRequest,
+)
+from paper_research_agent.conversation.models import ConversationResolution
 from paper_research_agent.corpus import load_frozen_papers
 from paper_research_agent.ingestion.models import DocumentElement, SectionRecord
 from paper_research_agent.memory.config import ShortTermMemoryConfig, load_memory_config
@@ -71,6 +77,8 @@ if TYPE_CHECKING:
 StorageClass = Literal["redistributable", "internal_research_only"]
 EvidenceType = Literal["text", "figure_summary"]
 RewriteStatus = Literal["success", "cache_hit", "stale_cache", "timeout", "error", "agent"]
+ResearchAgentMode = Literal["auto", "always"]
+ResearchRequestMode = Literal["single", "planned"]
 
 
 class _FrozenWebModel(BaseModel):
@@ -99,12 +107,24 @@ class SafeRetrievalHit(_FrozenWebModel):
 class SafeRetrievalTrace(_FrozenWebModel):
     original_question: str
     resolved_question: str
+    standalone_question: str
+    chinese_query: str
     english_query: str | None
     rewrite_status: RewriteStatus
     degraded: bool
     degraded_reason: str | None
     index_id: str
     audit_persisted: bool
+    conversation_memory_hit_count: int = Field(ge=0)
+    selected_history_turn_ids: tuple[str, ...] = ()
+    selected_history_questions: tuple[str, ...] = ()
+    selected_history_relevances: tuple[float, ...] = ()
+    inherited_across_route: bool = False
+    rewrite_confidence: float = Field(default=1, ge=0, le=1)
+    needs_clarification: bool = False
+    recent_context_turn_count: int = Field(default=0, ge=0)
+    recalled_candidate_count: int = Field(default=0, ge=0)
+    interpretation_source: str = "deterministic"
     hits: tuple[SafeRetrievalHit, ...]
 
 
@@ -211,6 +231,7 @@ class RAGRuntime:
         output_reserve_tokens: int = 1200,
         system_rules: str = DEFAULT_RAG_SYSTEM_RULES,
         excerpt_chars: int = 360,
+        research_agent_mode: ResearchAgentMode = "always",
     ) -> None:
         if not dependencies.chunks:
             raise ValueError("runtime requires at least one evidence chunk")
@@ -220,6 +241,8 @@ class RAGRuntime:
             raise ValueError("output reserve must be smaller than token budget")
         if excerpt_chars < 32 or excerpt_chars > 2000:
             raise ValueError("excerpt_chars must be between 32 and 2000")
+        if research_agent_mode not in {"auto", "always"}:
+            raise ValueError("research_agent_mode must be auto or always")
         chunk_ids = [chunk.chunk_id for chunk in dependencies.chunks]
         if len(chunk_ids) != len(set(chunk_ids)):
             raise ValueError("runtime chunks contain duplicate chunk IDs")
@@ -237,6 +260,7 @@ class RAGRuntime:
         self._memory_config = dependencies.memory_config
         self._answer_audit = dependencies.answer_audit
         self._research_agent = dependencies.research_agent
+        self._research_agent_mode = research_agent_mode
         self._project_root = dependencies.project_root
         self._frozen_papers = dependencies.frozen_papers
         self._sections = dependencies.sections
@@ -261,6 +285,15 @@ class RAGRuntime:
     @property
     def chunk_count(self) -> int:
         return len(self._chunks)
+
+    @property
+    def research_planning_available(self) -> bool:
+        return self._research_agent is not None
+
+    @property
+    def research_agent(self) -> ResearchAgentRuntime | None:
+        """Expose the guarded child runtime to the main Agent without Web internals."""
+        return self._research_agent
 
     @classmethod
     def load(
@@ -448,6 +481,14 @@ class RAGRuntime:
         return _environment_flag("PRA_RESEARCH_AGENT_ENABLED", default=False)
 
     @classmethod
+    def research_agent_mode_from_environment(cls) -> ResearchAgentMode:
+        del cls
+        value = os.getenv("PRA_RESEARCH_AGENT_MODE", "auto").strip().casefold()
+        if value not in {"auto", "always"}:
+            raise ValueError("PRA_RESEARCH_AGENT_MODE must be auto or always")
+        return cast(ResearchAgentMode, value)
+
+    @classmethod
     async def from_environment_with_agent(cls) -> RAGRuntime:
         """Construct the normal runtime and then attach the optional Agent lane."""
         project_root = Path(os.getenv("PRA_PROJECT_ROOT", str(Path(__file__).resolve().parents[3])))
@@ -469,6 +510,7 @@ class RAGRuntime:
                 model_id=answer_config.model,
                 checkpoint_path=checkpoint_path,
                 policy=policy,
+                mode=cls.research_agent_mode_from_environment(),
             )
         except BaseException:
             await runtime.aclose()
@@ -481,6 +523,7 @@ class RAGRuntime:
         model_id: str,
         checkpoint_path: Path,
         policy: object,
+        mode: ResearchAgentMode = "always",
     ) -> None:
         """Attach one durable, policy-gated Agent without exposing internals to Web."""
         if self._closed:
@@ -493,6 +536,8 @@ class RAGRuntime:
         from paper_research_agent.agent.policy import ResearchRuntimePolicy
 
         runtime_policy = ResearchRuntimePolicy.model_validate(policy)
+        if mode not in {"auto", "always"}:
+            raise ValueError("research agent mode must be auto or always")
         storage_classes = {
             corpus_id: paper.storage_class for corpus_id, paper in self._papers.items()
         }
@@ -508,8 +553,16 @@ class RAGRuntime:
             sections=self._sections,
             elements=self._elements,
         )
+        self._research_agent_mode = mode
 
-    async def ask(self, question: str, *, session_id: str) -> RuntimeExecutionResult:
+    async def ask(
+        self,
+        question: str,
+        *,
+        session_id: str,
+        research_mode: ResearchRequestMode = "single",
+        conversation_context: ConversationResolution | None = None,
+    ) -> RuntimeExecutionResult:
         normalized_question = question.strip()
         if not normalized_question:
             raise ValueError("question cannot be blank")
@@ -526,7 +579,12 @@ class RAGRuntime:
             async with self._execution_lock:
                 if self._closed:
                     raise RuntimeClosedError("RAG runtime is closed")
-                return await self._execute(normalized_question, session_id=session_id)
+                return await self._execute(
+                    normalized_question,
+                    session_id=session_id,
+                    research_mode=research_mode,
+                    conversation_context=conversation_context,
+                )
         finally:
             self._busy = False
 
@@ -620,19 +678,32 @@ class RAGRuntime:
         question: str,
         *,
         session_id: str,
+        research_mode: ResearchRequestMode = "single",
+        conversation_context: ConversationResolution | None = None,
     ) -> RuntimeExecutionResult:
         policy = self._memory_config
-        try:
-            memory_turns = self._memory_store.recent(session_id)
-        except (OSError, sqlite3.Error):
+        if conversation_context is None:
+            try:
+                memory_turns = self._memory_store.recent(session_id)
+            except (OSError, sqlite3.Error):
+                memory_turns = ()
+            resolved_question = contextualize_retrieval_query(
+                question,
+                memory_turns,
+                max_question_chars=policy.follow_up_max_chars,
+            )
+            context_memory = to_context_memory(memory_turns)
+        else:
             memory_turns = ()
-        resolved_question = contextualize_retrieval_query(
-            question,
-            memory_turns,
-            max_question_chars=policy.follow_up_max_chars,
-        )
+            resolved_question = conversation_context.standalone_question
+            context_memory = _conversation_context_memory(conversation_context)
         research: ResearchRuntimeResult | None = None
-        if self._research_agent is None:
+        use_research_agent = self._research_agent is not None and (
+            self._research_agent_mode == "always"
+            or research_mode == "planned"
+            or requires_research_planning(resolved_question)
+        )
+        if not use_research_agent:
             run = await self._retriever.search(
                 resolved_question,
                 top_k=self._top_k,
@@ -644,11 +715,18 @@ class RAGRuntime:
                 question=question,
                 resolved_question=resolved_question,
                 run=run,
+                conversation_context=conversation_context,
             )
         else:
+            if self._research_agent is None:
+                raise RuntimeError("research agent selection is inconsistent")
             research = await self._research_agent.run(
                 resolved_question,
                 thread_id=session_id,
+                planning_required=(
+                    research_mode == "planned"
+                    or requires_research_planning(resolved_question)
+                ),
             )
             evidence = research.evidence
             task_state = research.task_state
@@ -656,11 +734,13 @@ class RAGRuntime:
                 question=question,
                 resolved_question=resolved_question,
                 research=research,
+                conversation_context=conversation_context,
             )
         context = assemble_context(
             ContextRequest(
                 system_rules=self._system_rules,
                 user_question=question,
+                standalone_question=resolved_question,
                 evidence=evidence,
                 task_state=task_state,
                 allow_partial_answer=(
@@ -668,7 +748,7 @@ class RAGRuntime:
                     and bool(evidence)
                     and not research.evidence_sufficient
                 ),
-                short_term_memory=to_context_memory(memory_turns),
+                short_term_memory=context_memory,
                 memory_token_budget=policy.context_token_budget,
                 protected_evidence_count=policy.protected_evidence_count,
                 token_budget=self._token_budget,
@@ -680,41 +760,84 @@ class RAGRuntime:
             self._generator,
             audit=self._answer_audit,
         )
-        try:
-            self._memory_store.append(
-                turn_from_answer(
-                    session_id,
-                    question,
-                    answer,
-                    config=policy,
-                    standalone_question=resolved_question,
+        if conversation_context is None:
+            try:
+                self._memory_store.append(
+                    turn_from_answer(
+                        session_id,
+                        question,
+                        answer,
+                        config=policy,
+                        standalone_question=resolved_question,
+                    )
                 )
-            )
-        except (OSError, sqlite3.Error, ValueError):
-            pass
+            except (OSError, sqlite3.Error, ValueError):
+                pass
         return self._safe_result(
             question=question,
             retrieval=retrieval_trace,
             context=context,
             answer=answer,
         )
-
     def _safe_retrieval_trace(
         self,
         *,
         question: str,
         resolved_question: str,
         run: BilingualRetrievalRun,
+        conversation_context: ConversationResolution | None = None,
     ) -> SafeRetrievalTrace:
+        candidates = conversation_context.candidates if conversation_context is not None else ()
+        selected = (
+            conversation_context.selected_candidates if conversation_context is not None else ()
+        )
         return SafeRetrievalTrace(
             original_question=question,
             resolved_question=resolved_question,
+            standalone_question=resolved_question,
+            chinese_query=(
+                conversation_context.chinese_query
+                if conversation_context is not None
+                else resolved_question
+            ),
             english_query=run.rewrite.english_query,
             rewrite_status=run.rewrite.status,
             degraded=run.degraded,
             degraded_reason=run.degraded_reason,
             index_id=run.index_id,
             audit_persisted=run.audit_persisted,
+            conversation_memory_hit_count=len(candidates),
+            selected_history_turn_ids=tuple(item.turn_id for item in selected),
+            selected_history_questions=tuple(item.user_question for item in selected),
+            selected_history_relevances=tuple(item.relevance for item in selected),
+            inherited_across_route=(
+                conversation_context.inherited_across_route
+                if conversation_context is not None
+                else False
+            ),
+            rewrite_confidence=(
+                conversation_context.confidence if conversation_context is not None else 1
+            ),
+            needs_clarification=(
+                conversation_context.needs_clarification
+                if conversation_context is not None
+                else False
+            ),
+            recent_context_turn_count=(
+                conversation_context.recent_context_turn_count
+                if conversation_context is not None
+                else 0
+            ),
+            recalled_candidate_count=(
+                conversation_context.recalled_candidate_count
+                if conversation_context is not None
+                else 0
+            ),
+            interpretation_source=(
+                conversation_context.interpretation_source
+                if conversation_context is not None
+                else "deterministic"
+            ),
             hits=tuple(
                 SafeRetrievalHit(
                     chunk_id=hit.chunk_id,
@@ -735,6 +858,7 @@ class RAGRuntime:
         question: str,
         resolved_question: str,
         research: ResearchRuntimeResult,
+        conversation_context: ConversationResolution | None = None,
     ) -> SafeRetrievalTrace:
         index_ids = {item.search.index_id for item in research.observations}
         if len(index_ids) != 1:
@@ -749,12 +873,62 @@ class RAGRuntime:
         return SafeRetrievalTrace(
             original_question=question,
             resolved_question=resolved_question,
+            standalone_question=resolved_question,
+            chinese_query=(
+                conversation_context.chinese_query
+                if conversation_context is not None
+                else resolved_question
+            ),
             english_query=None,
             rewrite_status="agent",
             degraded=bool(reasons),
             degraded_reason="; ".join(reasons) or None,
             index_id=next(iter(index_ids)),
             audit_persisted=False,
+            conversation_memory_hit_count=(
+                len(conversation_context.candidates) if conversation_context is not None else 0
+            ),
+            selected_history_turn_ids=(
+                conversation_context.selected_turn_ids if conversation_context is not None else ()
+            ),
+            selected_history_questions=(
+                tuple(item.user_question for item in conversation_context.selected_candidates)
+                if conversation_context is not None
+                else ()
+            ),
+            selected_history_relevances=(
+                tuple(item.relevance for item in conversation_context.selected_candidates)
+                if conversation_context is not None
+                else ()
+            ),
+            inherited_across_route=(
+                conversation_context.inherited_across_route
+                if conversation_context is not None
+                else False
+            ),
+            rewrite_confidence=(
+                conversation_context.confidence if conversation_context is not None else 1
+            ),
+            needs_clarification=(
+                conversation_context.needs_clarification
+                if conversation_context is not None
+                else False
+            ),
+            recent_context_turn_count=(
+                conversation_context.recent_context_turn_count
+                if conversation_context is not None
+                else 0
+            ),
+            recalled_candidate_count=(
+                conversation_context.recalled_candidate_count
+                if conversation_context is not None
+                else 0
+            ),
+            interpretation_source=(
+                conversation_context.interpretation_source
+                if conversation_context is not None
+                else "deterministic"
+            ),
             hits=tuple(
                 SafeRetrievalHit(
                     chunk_id=item.chunk_id,
@@ -826,6 +1000,31 @@ class RAGRuntime:
                 audit_persisted=answer.audit_persisted,
             ),
         )
+
+
+def _conversation_context_memory(
+    resolution: ConversationResolution,
+) -> tuple[ContextMemoryTurn, ...]:
+    turns: list[ContextMemoryTurn] = []
+    for candidate in resolution.selected_candidates:
+        if candidate.status == "insufficient_evidence":
+            turns.append(
+                ContextMemoryTurn(
+                    turn_id=candidate.turn_id,
+                    user_question=candidate.user_question,
+                    status="insufficient_evidence",
+                )
+            )
+        elif candidate.assistant_summary:
+            turns.append(
+                ContextMemoryTurn(
+                    turn_id=candidate.turn_id,
+                    user_question=candidate.user_question,
+                    status="answered",
+                    assistant_claims=(candidate.assistant_summary,),
+                )
+            )
+    return tuple(turns)
 
 
 def _load_chunks(path: Path) -> list[EvidenceChunk]:
