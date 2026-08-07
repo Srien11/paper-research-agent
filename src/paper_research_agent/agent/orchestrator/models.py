@@ -380,3 +380,15 @@ class MainAgentResult(FrozenModel):
         if any(not value for value in normalized):
             raise ValueError("route trace entries must not be blank")
         return normalized
+
+
+class AgentRunStart(FrozenModel):
+    """Idempotent start of one main Agent run returned by begin_agent_run."""
+
+    run_id: str = Field(min_length=1, max_length=256)
+    request_id: str = Field(min_length=1, max_length=256)
+    conversation_id: str = Field(min_length=1, max_length=256)
+    turn_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    workspace: ConversationWorkspace
+    outcome: Literal["created", "running_reused", "completed_cached"]
+    result: MainAgentResult | None = None
