@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import json
+import os
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+from paper_research_agent.agent.orchestrator.models import MainAgentResult
 from paper_research_agent.answering.models import RAGAnswer
 from paper_research_agent.web.app import create_app
 from paper_research_agent.web.config import OwnerCredentials, WebConfig
@@ -374,6 +378,71 @@ class AppTests(unittest.TestCase):
             self.client.get("/paper-research/api/session").json(),
             {"authenticated": False},
         )
+
+    def test_main_agent_flag_routes_ask_and_preserves_request_id(self) -> None:
+        class FakeMainAgent:
+            def __init__(self) -> None:
+                self.requests: list[object] = []
+
+            async def run(self, request: object) -> MainAgentResult:
+                self.requests.append(request)
+                return MainAgentResult(
+                    run_id="r" * 32,
+                    request_id=request.request_id,  # type: ignore[attr-defined]
+                    conversation_id=request.conversation_id,  # type: ignore[attr-defined]
+                    status="completed",
+                    answer="主 Agent 回答",
+                    workspace_version=1,
+                )
+
+        main_agent = FakeMainAgent()
+        config = WebConfig(
+            credentials=OwnerCredentials(username="owner", password="correct-password"),
+            session_secret=b"s" * 32,
+            allowed_origins=frozenset({ORIGIN}),
+            max_question_chars=100,
+        )
+        with patch.dict(os.environ, {"PRA_MAIN_AGENT_ENABLED": "true"}):
+            app = create_app(
+                config=config,
+                runtime=self.runtime,
+                serve_static=False,
+                main_agent_runtime=main_agent,  # type: ignore[arg-type]
+            )
+            with TestClient(app, base_url=ORIGIN) as client:
+                client.post(
+                    "/paper-research/api/login",
+                    headers={"Origin": ORIGIN},
+                    json={"username": "owner", "password": "correct-password"},
+                )
+                response = client.post(
+                    "/paper-research/api/ask",
+                    headers={"Origin": ORIGIN},
+                    json={
+                        "question": "比较 RAG 与 GraphRAG",
+                        "rag_mode": "preferred",
+                        "request_id": "req-123",
+                    },
+                )
+        self.assertEqual(response.status_code, 200, response.text)
+        events = [json.loads(line) for line in response.text.strip().split("\n")]
+        self.assertEqual(events[0]["type"], "run_started")
+        self.assertEqual(events[0]["request_id"], "req-123")
+        self.assertEqual(events[-1]["type"], "done")
+        self.assertEqual(events[-1]["status"], "completed")
+        self.assertEqual(main_agent.requests[0].request_id, "req-123")
+
+    def test_main_agent_flag_off_keeps_legacy_ask(self) -> None:
+        self.login()
+        with patch.dict(os.environ, {"PRA_MAIN_AGENT_ENABLED": "false"}):
+            response = self.client.post(
+                "/paper-research/api/ask",
+                headers={"Origin": ORIGIN},
+                json={"question": "比较 RAG 与 GraphRAG", "rag_mode": "required"},
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertIn("answer", payload)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -8,7 +9,19 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 
+def _load_local_env(path: Path) -> None:
+    if not path.is_file():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
 def main() -> None:
+    _load_local_env(PROJECT_ROOT / ".env")
     parser = argparse.ArgumentParser(
         description="Serve the owner-only paper research Web interface."
     )
@@ -27,6 +40,11 @@ def main() -> None:
 
     # One worker is intentional: the local embedding and reranking models are shared
     # process state and must not be duplicated on the small personal server.
+    # One worker is intentional: the local embedding and reranking models are shared
+    # process state and must not be duplicated on the small personal server.
+    main_agent_enabled = os.getenv("PRA_MAIN_AGENT_ENABLED", "").strip().lower() == "true"
+    if main_agent_enabled:
+        print("主 Agent 统一入口已启用（PRA_MAIN_AGENT_ENABLED=true）")
     uvicorn.run(
         "paper_research_agent.web.app:create_app",
         factory=True,

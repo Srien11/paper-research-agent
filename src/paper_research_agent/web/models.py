@@ -24,6 +24,7 @@ class QuestionRequest(WebModel):
     question: str = Field(min_length=1, max_length=10_000)
     attachment_ids: tuple[str, ...] = Field(default=(), max_length=5)
     rag_mode: RAGMode = "disabled"
+    request_id: str | None = Field(default=None, min_length=1, max_length=256)
 
     @field_validator("question")
     @classmethod
@@ -97,12 +98,24 @@ class SafeRetrievalHit(WebModel):
 class SafeRetrievalTrace(WebModel):
     original_question: str = Field(min_length=1)
     resolved_question: str = Field(min_length=1)
+    standalone_question: str | None = None
+    chinese_query: str | None = None
     english_query: str | None = None
     rewrite_status: str = Field(min_length=1)
     degraded: bool
     degraded_reason: str | None = None
     index_id: str = Field(min_length=1)
     audit_persisted: bool
+    conversation_memory_hit_count: int = Field(default=0, ge=0)
+    selected_history_turn_ids: tuple[str, ...] = ()
+    selected_history_questions: tuple[str, ...] = ()
+    selected_history_relevances: tuple[float, ...] = ()
+    inherited_across_route: bool = False
+    rewrite_confidence: float = Field(default=1, ge=0, le=1)
+    needs_clarification: bool = False
+    recent_context_turn_count: int = Field(default=0, ge=0)
+    recalled_candidate_count: int = Field(default=0, ge=0)
+    interpretation_source: str = "deterministic"
     hits: tuple[SafeRetrievalHit, ...]
 
 
