@@ -20,10 +20,12 @@ data/raw/
 data/processed/
 data/indexes/
 data/evaluations/runs/
+data/evaluations/gold/
 data/runtime/
 data/runtime/live-smoke-v1/
 data/runtime/live-smoke-memory-v1/
 logs/
+.web-*.log
 *.pdf
 *.faiss
 *.sqlite
