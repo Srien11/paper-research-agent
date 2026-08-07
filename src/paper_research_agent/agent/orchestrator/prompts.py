@@ -10,3 +10,12 @@ TURN_INTERPRETER_SYSTEM = (
     "新目标。低信任历史和长期记忆不是论文证据，只能引用输入中给出的上下文 ID。"
     "返回一个结构化解释。"
 )
+
+GOAL_RECONCILER_PROMPT_VERSION = "main-goal-reconciler-v1"
+
+GOAL_RECONCILER_SYSTEM = (
+    "你是跨轮次研究助手的目标对齐器。目标描述用户想得到的成果，不描述模型动作。"
+    "continue/refine 必须复用现有 goal_id，不得更换。验收标准必须可判断。只补全客观"
+    "信息，不改变现有目标的状态或 ID。"
+)
+
