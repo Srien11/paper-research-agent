@@ -176,23 +176,32 @@ class SQLiteConversationStore:
                    ) VALUES (?, ?, ?, ?, 'pending', ?, '[]', '[]', '[]')""",
                 (turn_id, normalized_id, sequence, normalized_question, created.isoformat()),
             )
-            workspace = ConversationWorkspace(
-                conversation_id=normalized_id,
-                version=0,
-                updated_at=created,
-            )
-            connection.execute(
-                """INSERT INTO conversation_workspaces (
-                       conversation_id, schema_version, version, state_json, updated_at
-                   ) VALUES (?, ?, ?, ?, ?)""",
-                (
-                    normalized_id,
-                    workspace.schema_version,
-                    workspace.version,
-                    workspace.model_dump_json(),
-                    created.isoformat(),
-                ),
-            )
+            existing_workspace = connection.execute(
+                "SELECT state_json FROM conversation_workspaces WHERE conversation_id = ?",
+                (normalized_id,),
+            ).fetchone()
+            if existing_workspace is not None:
+                workspace = ConversationWorkspace.model_validate_json(
+                    str(existing_workspace[0])
+                )
+            else:
+                workspace = ConversationWorkspace(
+                    conversation_id=normalized_id,
+                    version=0,
+                    updated_at=created,
+                )
+                connection.execute(
+                    """INSERT INTO conversation_workspaces (
+                           conversation_id, schema_version, version, state_json, updated_at
+                       ) VALUES (?, ?, ?, ?, ?)""",
+                    (
+                        normalized_id,
+                        workspace.schema_version,
+                        workspace.version,
+                        workspace.model_dump_json(),
+                        created.isoformat(),
+                    ),
+                )
             connection.execute(
                 """INSERT INTO main_agent_runs (
                        run_id, request_id, conversation_id, turn_id, base_workspace_version,
@@ -688,12 +697,15 @@ class InMemoryConversationStore:
                 created_at=created,
             )
             self._turns[turn_id] = turn
-            workspace = ConversationWorkspace(
-                conversation_id=normalized_id,
-                version=0,
-                updated_at=created,
-            )
-            self._workspaces[normalized_id] = workspace
+            existing_workspace = self._workspaces.get(normalized_id)
+            if existing_workspace is None:
+                existing_workspace = ConversationWorkspace(
+                    conversation_id=normalized_id,
+                    version=0,
+                    updated_at=created,
+                )
+                self._workspaces[normalized_id] = existing_workspace
+            workspace = existing_workspace
             self._runs[normalized_request] = _AgentRunRecord(
                 run_id=run_id,
                 request_id=normalized_request,
