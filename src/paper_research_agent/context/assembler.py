@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections import deque
 from collections.abc import Sequence
 
 from paper_research_agent.context.budget import (
@@ -71,17 +72,19 @@ def _system_message(
     return PromptMessage(role="system", content=content)
 
 
-def _is_comparison_task(task_state: str | None) -> bool:
+def _comparison_task_payload(task_state: str | None) -> dict[str, object] | None:
     if task_state is None:
-        return False
+        return None
     try:
         payload = json.loads(task_state)
     except (TypeError, json.JSONDecodeError):
-        return False
+        return None
     if not isinstance(payload, dict):
-        return False
+        return None
     plan = payload.get("plan")
-    return isinstance(plan, dict) and plan.get("task_type") == "comparison"
+    if not isinstance(plan, dict) or plan.get("task_type") != "comparison":
+        return None
+    return payload
 
 
 def _request_message(request: ContextRequest) -> PromptMessage:
@@ -180,17 +183,141 @@ def _deduplicate(evidence: Sequence[ContextEvidence]) -> list[ContextEvidence]:
     return selected
 
 
+def _comparison_target_pairs(
+    payload: dict[str, object],
+) -> tuple[tuple[str, str], ...]:
+    plan = payload.get("plan")
+    if not isinstance(plan, dict):
+        return ()
+    targets = plan.get("targets")
+    if not isinstance(targets, list):
+        return ()
+    result: list[tuple[str, str]] = []
+    seen_corpora: set[str] = set()
+    for target in targets:
+        if not isinstance(target, dict):
+            continue
+        target_id = target.get("target_id")
+        corpus_id = target.get("corpus_id")
+        if (
+            not isinstance(target_id, str)
+            or not isinstance(corpus_id, str)
+            or len(corpus_id) != 4
+            or corpus_id[0] not in {"C", "T"}
+            or not corpus_id[1:].isdigit()
+            or corpus_id in seen_corpora
+        ):
+            continue
+        result.append((target_id, corpus_id))
+        seen_corpora.add(corpus_id)
+    return tuple(result)
+
+
+def _covered_chunks_by_target(
+    payload: dict[str, object],
+    target_pairs: tuple[tuple[str, str], ...],
+) -> tuple[tuple[str, str], ...]:
+    plan = payload.get("plan")
+    if not isinstance(plan, dict):
+        return ()
+    requirements = plan.get("requirements")
+    assessments = payload.get("assessments")
+    if not isinstance(requirements, list) or not isinstance(assessments, list):
+        return ()
+    final_coverage: list[object] | None = None
+    for assessment in reversed(assessments):
+        if isinstance(assessment, dict) and isinstance(assessment.get("coverage"), list):
+            final_coverage = assessment["coverage"]
+            break
+    if final_coverage is None:
+        return ()
+
+    coverage_by_requirement: dict[str, tuple[str, ...]] = {}
+    for coverage in final_coverage:
+        if not isinstance(coverage, dict) or coverage.get("covered") is not True:
+            continue
+        requirement_id = coverage.get("requirement_id")
+        chunk_ids = coverage.get("chunk_ids")
+        if not isinstance(requirement_id, str) or not isinstance(chunk_ids, list):
+            continue
+        coverage_by_requirement[requirement_id] = tuple(
+            chunk_id for chunk_id in chunk_ids if isinstance(chunk_id, str)
+        )
+
+    corpus_by_target = dict(target_pairs)
+    ordered: list[tuple[str, str]] = []
+    for requirement in requirements:
+        if not isinstance(requirement, dict):
+            continue
+        requirement_id = requirement.get("requirement_id")
+        target_id = requirement.get("target_id")
+        if not isinstance(requirement_id, str) or not isinstance(target_id, str):
+            continue
+        corpus_id = corpus_by_target.get(target_id)
+        if corpus_id is None:
+            continue
+        ordered.extend(
+            (corpus_id, chunk_id)
+            for chunk_id in coverage_by_requirement.get(requirement_id, ())
+        )
+    return tuple(ordered)
+
+
+def _prioritize_comparison_evidence(
+    evidence: list[ContextEvidence],
+    payload: dict[str, object] | None,
+) -> tuple[list[ContextEvidence], int]:
+    if payload is None:
+        return evidence, 0
+    target_pairs = _comparison_target_pairs(payload)
+    if len(target_pairs) < 2:
+        return evidence, 0
+
+    target_corpora = tuple(corpus_id for _, corpus_id in target_pairs)
+    candidates_by_chunk = {item.chunk_id: item for item in evidence}
+    queues = {corpus_id: deque[ContextEvidence]() for corpus_id in target_corpora}
+    queued_ids: set[str] = set()
+    for corpus_id, chunk_id in _covered_chunks_by_target(payload, target_pairs):
+        candidate = candidates_by_chunk.get(chunk_id)
+        if (
+            candidate is None
+            or candidate.corpus_id != corpus_id
+            or candidate.chunk_id in queued_ids
+        ):
+            continue
+        queues[corpus_id].append(candidate)
+        queued_ids.add(candidate.chunk_id)
+    for candidate in evidence:
+        queue = queues.get(candidate.corpus_id)
+        if queue is None or candidate.chunk_id in queued_ids:
+            continue
+        queue.append(candidate)
+        queued_ids.add(candidate.chunk_id)
+
+    prioritized: list[ContextEvidence] = []
+    while any(queues.values()):
+        for corpus_id in target_corpora:
+            if queues[corpus_id]:
+                prioritized.append(queues[corpus_id].popleft())
+    prioritized.extend(item for item in evidence if item.chunk_id not in queued_ids)
+    represented_targets = len(
+        {item.corpus_id for item in evidence} & set(target_corpora)
+    )
+    return prioritized, represented_targets
+
+
 def assemble_context(
     request: ContextRequest,
     *,
     estimator: TokenEstimator = conservative_token_count,
 ) -> AssembledContext:
     """Build complete messages without truncating trusted rules or evidence."""
+    comparison_payload = _comparison_task_payload(request.task_state)
     required_messages = (
         _system_message(
             request.system_rules,
             allow_partial_answer=request.allow_partial_answer,
-            comparison_mode=_is_comparison_task(request.task_state),
+            comparison_mode=comparison_payload is not None,
         ),
         *request.conversation_history,
         _request_message(request),
@@ -202,7 +329,10 @@ def assemble_context(
             f"required context needs {base_tokens} tokens but only {usable_budget} are available"
         )
 
-    candidates = _deduplicate(request.evidence)
+    candidates, represented_target_count = _prioritize_comparison_evidence(
+        _deduplicate(request.evidence),
+        comparison_payload,
+    )
     memory = list(request.short_term_memory)
     while memory:
         memory_message = _memory_message(memory)
@@ -219,7 +349,11 @@ def assemble_context(
             memory.pop(0)
             continue
         if candidates:
-            protected = candidates[: request.protected_evidence_count]
+            protected_count = max(
+                request.protected_evidence_count,
+                represented_target_count,
+            )
+            protected = candidates[:protected_count]
             protected_message, _ = _evidence_message(protected)
             if estimate_messages((*proposed_base, protected_message), estimator) > usable_budget:
                 memory.pop(0)

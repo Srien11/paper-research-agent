@@ -52,7 +52,7 @@ class RecordingReranker:
 
 class FakeRewriter:
     model_id = "qwen3.7-plus-2026-05-26"
-    prompt_version = "query-rewrite-v2"
+    prompt_version = "query-rewrite-v3"
 
     def __init__(self, *, delay=0.0, error=None):
         self.delay = delay
@@ -183,6 +183,30 @@ class BilingualRetrievalTests(unittest.IsolatedAsyncioTestCase):
         with closing(sqlite3.connect(self.directory / "audit.sqlite3")) as connection:
             stages = {row[0] for row in connection.execute("SELECT DISTINCT stage FROM rankings")}
         self.assertTrue({"zh.bm25", "en.vector", "cross_route_rrf", "final"} <= stages)
+
+    async def test_resolve_query_exposes_cached_rewrite_without_running_chunk_recall(self) -> None:
+        service = self.service(FakeRewriter())
+
+        first = await service.resolve_query("中文问题")
+        second = await service.resolve_query("中文问题")
+
+        self.assertEqual(first.english_query, "English query")
+        self.assertEqual(second.status, "cache_hit")
+        self.assertEqual(self.sparse.calls, [])
+        self.assertEqual(self.vector.calls, [])
+
+    async def test_request_can_expand_recall_and_skip_reranking_for_candidate_discovery(self) -> None:
+        run = await self.service(FakeRewriter()).search(
+            "中文问题",
+            top_k=3,
+            candidate_k=4,
+            recall_k=4,
+            rerank=False,
+        )
+
+        self.assertEqual(self.reranker.calls, [])
+        self.assertTrue(all(call[0] in {"中文问题", "English query"} for call in self.sparse.calls))
+        self.assertLessEqual(len(run.hits), 3)
 
     async def test_timeout_returns_chinese_hybrid_without_english_reranker(self) -> None:
         run = await self.service(FakeRewriter(delay=0.05), timeout=0.005).search("中文问题")

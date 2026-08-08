@@ -27,7 +27,7 @@ from paper_research_agent.answering.dashscope import (
 )
 from paper_research_agent.answering.models import AnswerRequest, RAGAnswer
 from paper_research_agent.answering.service import AnswerAuditLogger, answer_context
-from paper_research_agent.chunking.models import EvidenceChunk
+from paper_research_agent.chunking.models import EvidenceChunk, PaperCard
 from paper_research_agent.context.adapters import join_retrieval_evidence
 from paper_research_agent.context.assembler import assemble_context
 from paper_research_agent.context.models import (
@@ -53,6 +53,11 @@ from paper_research_agent.retrieval.config import (
 )
 from paper_research_agent.retrieval.contracts import BilingualRetrievalRun, IndexManifest
 from paper_research_agent.retrieval.model_adapters import FastEmbedEncoder, FastEmbedReranker
+from paper_research_agent.retrieval.papers import (
+    AsyncPaperCandidateRetriever,
+    HybridPaperCandidateRetriever,
+    build_paper_candidate_documents,
+)
 from paper_research_agent.retrieval.query_rewrite import (
     AsyncQueryRewriter,
     DashScopeQueryRewriter,
@@ -201,6 +206,8 @@ class RuntimeDependencies:
         frozen_papers: Sequence[FrozenPaper] = (),
         sections: Sequence[SectionRecord] = (),
         elements: Sequence[DocumentElement] = (),
+        paper_cards: Sequence[PaperCard] = (),
+        paper_candidate_retriever: AsyncPaperCandidateRetriever | None = None,
     ) -> None:
         self.chunks = tuple(chunks)
         self.papers = dict(papers)
@@ -214,6 +221,8 @@ class RuntimeDependencies:
         self.frozen_papers = tuple(frozen_papers)
         self.sections = tuple(sections)
         self.elements = tuple(elements)
+        self.paper_cards = tuple(paper_cards)
+        self.paper_candidate_retriever = paper_candidate_retriever
 
 
 class RAGRuntime:
@@ -265,6 +274,8 @@ class RAGRuntime:
         self._frozen_papers = dependencies.frozen_papers
         self._sections = dependencies.sections
         self._elements = dependencies.elements
+        self._paper_cards = dependencies.paper_cards
+        self._paper_candidate_retriever = dependencies.paper_candidate_retriever
         self._top_k = top_k
         self._token_budget = token_budget
         self._output_reserve_tokens = output_reserve_tokens
@@ -302,6 +313,7 @@ class RAGRuntime:
         project_root: Path,
         corpus_dir: Path,
         chunks_path: Path | None = None,
+        paper_cards_path: Path | None = None,
         retrieval_config_path: Path | None = None,
         bilingual_config_path: Path | None = None,
         answer_config_path: Path | None = None,
@@ -324,6 +336,11 @@ class RAGRuntime:
             root,
             chunks_path,
             "data/processed/chunks/chunks.jsonl",
+        )
+        paper_cards_file = _project_path(
+            root,
+            paper_cards_path,
+            "data/processed/chunks/paper_cards.jsonl",
         )
         retrieval_file = _project_path(
             root,
@@ -357,6 +374,7 @@ class RAGRuntime:
             raise RuntimeError("answer generation credentials are unavailable")
 
         chunks = tuple(_load_chunks(chunks_file))
+        paper_cards = tuple(_load_paper_cards(paper_cards_file))
         retrieval_config = load_retrieval_config(retrieval_file)
         bilingual_config = load_bilingual_retrieval_config(bilingual_file)
         answer_config = load_answering_config(answer_file)
@@ -383,6 +401,13 @@ class RAGRuntime:
         encoder = FastEmbedEncoder(
             retrieval_config.embedding_model,
             revision=retrieval_config.embedding_revision,
+        )
+        paper_documents = build_paper_candidate_documents(paper_cards, chunks)
+        if {item.corpus_id for item in paper_documents} != set(paper_metadata):
+            raise ValueError("paper cards do not exactly cover the corpus catalog")
+        paper_candidate_retriever = HybridPaperCandidateRetriever(
+            paper_documents,
+            encoder,
         )
         sparse = BM25Index(chunks)
         vector = FaissVectorIndex(chunks, encoder, index_dir / "vectors.faiss")
@@ -447,6 +472,8 @@ class RAGRuntime:
                 frozen_papers=papers,
                 sections=sections,
                 elements=elements,
+                paper_cards=paper_cards,
+                paper_candidate_retriever=paper_candidate_retriever,
             ),
             top_k=top_k,
             token_budget=token_budget,
@@ -466,6 +493,7 @@ class RAGRuntime:
             project_root=project_root,
             corpus_dir=corpus_dir,
             chunks_path=_optional_env_path("PRA_CHUNKS_PATH"),
+            paper_cards_path=_optional_env_path("PRA_PAPER_CARDS_PATH"),
             retrieval_config_path=_optional_env_path("PRA_RETRIEVAL_CONFIG"),
             bilingual_config_path=_optional_env_path("PRA_BILINGUAL_CONFIG"),
             answer_config_path=_optional_env_path("PRA_ANSWER_CONFIG"),
@@ -543,6 +571,8 @@ class RAGRuntime:
         }
         self._research_agent = await create_research_agent_runtime(
             retriever=self._retriever,
+            paper_candidate_retriever=self._require_paper_candidate_retriever(),
+            paper_candidate_query_resolver=self._retriever,
             chunks=self._chunks,
             storage_classes=storage_classes,
             model_id=model_id,
@@ -554,6 +584,11 @@ class RAGRuntime:
             elements=self._elements,
         )
         self._research_agent_mode = mode
+
+    def _require_paper_candidate_retriever(self) -> AsyncPaperCandidateRetriever:
+        if self._paper_candidate_retriever is None:
+            raise RuntimeError("paper candidate retriever is unavailable")
+        return self._paper_candidate_retriever
 
     async def ask(
         self,
@@ -1035,6 +1070,14 @@ def _load_chunks(path: Path) -> list[EvidenceChunk]:
     ]
 
 
+def _load_paper_cards(path: Path) -> list[PaperCard]:
+    return [
+        PaperCard.model_validate_json(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
 def _load_sections(path: Path) -> list[SectionRecord]:
     return [
         SectionRecord.model_validate_json(line)
@@ -1105,7 +1148,7 @@ def _research_policy_from_environment() -> object:
         max_tool_calls=_environment_int("PRA_RESEARCH_AGENT_MAX_TOOL_CALLS", 12),
         timeout_seconds=_environment_float(
             "PRA_RESEARCH_AGENT_TIMEOUT_SECONDS",
-            90,
+            120,
         ),
     )
 

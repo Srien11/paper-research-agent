@@ -179,15 +179,15 @@ class ResearchRuntimePolicyTests(unittest.TestCase):
 
 
 class ResearchAgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
-    async def test_revalidates_comparison_coverage_and_exposes_safe_grid_state(self) -> None:
+    async def test_rejects_cross_target_comparison_coverage(self) -> None:
         chunk = _chunk()
         state = _state(chunk)
         state["question"] = "比较 Paper A 和 Paper B"
         state["plan"] = {
             "task_type": "comparison",
             "targets": [
-                {"target_id": "a", "label": "Paper A"},
-                {"target_id": "b", "label": "Paper B"},
+                {"target_id": "a", "label": "Paper A", "corpus_id": "C001"},
+                {"target_id": "b", "label": "Paper B", "corpus_id": "T001"},
             ],
             "dimensions": [{"dimension_id": "method", "label": "Method"}],
             "requirements": [
@@ -206,15 +206,27 @@ class ResearchAgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             ],
             "steps": [
                 {
-                    "step_id": "methods",
-                    "objective": "查找方法",
-                    "query": "grounded RAG",
+                    "step_id": "methods-a",
+                    "objective": "查找 Paper A 方法",
+                    "query": "Paper A grounded RAG",
                     "top_k": 4,
-                    "target_ids": ["a", "b"],
+                    "corpus_id": "C001",
+                    "target_ids": ["a"],
+                    "dimension_ids": ["method"],
+                },
+                {
+                    "step_id": "methods-b",
+                    "objective": "查找 Paper B 方法",
+                    "query": "Paper B grounded RAG",
+                    "top_k": 4,
+                    "corpus_id": "T001",
+                    "target_ids": ["b"],
                     "dimension_ids": ["method"],
                 }
             ],
         }
+        state["observations"][0]["step_id"] = "methods-a"  # type: ignore[index]
+        state["observations"][0]["search"]["corpus_id"] = "C001"  # type: ignore[index]
         state["assessments"] = [
             {
                 "evidence_sufficient": True,
@@ -239,20 +251,8 @@ class ResearchAgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             storage_classes={"C001": "internal_research_only"},
         )
 
-        result = await runtime.run("比较 Paper A 和 Paper B", thread_id="session-1")
-
-        self.assertIn('"task_type":"comparison"', result.task_state)
-        self.assertIn('"requirement_id":"a-method"', result.task_state)
-        self.assertNotIn(chunk.text, result.task_state)
-
-        state["assessments"][0]["coverage"][1]["chunk_ids"] = ["unknown"]  # type: ignore[index]
-        runtime = ResearchAgentRuntime(
-            graph=FakeGraph(state),
-            chunks=(chunk,),
-            storage_classes={"C001": "internal_research_only"},
-        )
-        with self.assertRaisesRegex(ValueError, "unknown evidence chunk"):
-            await runtime.run("比较 Paper A 和 Paper B", thread_id="session-2")
+        with self.assertRaisesRegex(ValueError, "comparison cell"):
+            await runtime.run("比较 Paper A 和 Paper B", thread_id="session-1")
 
     async def test_maps_thread_and_revalidates_graph_evidence(self) -> None:
         chunk = _chunk()

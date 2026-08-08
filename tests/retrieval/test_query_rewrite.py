@@ -86,7 +86,7 @@ class QueryRewriteTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("context", payload)
         self.assertEqual(payload["temperature"], 0.1)
         self.assertEqual(payload["top_p"], 0.7)
-        self.assertEqual(payload["max_tokens"], 128)
+        self.assertEqual(payload["max_tokens"], 512)
         self.assertFalse(payload["enable_thinking"])
         for required_constraint in (
             "model names",
@@ -97,6 +97,11 @@ class QueryRewriteTests(unittest.IsolatedAsyncioTestCase):
             "negations",
             "scope restrictions",
             "comparison direction",
+            "Do not summarize",
+            "Do not add",
+            "Do not omit",
+            "relationships",
+            "question intent",
         ):
             self.assertIn(required_constraint, payload["messages"][0]["content"])
         self.assertEqual(
@@ -153,7 +158,7 @@ class QueryRewriteTests(unittest.IsolatedAsyncioTestCase):
             {"choices": [{"message": {"content": "not-json"}}]},
             {"choices": [{"message": {"content": '{"english_query":"valid","unexpected":true}'}}]},
             {"choices": [{"message": {"content": '{"english_query":"   "}'}}]},
-            {"choices": [{"message": {"content": json.dumps({"english_query": "x" * 1025})}}]},
+            {"choices": [{"message": {"content": json.dumps({"english_query": "x" * 4001})}}]},
         )
         for response in invalid_responses:
             with self.subTest(response=response), self.assertRaises(QueryRewriteError):

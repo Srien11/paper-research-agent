@@ -40,6 +40,7 @@ from paper_research_agent.web.runtime import (
     RuntimeClosedError,
     RuntimeDependencies,
     SafePaperMetadata,
+    _research_policy_from_environment,
 )
 
 
@@ -378,6 +379,7 @@ def _runtime(
             memory_store=FakeMemoryStore(),
             memory_config=ShortTermMemoryConfig(),
             research_agent=research_agent,
+            paper_candidate_retriever=AsyncMock(),
         ),
         excerpt_chars=48,
         research_agent_mode=research_agent_mode,
@@ -386,6 +388,12 @@ def _runtime(
 
 
 class RAGRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    def test_research_policy_default_timeout_covers_six_step_budget(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            policy = _research_policy_from_environment()
+
+        self.assertEqual(policy.timeout_seconds, 120)
+
     def test_from_environment_requires_corpus_and_forwards_optional_paths(self) -> None:
         with (
             patch.dict("os.environ", {"PRA_PROJECT_ROOT": "project-root"}, clear=True),
@@ -398,6 +406,7 @@ class RAGRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "PRA_PROJECT_ROOT": "project-root",
             "PRA_CORPUS_DIR": "corpus",
             "PRA_CHUNKS_PATH": "private/chunks.jsonl",
+            "PRA_PAPER_CARDS_PATH": "private/paper-cards.jsonl",
             "PRA_RETRIEVAL_CONFIG": "private/retrieval.json",
             "PRA_BILINGUAL_CONFIG": "private/bilingual.json",
             "PRA_ANSWER_CONFIG": "private/answer.json",
@@ -415,6 +424,7 @@ class RAGRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["project_root"], Path("project-root"))
         self.assertEqual(kwargs["corpus_dir"], Path("project-root/corpus"))
         self.assertEqual(kwargs["chunks_path"], Path("private/chunks.jsonl"))
+        self.assertEqual(kwargs["paper_cards_path"], Path("private/paper-cards.jsonl"))
         self.assertEqual(kwargs["answer_audit_path"], Path("private/answer-audit.sqlite3"))
         self.assertEqual(kwargs["sections_path"], Path("private/sections.jsonl"))
         self.assertEqual(kwargs["elements_path"], Path("private/elements.jsonl"))
@@ -477,6 +487,24 @@ class RAGRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["policy"].max_tool_calls, 12)
         self.assertEqual(kwargs["policy"].timeout_seconds, 45)
         self.assertEqual(kwargs["mode"], "auto")
+
+    async def test_enable_agent_forwards_paper_candidate_retriever(self) -> None:
+        runtime, _, _ = _runtime()
+        attached = FakeResearchAgent(_chunk())
+        with patch(
+            "paper_research_agent.agent.factory.create_research_agent_runtime",
+            new=AsyncMock(return_value=attached),
+        ) as create:
+            await runtime.enable_research_agent(
+                model_id="qwen-test",
+                checkpoint_path=Path("agent.sqlite3"),
+                policy={"max_steps": 2, "max_tool_calls": 4},
+            )
+
+        self.assertIs(
+            create.await_args.kwargs["paper_candidate_retriever"],
+            runtime._paper_candidate_retriever,
+        )
 
     async def test_reuses_dependencies_and_returns_only_safe_trace(self) -> None:
         runtime, retriever, generator = _runtime()

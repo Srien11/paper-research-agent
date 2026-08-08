@@ -1,4 +1,4 @@
-"""Unified dispatch, timeout, approval, and audit boundary for 19 research tools."""
+"""Unified dispatch, timeout, approval, and audit boundary for 18 research tools."""
 
 from __future__ import annotations
 
@@ -26,7 +26,6 @@ from paper_research_agent.agent.tooling.contracts import (
     CalculateInput,
     ChunkIdsInput,
     CitationGraphInput,
-    ComparePapersInput,
     CorpusInput,
     ElementLookupInput,
     ExportResearchReportInput,
@@ -164,8 +163,6 @@ class ExtendedResearchToolkit:
             return self.local.trace_evidence_source(ChunkIdsInput.model_validate(request))
         if name == "get_paper_outline":
             return self.local.get_paper_outline(CorpusInput.model_validate(request))
-        if name == "compare_papers":
-            return self.local.compare_papers(ComparePapersInput.model_validate(request))
         if name == "search_scholarly_sources":
             return await self.scholarly.search_scholarly_sources(
                 ScholarlySearchInput.model_validate(request)

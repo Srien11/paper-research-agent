@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import re
 from typing import Literal
 
 from pydantic import Field
 
+from paper_research_agent.agent.intent import requires_research_planning
 from paper_research_agent.agent.orchestrator.models import (
     AgentContextEnvelope,
     AgentTask,
@@ -24,6 +26,9 @@ class RouteDecision(FrozenModel):
     capability: Capability
     reason: str = Field(min_length=1, max_length=200)
     requires_approval: bool = False
+
+
+_LOCAL_CORPUS_ID = re.compile(r"\b[CT]\d{3}\b", re.IGNORECASE)
 
 
 def select_next_task(workspace: ConversationWorkspace) -> TaskSelection:
@@ -82,5 +87,15 @@ def route_task(
     if capability == "dynamic_tools":
         if rag_mode == "required":
             return RouteDecision(capability="local_rag", reason="required 模式禁止外部动态研究")
+        corpus_ids = {item.upper() for item in _LOCAL_CORPUS_ID.findall(task.objective)}
+        if (
+            rag_mode != "disabled"
+            and len(corpus_ids) >= 2
+            and requires_research_planning(task.objective)
+        ):
+            return RouteDecision(
+                capability="local_rag",
+                reason="本地多论文比较由固定检索图执行",
+            )
         return RouteDecision(capability="dynamic_tools", reason="需要最新信息或非论文工具")
     return RouteDecision(capability="direct_chat", reason="任务不需要外部事实")

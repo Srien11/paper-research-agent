@@ -42,20 +42,6 @@ class CorpusInput(ToolInput):
     corpus_id: str = Field(pattern=r"^[CT]\d{3}$")
 
 
-class ComparePapersInput(ToolInput):
-    corpus_ids: tuple[str, ...] = Field(min_length=2, max_length=5)
-    dimensions: tuple[str, ...] = Field(min_length=1, max_length=6)
-    evidence_per_dimension: int = Field(default=3, ge=1, le=3)
-
-    @field_validator("dimensions")
-    @classmethod
-    def normalize_dimensions(cls, values: tuple[str, ...]) -> tuple[str, ...]:
-        normalized = tuple(value.strip() for value in values)
-        if any(not value or len(value) > 100 for value in normalized):
-            raise ValueError("comparison dimensions are invalid")
-        return normalized
-
-
 class ScholarlySearchInput(ToolInput):
     query: str = Field(min_length=1, max_length=500)
     limit: int = Field(default=10, ge=1, le=20)
@@ -184,7 +170,6 @@ TOOL_INPUT_SCHEMAS: dict[str, type[ToolInput]] = {
     "get_paper_metadata": PaperMetadataInput,
     "trace_evidence_source": ChunkIdsInput,
     "get_paper_outline": CorpusInput,
-    "compare_papers": ComparePapersInput,
     "search_scholarly_sources": ScholarlySearchInput,
     "resolve_paper_identifier": IdentifierInput,
     "get_citation_graph": CitationGraphInput,

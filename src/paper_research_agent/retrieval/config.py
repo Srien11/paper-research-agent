@@ -87,13 +87,13 @@ class BilingualRetrievalConfig(FrozenConfig):
     schema_version: Literal["bilingual-retrieval-v1"] = "bilingual-retrieval-v1"
     pipeline_id: str = Field(default="zh-en-two-level-rrf-v1", min_length=1)
     rewrite_model: str = Field(default="qwen3.7-plus-2026-05-26", min_length=1)
-    rewrite_prompt_version: Literal["query-rewrite-v2"] = "query-rewrite-v2"
+    rewrite_prompt_version: Literal["query-rewrite-v3"] = "query-rewrite-v3"
     rewrite_timeout_seconds: float = Field(default=2.0, gt=0, le=30)
     rewrite_cache_fresh_days: int = Field(default=90, gt=0)
     rewrite_cache_stale_days: int = Field(default=365, gt=0)
     audit_plaintext_days: int = Field(default=30, ge=0)
     route_rrf_k: int = Field(default=60, gt=0)
-    cache_path: Path = Path("data/runtime/query-rewrite-v2.sqlite3")
+    cache_path: Path = Path("data/runtime/query-rewrite-v3.sqlite3")
     audit_path: Path = Path("data/runtime/query-audit-v1.sqlite3")
 
     @field_validator("cache_path", "audit_path")

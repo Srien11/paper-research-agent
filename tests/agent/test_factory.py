@@ -45,6 +45,8 @@ class ResearchAgentFactoryTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(RuntimeError, "credentials"):
                 await create_research_agent_runtime(
                     retriever=Mock(),
+                    paper_candidate_retriever=AsyncMock(),
+                    paper_candidate_query_resolver=AsyncMock(),
                     chunks=(_chunk(),),
                     storage_classes={"C001": "internal_research_only"},
                     model_id="qwen-test-2026-01-01",
@@ -65,6 +67,8 @@ class ResearchAgentFactoryTests(unittest.IsolatedAsyncioTestCase):
             ) as chat_open_ai:
                 runtime = await create_research_agent_runtime(
                     retriever=Mock(),
+                    paper_candidate_retriever=AsyncMock(),
+                    paper_candidate_query_resolver=AsyncMock(),
                     chunks=(_chunk(),),
                     storage_classes={"C001": "internal_research_only"},
                     model_id="qwen-test-2026-01-01",
@@ -81,7 +85,12 @@ class ResearchAgentFactoryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(model.with_structured_output.call_count, 4)
             self.assertEqual(
                 [call.args[0] for call in model.with_structured_output.call_args_list],
-                [ResearchPlan, EvidenceAssessment, ToolDecision, MemoryProposal],
+                [
+                    ResearchPlan,
+                    EvidenceAssessment,
+                    ToolDecision,
+                    MemoryProposal,
+                ],
             )
             self.assertEqual(runtime.policy.max_steps, 2)
             self.assertTrue(runtime.extended_tools_enabled)
@@ -133,6 +142,8 @@ class ResearchAgentFactoryTests(unittest.IsolatedAsyncioTestCase):
             ):
                 runtime = await create_research_agent_runtime(
                     retriever=retriever,
+                    paper_candidate_retriever=AsyncMock(),
+                    paper_candidate_query_resolver=AsyncMock(),
                     chunks=(chunk,),
                     storage_classes={"C001": "internal_research_only"},
                     model_id="qwen-test-2026-01-01",
@@ -184,8 +195,12 @@ class FakeRetriever:
         *,
         top_k: int | None = None,
         privacy_ttl_days: int | None = None,
+        filters=None,
+        candidate_k: int | None = None,
+        recall_k: int | None = None,
+        rerank: bool = True,
     ) -> BilingualRetrievalRun:
-        del privacy_ttl_days
+        del privacy_ttl_days, filters, candidate_k, recall_k, rerank
         return BilingualRetrievalRun(
             pipeline_id="test-pipeline",
             original_query=query,

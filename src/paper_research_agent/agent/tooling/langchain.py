@@ -1,4 +1,4 @@
-"""LangChain adapters exposing the exact 19-tool extended registry."""
+"""LangChain adapters exposing the exact 18-tool extended registry."""
 
 from __future__ import annotations
 

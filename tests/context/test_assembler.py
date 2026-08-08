@@ -22,11 +22,17 @@ from paper_research_agent.context.models import (
 )
 
 
-def evidence(chunk_id: str, text: str, rank: int) -> ContextEvidence:
+def evidence(
+    chunk_id: str,
+    text: str,
+    rank: int,
+    *,
+    corpus_id: str = "C001",
+) -> ContextEvidence:
     return ContextEvidence(
         chunk_id=chunk_id,
-        corpus_id="C001",
-        asset_id="asset-1",
+        corpus_id=corpus_id,
+        asset_id=f"asset-{corpus_id}",
         page_start=rank,
         page_end=rank,
         text=text,
@@ -52,6 +58,131 @@ class ContextAssemblerTests(unittest.TestCase):
         self.assertIn("COMPARISON SYNTHESIS POLICY", system)
         self.assertIn("target-by-dimension", system)
         self.assertIn("Do not infer an uncovered cell", system)
+
+    def test_comparison_budget_preserves_evidence_from_each_target_corpus(self) -> None:
+        task_state = json.dumps(
+            {
+                "plan": {
+                    "task_type": "comparison",
+                    "targets": [
+                        {"target_id": "a", "label": "Paper A", "corpus_id": "C001"},
+                        {"target_id": "b", "label": "Paper B", "corpus_id": "C002"},
+                    ],
+                }
+            },
+            separators=(",", ":"),
+        )
+        first_a = evidence("a-1", "A" * 240, 1, corpus_id="C001")
+        second_a = evidence("a-2", "B" * 240, 2, corpus_id="C001")
+        first_b = evidence("b-1", "C" * 240, 3, corpus_id="C002")
+        estimator = len
+        two_target_context = assemble_context(
+            ContextRequest(
+                system_rules="Use citations.",
+                user_question="Compare Paper A and Paper B",
+                task_state=task_state,
+                evidence=(first_a, first_b),
+                token_budget=10000,
+            ),
+            estimator=estimator,
+        )
+
+        constrained = assemble_context(
+            ContextRequest(
+                system_rules="Use citations.",
+                user_question="Compare Paper A and Paper B",
+                task_state=task_state,
+                evidence=(first_a, second_a, first_b),
+                token_budget=two_target_context.estimated_tokens,
+            ),
+            estimator=estimator,
+        )
+
+        self.assertEqual(
+            {citation.corpus_id for citation in constrained.citations},
+            {"C001", "C002"},
+        )
+
+    def test_comparison_round_robins_covered_requirements_across_targets(self) -> None:
+        task_state = json.dumps(
+            {
+                "plan": {
+                    "task_type": "comparison",
+                    "targets": [
+                        {"target_id": "a", "label": "Paper A", "corpus_id": "C001"},
+                        {"target_id": "b", "label": "Paper B", "corpus_id": "C002"},
+                    ],
+                    "requirements": [
+                        {
+                            "requirement_id": "a-method",
+                            "target_id": "a",
+                            "dimension_id": "method",
+                        },
+                        {
+                            "requirement_id": "a-metric",
+                            "target_id": "a",
+                            "dimension_id": "metric",
+                        },
+                        {
+                            "requirement_id": "b-method",
+                            "target_id": "b",
+                            "dimension_id": "method",
+                        },
+                        {
+                            "requirement_id": "b-metric",
+                            "target_id": "b",
+                            "dimension_id": "metric",
+                        },
+                    ],
+                },
+                "assessments": [
+                    {
+                        "coverage": [
+                            {
+                                "requirement_id": "a-method",
+                                "covered": True,
+                                "chunk_ids": ["a-method"],
+                            },
+                            {
+                                "requirement_id": "a-metric",
+                                "covered": True,
+                                "chunk_ids": ["a-metric"],
+                            },
+                            {
+                                "requirement_id": "b-method",
+                                "covered": True,
+                                "chunk_ids": ["b-method"],
+                            },
+                            {
+                                "requirement_id": "b-metric",
+                                "covered": True,
+                                "chunk_ids": ["b-metric"],
+                            },
+                        ]
+                    }
+                ],
+            },
+            separators=(",", ":"),
+        )
+        context = assemble_context(
+            ContextRequest(
+                system_rules="Use citations.",
+                user_question="Compare Paper A and Paper B",
+                task_state=task_state,
+                evidence=(
+                    evidence("a-metric", "A metric", 1, corpus_id="C001"),
+                    evidence("a-method", "A method", 2, corpus_id="C001"),
+                    evidence("b-metric", "B metric", 3, corpus_id="C002"),
+                    evidence("b-method", "B method", 4, corpus_id="C002"),
+                ),
+                token_budget=10000,
+            )
+        )
+
+        self.assertEqual(
+            [citation.chunk_id for citation in context.citations],
+            ["a-method", "b-method", "a-metric", "b-metric"],
+        )
 
     def test_partial_answer_policy_is_a_trusted_opt_in(self) -> None:
         default_context = assemble_context(

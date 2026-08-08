@@ -37,6 +37,26 @@ def _hit(*, rank: int = 1) -> SearchCorpusHit:
 
 
 class ResearchToolModelTests(unittest.TestCase):
+    def test_scoped_search_result_rejects_cross_corpus_hits(self) -> None:
+        hit = SearchCorpusHit(
+            chunk_id="chunk-1",
+            corpus_id="T001",
+            page_start=1,
+            page_end=1,
+            text_sha256="a" * 64,
+            storage_class="redistributable",
+            final_rank=1,
+        )
+
+        with self.assertRaisesRegex(ValueError, "corpus scope"):
+            SearchCorpusResult(
+                query="method",
+                corpus_id="C001",
+                index_id="idx",
+                degraded=False,
+                hits=(hit,),
+            )
+
     def test_search_input_normalizes_query_and_bounds_top_k(self) -> None:
         request = SearchCorpusInput(query="  grounded RAG  ", top_k=3)
 
@@ -124,8 +144,8 @@ class ResearchToolModelTests(unittest.TestCase):
 
     def test_comparison_plan_requires_complete_target_dimension_grid(self) -> None:
         targets = (
-            ResearchTarget(target_id="ragas", label="RAGAS"),
-            ResearchTarget(target_id="ares", label="ARES"),
+            ResearchTarget(target_id="ragas", label="RAGAS", corpus_id="C001"),
+            ResearchTarget(target_id="ares", label="ARES", corpus_id="T001"),
         )
         dimensions = (
             ResearchDimension(dimension_id="method", label="评测方法"),
@@ -149,18 +169,36 @@ class ResearchToolModelTests(unittest.TestCase):
             requirements=requirements,
             steps=(
                 ResearchStep(
-                    step_id="ragas",
-                    objective="检索 RAGAS",
-                    query="RAGAS evaluation method metrics",
+                    step_id="ragas-method",
+                    objective="检索 RAGAS 方法",
+                    query="RAGAS evaluation method",
+                    corpus_id="C001",
                     target_ids=("ragas",),
-                    dimension_ids=("method", "metrics"),
+                    dimension_ids=("method",),
                 ),
                 ResearchStep(
-                    step_id="ares",
-                    objective="检索 ARES",
-                    query="ARES evaluation method metrics",
+                    step_id="ragas-metrics",
+                    objective="检索 RAGAS 指标",
+                    query="RAGAS evaluation metrics",
+                    corpus_id="C001",
+                    target_ids=("ragas",),
+                    dimension_ids=("metrics",),
+                ),
+                ResearchStep(
+                    step_id="ares-method",
+                    objective="检索 ARES 方法",
+                    query="ARES evaluation method",
+                    corpus_id="T001",
                     target_ids=("ares",),
-                    dimension_ids=("method", "metrics"),
+                    dimension_ids=("method",),
+                ),
+                ResearchStep(
+                    step_id="ares-metrics",
+                    objective="检索 ARES 指标",
+                    query="ARES evaluation metrics",
+                    corpus_id="T001",
+                    target_ids=("ares",),
+                    dimension_ids=("metrics",),
                 ),
             ),
         )
@@ -175,13 +213,55 @@ class ResearchToolModelTests(unittest.TestCase):
                 steps=plan.steps,
             )
 
+    def test_comparison_plan_rejects_one_query_for_multiple_dimensions(self) -> None:
+        with self.assertRaisesRegex(ValidationError, "one target and one dimension"):
+            ResearchPlan(
+                task_type="comparison",
+                targets=(
+                    ResearchTarget(target_id="a", label="A", corpus_id="C001"),
+                    ResearchTarget(target_id="b", label="B", corpus_id="T001"),
+                ),
+                dimensions=(
+                    ResearchDimension(dimension_id="method", label="方法"),
+                    ResearchDimension(dimension_id="metric", label="指标"),
+                ),
+                requirements=tuple(
+                    EvidenceRequirement(
+                        requirement_id=f"{target}-{dimension}",
+                        target_id=target,
+                        dimension_id=dimension,
+                        description=f"{target} {dimension}",
+                    )
+                    for target in ("a", "b")
+                    for dimension in ("method", "metric")
+                ),
+                steps=(
+                    ResearchStep(
+                        step_id="a-all",
+                        objective="A all",
+                        query="A method metric",
+                        corpus_id="C001",
+                        target_ids=("a",),
+                        dimension_ids=("method", "metric"),
+                    ),
+                    ResearchStep(
+                        step_id="b-all",
+                        objective="B all",
+                        query="B method metric",
+                        corpus_id="T001",
+                        target_ids=("b",),
+                        dimension_ids=("method", "metric"),
+                    ),
+                ),
+            )
+
     def test_comparison_plan_rejects_unplanned_requirement_cells(self) -> None:
         with self.assertRaisesRegex(ValidationError, "research steps do not cover"):
             ResearchPlan(
                 task_type="comparison",
                 targets=(
-                    ResearchTarget(target_id="a", label="A"),
-                    ResearchTarget(target_id="b", label="B"),
+                    ResearchTarget(target_id="a", label="A", corpus_id="C001"),
+                    ResearchTarget(target_id="b", label="B", corpus_id="T001"),
                 ),
                 dimensions=(ResearchDimension(dimension_id="method", label="方法"),),
                 requirements=(
@@ -203,6 +283,7 @@ class ResearchToolModelTests(unittest.TestCase):
                         step_id="a",
                         objective="检索 A",
                         query="A method",
+                        corpus_id="C001",
                         target_ids=("a",),
                         dimension_ids=("method",),
                     ),

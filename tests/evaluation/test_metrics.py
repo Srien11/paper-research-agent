@@ -8,7 +8,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from paper_research_agent.evaluation.metrics import (
+    candidate_paper_recall,
     evidence_hit_at_k,
+    explicit_corpus_id_accuracy,
     ndcg_at_k,
     recall_at_k,
     reciprocal_rank,
@@ -26,3 +28,22 @@ class MetricTests(unittest.TestCase):
 
     def test_ndcg_counts_each_relevant_document_once(self) -> None:
         self.assertEqual(ndcg_at_k(["C001", "C001"], {"C001"}, 2), 1.0)
+
+    def test_candidate_paper_recall_is_independent_of_chunk_recall(self) -> None:
+        self.assertEqual(
+            candidate_paper_recall(["C001", "T999", "C001"], {"C001", "T001"}),
+            0.5,
+        )
+        self.assertIsNone(candidate_paper_recall(["C001"], set()))
+
+    def test_explicit_corpus_id_accuracy_is_exact_and_ordered(self) -> None:
+        self.assertEqual(
+            explicit_corpus_id_accuracy(
+                [("C001", "T001"), ("C001",)],
+                [("C001", "T001"), ("T001",)],
+            ),
+            0.5,
+        )
+        self.assertIsNone(explicit_corpus_id_accuracy([], []))
+        with self.assertRaisesRegex(ValueError, "counts differ"):
+            explicit_corpus_id_accuracy([("C001",)], [])

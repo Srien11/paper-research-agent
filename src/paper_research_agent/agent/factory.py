@@ -18,7 +18,11 @@ from paper_research_agent.agent.observability import (
     AgentEventSink,
     SQLiteAgentEventLogger,
 )
-from paper_research_agent.agent.planner import LangChainResearchPlanner
+from paper_research_agent.agent.planner import (
+    ComparisonQueryResolver,
+    LangChainComparisonTargetResolver,
+    LangChainResearchPlanner,
+)
 from paper_research_agent.agent.policy import ResearchRuntimePolicy
 from paper_research_agent.agent.reasoner import LangChainEvidenceReasoner
 from paper_research_agent.agent.runtime import ResearchAgentRuntime
@@ -26,6 +30,7 @@ from paper_research_agent.agent.service import AsyncResearchRetriever, ResearchT
 from paper_research_agent.chunking.models import EvidenceChunk
 from paper_research_agent.ingestion.models import DocumentElement, SectionRecord
 from paper_research_agent.models import FrozenPaper
+from paper_research_agent.retrieval.papers import AsyncPaperCandidateRetriever
 from paper_research_agent.retrieval.query_rewrite import (
     DEFAULT_API_KEY_ENV,
     DEFAULT_BASE_URL,
@@ -36,6 +41,8 @@ from paper_research_agent.retrieval.query_rewrite import (
 async def create_research_agent_runtime(
     *,
     retriever: AsyncResearchRetriever,
+    paper_candidate_retriever: AsyncPaperCandidateRetriever,
+    paper_candidate_query_resolver: ComparisonQueryResolver,
     chunks: Sequence[EvidenceChunk],
     storage_classes: Mapping[str, StorageClass],
     model_id: str,
@@ -83,7 +90,17 @@ async def create_research_agent_runtime(
             max_retries=2,
             extra_body={"enable_thinking": False},
         )
-        planner = LangChainResearchPlanner(model)
+        corpus_catalog = {paper.corpus_id: paper.title for paper in papers}
+        target_resolver = LangChainComparisonTargetResolver(
+            candidate_retriever=paper_candidate_retriever,
+            query_resolver=paper_candidate_query_resolver,
+            corpus_catalog=corpus_catalog,
+        )
+        planner = LangChainResearchPlanner(
+            model,
+            corpus_catalog=corpus_catalog,
+            target_resolver=target_resolver,
+        )
         reasoner = LangChainEvidenceReasoner(model)
         service = ResearchToolService(
             retriever=retriever,

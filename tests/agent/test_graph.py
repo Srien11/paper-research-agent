@@ -117,8 +117,8 @@ class ResearchGraphTests(unittest.IsolatedAsyncioTestCase):
             ResearchPlan(
                 task_type="comparison",
                 targets=(
-                    ResearchTarget(target_id="a", label="Paper A"),
-                    ResearchTarget(target_id="b", label="Paper B"),
+                    ResearchTarget(target_id="a", label="Paper A", corpus_id="C001"),
+                    ResearchTarget(target_id="b", label="Paper B", corpus_id="T001"),
                 ),
                 dimensions=(ResearchDimension(dimension_id="method", label="Method"),),
                 requirements=(
@@ -139,16 +139,18 @@ class ResearchGraphTests(unittest.IsolatedAsyncioTestCase):
                     ResearchStep(
                         step_id="a",
                         objective="Find A",
-                        query="Paper A method",
+                        query="shared method query",
                         top_k=1,
+                        corpus_id="C001",
                         target_ids=("a",),
                         dimension_ids=("method",),
                     ),
                     ResearchStep(
                         step_id="b",
                         objective="Find B",
-                        query="Paper B method",
+                        query="shared method query",
                         top_k=1,
+                        corpus_id="T001",
                         target_ids=("b",),
                         dimension_ids=("method",),
                     ),
@@ -185,13 +187,15 @@ class ResearchGraphTests(unittest.IsolatedAsyncioTestCase):
         service = AsyncMock()
         service.search_corpus.side_effect = (
             SearchCorpusResult(
-                query="Paper A method",
+                query="shared method query",
+                corpus_id="C001",
                 index_id="idx-test",
                 degraded=False,
                 hits=(_hit("chunk-1", "C001", 1),),
             ),
             SearchCorpusResult(
-                query="Paper B method",
+                query="shared method query",
+                corpus_id="T001",
                 index_id="idx-test",
                 degraded=False,
                 hits=(_hit("chunk-2", "T001", 1),),
@@ -212,10 +216,18 @@ class ResearchGraphTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             [item["search"]["query"] for item in state["observations"]],
-            ["Paper A method", "Paper B method"],
+            ["shared method query", "shared method query"],
         )
         self.assertEqual(state["replan_count"], 0)
         self.assertTrue(state["evidence_sufficient"])
+        self.assertEqual(
+            [call.args[0].corpus_id for call in service.search_corpus.await_args_list],
+            ["C001", "T001"],
+        )
+        self.assertEqual(
+            [call.args[0].top_k for call in service.search_corpus.await_args_list],
+            [20, 20],
+        )
 
     async def test_stops_early_when_first_observation_is_sufficient(self) -> None:
         planner = FakePlanner(

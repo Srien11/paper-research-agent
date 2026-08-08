@@ -150,7 +150,7 @@ def rewrite_cache_key(query: str, *, model: str, prompt_version: str) -> str:
         "temperature": 0.1,
         "top_p": 0.7,
         "enable_thinking": False,
-        "max_tokens": 128,
+        "max_tokens": 512,
         "query": normalize_query(query),
     }
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))

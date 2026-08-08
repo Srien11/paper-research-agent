@@ -133,6 +133,21 @@ class ChildGraphDispatcherTests(unittest.TestCase):
         self.assertEqual(result.citation_kind, "local_paper")
         self.assertEqual(result.source_ids, ())
 
+    def test_single_paper_local_question_does_not_force_comparison_plan(self) -> None:
+        fake = _FakeLocalExecutor(_FakeLocalResult(sufficient=True))
+        dispatcher = ChildGraphDispatcher(local_rag=fake)
+
+        asyncio.run(
+            dispatcher.dispatch(
+                _request(
+                    capability="local_rag",
+                    objective="总结 C001 的主要方法",
+                )
+            )
+        )
+
+        self.assertFalse(fake.calls[0][2])
+
     def test_dynamic_receives_goal_criteria_and_constraints(self) -> None:
         result = DynamicResearchResult(
             run_id="a" * 32,

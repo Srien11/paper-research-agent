@@ -12,8 +12,10 @@ from paper_research_agent.agent.tooling.contracts import TOOL_INPUT_SCHEMAS
 
 
 class ToolCatalogTests(unittest.TestCase):
-    def test_catalog_contains_exactly_nineteen_strict_tools(self) -> None:
-        self.assertEqual(len(EXTENDED_TOOL_NAMES), 19)
+    def test_catalog_contains_exactly_eighteen_strict_tools(self) -> None:
+        self.assertEqual(len(EXTENDED_TOOL_NAMES), 18)
+        self.assertNotIn("compare_papers", EXTENDED_TOOL_NAMES)
+        self.assertNotIn("compare_papers", TOOL_INPUT_SCHEMAS)
         self.assertEqual(set(TOOL_INPUT_SCHEMAS), set(EXTENDED_TOOL_NAMES))
         self.assertEqual(set(TOOL_SPEC_BY_NAME), set(EXTENDED_TOOL_NAMES))
         self.assertEqual(

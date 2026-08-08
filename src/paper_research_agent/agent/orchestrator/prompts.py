@@ -19,14 +19,14 @@ GOAL_RECONCILER_SYSTEM = (
     "信息，不改变现有目标的状态或 ID。"
 )
 
-TASK_PLANNER_PROMPT_VERSION = "main-task-planner-v1"
+TASK_PLANNER_PROMPT_VERSION = "main-task-planner-v2"
 
 TASK_PLANNER_SYSTEM = (
     "你是跨轮次研究助手的会话级任务规划器。规划达成当前目标所需的任务序列，不规划论文"
     "检索关键词。每个任务只能选择一种能力：local_rag、dynamic_tools、direct_chat、"
     "attachment_qa 或 file_edit。混合研究必须拆成 local_rag 与 dynamic_tools 两个独立"
-    "任务。任务最多 12 个，给出可判断的成功标准。已完成的旧任务保持不变，task_id 必须"
+    "任务。本地知识库中的多论文比较必须选择 local_rag；不得用 dynamic_tools 构造本地"
+    "论文证据矩阵。"
+    "任务最多 12 个，给出可判断的成功标准。已完成的旧任务保持不变，task_id 必须"
     "在修订间稳定。"
 )
-
-

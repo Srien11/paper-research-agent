@@ -26,6 +26,10 @@ class AsyncResearchRetriever(Protocol):
         *,
         top_k: int | None = None,
         privacy_ttl_days: int | None = None,
+        filters: Mapping[str, str] | None = None,
+        candidate_k: int | None = None,
+        recall_k: int | None = None,
+        rerank: bool = True,
     ) -> BilingualRetrievalRun: ...
 
 
@@ -58,7 +62,15 @@ class ResearchToolService:
 
     async def search_corpus(self, request: SearchCorpusInput) -> SearchCorpusResult:
         """Search the existing bilingual index and validate every hit against source chunks."""
-        run = await self._retriever.search(request.query, top_k=request.top_k)
+        if request.corpus_id is None:
+            run = await self._retriever.search(request.query, top_k=request.top_k)
+        else:
+            run = await self._retriever.search(
+                request.query,
+                top_k=request.top_k,
+                filters={"corpus_id": request.corpus_id},
+                candidate_k=max(50, request.top_k),
+            )
         evidence = join_retrieval_evidence(run, self._chunks)
         hits: list[SearchCorpusHit] = []
         for item in evidence:
@@ -79,6 +91,7 @@ class ResearchToolService:
             )
         return SearchCorpusResult(
             query=request.query,
+            corpus_id=request.corpus_id,
             index_id=run.index_id,
             degraded=run.degraded,
             degraded_reason=run.degraded_reason,

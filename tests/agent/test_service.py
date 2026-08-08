@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import unittest
+from collections.abc import Mapping
 
 from paper_research_agent.agent.models import GetEvidenceInput, SearchCorpusInput
 from paper_research_agent.agent.service import ResearchToolService
@@ -38,7 +39,17 @@ def _chunk(chunk_id: str, corpus_id: str, text: str, page: int) -> EvidenceChunk
 class FakeRetriever:
     def __init__(self, chunks: tuple[EvidenceChunk, ...]):
         self.chunks = chunks
-        self.calls: list[tuple[str, int | None, int | None]] = []
+        self.calls: list[
+            tuple[
+                str,
+                int | None,
+                int | None,
+                Mapping[str, str] | None,
+                int | None,
+                int | None,
+                bool,
+            ]
+        ] = []
         self.tamper_hash = False
 
     async def search(
@@ -47,9 +58,21 @@ class FakeRetriever:
         *,
         top_k: int | None = None,
         privacy_ttl_days: int | None = None,
+        filters: Mapping[str, str] | None = None,
+        candidate_k: int | None = None,
+        recall_k: int | None = None,
+        rerank: bool = True,
     ) -> BilingualRetrievalRun:
-        self.calls.append((query, top_k, privacy_ttl_days))
-        selected = self.chunks[: top_k or len(self.chunks)]
+        self.calls.append(
+            (query, top_k, privacy_ttl_days, filters, candidate_k, recall_k, rerank)
+        )
+        candidates = tuple(
+            chunk
+            for chunk in self.chunks
+            if filters is None
+            or all(getattr(chunk, key, None) == value for key, value in filters.items())
+        )
+        selected = candidates[: top_k or len(candidates)]
         hits = tuple(
             SearchHit(
                 chunk_id=chunk.chunk_id,
@@ -113,11 +136,26 @@ class ResearchToolServiceTests(unittest.IsolatedAsyncioTestCase):
             SearchCorpusInput(query="  evidence grounding  ", top_k=2)
         )
 
-        self.assertEqual(self.retriever.calls, [("evidence grounding", 2, None)])
+        self.assertEqual(
+            self.retriever.calls,
+            [("evidence grounding", 2, None, None, None, None, True)],
+        )
         self.assertEqual([hit.chunk_id for hit in result.hits], ["chunk-1", "chunk-2"])
         self.assertEqual(result.hits[0].storage_class, "internal_research_only")
         self.assertEqual(result.hits[1].storage_class, "redistributable")
         self.assertEqual(result.index_id, "idx-test")
+
+    async def test_search_scopes_hybrid_retrieval_to_one_corpus(self) -> None:
+        result = await self.service.search_corpus(
+            SearchCorpusInput(query="method", top_k=2, corpus_id="T001")
+        )
+
+        self.assertEqual(
+            self.retriever.calls,
+            [("method", 2, None, {"corpus_id": "T001"}, 50, None, True)],
+        )
+        self.assertEqual(result.corpus_id, "T001")
+        self.assertEqual([hit.corpus_id for hit in result.hits], ["T001"])
 
     async def test_get_evidence_preserves_request_order_and_reports_missing(self) -> None:
         result = await self.service.get_evidence(

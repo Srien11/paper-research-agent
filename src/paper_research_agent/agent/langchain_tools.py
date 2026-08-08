@@ -17,10 +17,16 @@ def build_langchain_tools(
     service: ResearchToolService,
     extended: ExtendedResearchToolkit | None = None,
 ) -> tuple[BaseTool, ...]:
-    """Return the core RAG pair and, when configured, the 19 extended tools."""
+    """Return the core RAG pair and, when configured, the 18 extended tools."""
 
-    async def search_corpus(query: str, top_k: int = 10) -> dict[str, Any]:
-        result = await service.search_corpus(SearchCorpusInput(query=query, top_k=top_k))
+    async def search_corpus(
+        query: str,
+        top_k: int = 10,
+        corpus_id: str | None = None,
+    ) -> dict[str, Any]:
+        result = await service.search_corpus(
+            SearchCorpusInput(query=query, top_k=top_k, corpus_id=corpus_id)
+        )
         return result.model_dump(mode="json")
 
     async def get_evidence(chunk_ids: tuple[str, ...]) -> dict[str, Any]:

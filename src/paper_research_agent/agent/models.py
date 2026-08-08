@@ -55,6 +55,7 @@ class SearchCorpusInput(FrozenContract):
 
     query: str = Field(min_length=1, max_length=2000)
     top_k: int = Field(default=10, ge=1, le=20)
+    corpus_id: str | None = Field(default=None, pattern=r"^[CT]\d{3}$")
 
     @field_validator("query")
     @classmethod
@@ -90,6 +91,7 @@ class SearchCorpusResult(FrozenContract):
 
     schema_version: Literal["research-search-tool-v1"] = "research-search-tool-v1"
     query: str = Field(min_length=1)
+    corpus_id: str | None = Field(default=None, pattern=r"^[CT]\d{3}$")
     index_id: str = Field(min_length=1)
     degraded: bool
     degraded_reason: str | None = None
@@ -105,6 +107,10 @@ class SearchCorpusResult(FrozenContract):
         chunk_ids = [hit.chunk_id for hit in self.hits]
         if len(chunk_ids) != len(set(chunk_ids)):
             raise ValueError("search result chunk IDs must be unique")
+        if self.corpus_id is not None and any(
+            hit.corpus_id != self.corpus_id for hit in self.hits
+        ):
+            raise ValueError("search result contains a hit outside the declared corpus scope")
         return self
 
 
@@ -170,6 +176,7 @@ class ResearchTarget(FrozenContract):
 
     target_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
     label: str = Field(min_length=1, max_length=200)
+    corpus_id: str | None = Field(default=None, pattern=r"^[CT]\d{3}$")
 
     @field_validator("label")
     @classmethod
@@ -245,6 +252,7 @@ class ResearchStep(FrozenContract):
     objective: str = Field(min_length=1, max_length=500)
     query: str = Field(min_length=1, max_length=2000)
     top_k: int = Field(default=10, ge=1, le=20)
+    corpus_id: str | None = Field(default=None, pattern=r"^[CT]\d{3}$")
     target_ids: tuple[str, ...] = Field(default=(), max_length=4)
     dimension_ids: tuple[str, ...] = Field(default=(), max_length=5)
 
@@ -299,6 +307,11 @@ class ResearchPlan(FrozenContract):
             return self
         if len(self.targets) < 2:
             raise ValueError("comparison research plan requires at least two targets")
+        if any(target.corpus_id is None for target in self.targets):
+            raise ValueError("comparison research targets require resolved corpus IDs")
+        corpus_ids = [target.corpus_id for target in self.targets]
+        if len(corpus_ids) != len(set(corpus_ids)):
+            raise ValueError("comparison research targets must use distinct corpus IDs")
         if not self.dimensions:
             raise ValueError("comparison research plan requires at least one dimension")
         known_targets = set(target_ids)
@@ -317,13 +330,20 @@ class ResearchPlan(FrozenContract):
         if actual_pairs != required_pairs or len(self.requirements) != len(required_pairs):
             raise ValueError("comparison requirements must form a complete target-dimension grid")
         if any(
-            not step.target_ids
-            or not step.dimension_ids
+            len(step.target_ids) != 1
+            or len(step.dimension_ids) != 1
             or not set(step.target_ids) <= known_targets
             or not set(step.dimension_ids) <= known_dimensions
             for step in self.steps
         ):
-            raise ValueError("comparison research step references are missing or unknown")
+            raise ValueError(
+                "comparison research steps require one target and one dimension"
+            )
+        target_corpus_ids = {target.target_id: target.corpus_id for target in self.targets}
+        for step in self.steps:
+            expected_corpus_id = target_corpus_ids[step.target_ids[0]]
+            if step.corpus_id != expected_corpus_id:
+                raise ValueError("comparison research step corpus scope does not match its target")
         planned_pairs = {
             (target_id, dimension_id)
             for step in self.steps

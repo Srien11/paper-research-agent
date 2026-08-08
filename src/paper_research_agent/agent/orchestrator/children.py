@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Protocol
 
+from paper_research_agent.agent.intent import requires_research_planning
 from paper_research_agent.agent.orchestrator.models import ChildTaskRequest, ChildTaskResult
 
 if TYPE_CHECKING:
@@ -64,7 +65,7 @@ class ChildGraphDispatcher:
         result = await self.local_rag.run(
             request.objective,
             thread_id=_child_thread_id("research", request),
-            planning_required=True,
+            planning_required=requires_research_planning(request.objective),
         )
         return ChildTaskResult(
             child_run_id=result.run_id,

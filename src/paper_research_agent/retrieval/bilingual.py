@@ -38,7 +38,8 @@ from paper_research_agent.retrieval.query_store import (
     SQLiteQueryAuditLogger,
     rewrite_cache_key,
 )
-from paper_research_agent.retrieval.rerank import Reranker, rerank
+from paper_research_agent.retrieval.rerank import Reranker
+from paper_research_agent.retrieval.rerank import rerank as rerank_candidates
 from paper_research_agent.retrieval.rights import CorpusRightsMap
 from paper_research_agent.retrieval.vector import SearchableVectorIndex
 
@@ -107,6 +108,26 @@ class BilingualRetrievalService:
         self._rewrite_flights: dict[str, asyncio.Task[RewriteResolution]] = {}
         self._closed = False
 
+    async def resolve_query(
+        self,
+        query: str,
+        *,
+        privacy_ttl_days: int | None = None,
+    ) -> QueryRewriteTrace:
+        """Return the cached English retrieval view without running chunk recall."""
+        original_query = query.strip()
+        if self._closed:
+            raise RuntimeError("bilingual retrieval service is closed")
+        if not original_query:
+            raise ValueError("query cannot be blank")
+        if privacy_ttl_days is not None and privacy_ttl_days <= 0:
+            raise ValueError("privacy_ttl_days must be positive")
+        resolution = await self._resolve_rewrite(
+            original_query,
+            privacy_ttl_days=privacy_ttl_days,
+        )
+        return resolution.trace
+
     async def search(
         self,
         query: str,
@@ -114,6 +135,9 @@ class BilingualRetrievalService:
         top_k: int | None = None,
         filters: Mapping[str, str] | None = None,
         privacy_ttl_days: int | None = None,
+        candidate_k: int | None = None,
+        recall_k: int | None = None,
+        rerank: bool = True,
     ) -> BilingualRetrievalRun:
         original_query = query.strip()
         if self._closed:
@@ -123,6 +147,23 @@ class BilingualRetrievalService:
         limit = self.retrieval_config.top_k if top_k is None else top_k
         if limit <= 0:
             raise ValueError("top_k must be positive")
+        candidate_limit = (
+            self.retrieval_config.rerank_candidates
+            if candidate_k is None
+            else candidate_k
+        )
+        if candidate_limit < limit:
+            raise ValueError("candidate_k cannot be smaller than top_k")
+        sparse_limit = (
+            self.retrieval_config.sparse_candidates if recall_k is None else recall_k
+        )
+        vector_limit = (
+            self.retrieval_config.vector_candidates if recall_k is None else recall_k
+        )
+        if sparse_limit <= 0 or vector_limit <= 0:
+            raise ValueError("recall_k must be positive")
+        if candidate_limit > sparse_limit + vector_limit:
+            raise ValueError("candidate_k exceeds the requested recall pool")
         if privacy_ttl_days is not None and privacy_ttl_days <= 0:
             raise ValueError("privacy_ttl_days must be positive")
 
@@ -135,7 +176,15 @@ class BilingualRetrievalService:
         )
         zh_future = loop.run_in_executor(
             self._local_executor,
-            functools.partial(self._recall, "zh", original_query, filters),
+            functools.partial(
+                self._recall,
+                "zh",
+                original_query,
+                filters,
+                sparse_limit,
+                vector_limit,
+                candidate_limit,
+            ),
         )
         try:
             zh_route = await zh_future
@@ -164,6 +213,9 @@ class BilingualRetrievalService:
                     "en",
                     rewrite.trace.english_query,
                     filters,
+                    sparse_limit,
+                    vector_limit,
+                    candidate_limit,
                 ),
             )
             routes["en"] = en_route
@@ -173,13 +225,13 @@ class BilingualRetrievalService:
         fused = fuse_language_routes(
             {name: route.candidates for name, route in routes.items()},
             rrf_k=self.bilingual_config.route_rrf_k,
-            top_k=self.retrieval_config.rerank_candidates,
+            top_k=candidate_limit,
         )
         route_latencies["cross_route_rrf"] = _elapsed_ms(cross_started)
 
-        if rewrite.trace.english_query is not None:
+        if rewrite.trace.english_query is not None and rerank:
             rerank_started = time.perf_counter()
-            final_candidates = rerank(
+            final_candidates = rerank_candidates(
                 rewrite.trace.english_query,
                 fused,
                 self.reranker,
@@ -192,6 +244,11 @@ class BilingualRetrievalService:
             {
                 "retrieval": self.retrieval_config.model_dump(mode="json"),
                 "bilingual": self.bilingual_config.model_dump(mode="json"),
+                "request": {
+                    "candidate_k": candidate_limit,
+                    "recall_k": recall_k,
+                    "rerank": rerank,
+                },
             }
         )
         storage_classes = self.rights.for_hits(hits) if self.rights is not None else {}
@@ -247,23 +304,26 @@ class BilingualRetrievalService:
         route: str,
         query: str,
         filters: Mapping[str, str] | None,
+        sparse_limit: int,
+        vector_limit: int,
+        candidate_limit: int,
     ) -> RecallRoute:
         started = time.perf_counter()
         vector = self.vector.search(
             query,
-            self.retrieval_config.vector_candidates,
+            vector_limit,
             filters=filters,
         )
         sparse = self.sparse.search(
             query,
-            self.retrieval_config.sparse_candidates,
+            sparse_limit,
             filters=filters,
         )
         candidates = reciprocal_rank_fusion(
             sparse,
             vector,
             rrf_k=self.retrieval_config.rrf_k,
-            top_k=self.retrieval_config.rerank_candidates,
+            top_k=candidate_limit,
         )
         namespaced: list[Candidate] = []
         for rank, (chunk, score, ranks, scores) in enumerate(candidates, start=1):

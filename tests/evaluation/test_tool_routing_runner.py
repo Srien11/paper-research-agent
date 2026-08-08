@@ -135,7 +135,7 @@ class ToolRoutingRunnerTests(unittest.IsolatedAsyncioTestCase):
                 output,
             )
 
-        self.assertEqual(result["case_count"], 124)
+        self.assertEqual(result["case_count"], 119)
         self.assertEqual(result["aggregates"]["case_pass_rate"], 1.0)
         self.assertEqual(result["aggregates"]["arguments_accuracy"], 1.0)
         self.assertEqual(result["stage_aggregates"]["tool_router"]["tool_macro_f1"], 1.0)

@@ -23,7 +23,7 @@ class ResearchRuntimePolicy(BaseModel):
     max_steps: int = Field(default=4, ge=1, le=6)
     evidence_per_step: int = Field(default=4, ge=1, le=20)
     max_tool_calls: int = Field(default=12, ge=1, le=12)
-    timeout_seconds: float = Field(default=90, gt=0, le=300)
+    timeout_seconds: float = Field(default=120, gt=0, le=300)
 
     @field_validator("allowed_tools")
     @classmethod

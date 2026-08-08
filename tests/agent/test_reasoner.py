@@ -59,8 +59,8 @@ def _comparison_plan() -> ResearchPlan:
     return ResearchPlan(
         task_type="comparison",
         targets=(
-            ResearchTarget(target_id="a", label="Paper A"),
-            ResearchTarget(target_id="b", label="Paper B"),
+            ResearchTarget(target_id="a", label="Paper A", corpus_id="C001"),
+            ResearchTarget(target_id="b", label="Paper B", corpus_id="T001"),
         ),
         dimensions=(ResearchDimension(dimension_id="method", label="Method"),),
         requirements=(
@@ -82,6 +82,7 @@ def _comparison_plan() -> ResearchPlan:
                 step_id="a",
                 objective="Find Paper A method",
                 query="Paper A method",
+                corpus_id="C001",
                 target_ids=("a",),
                 dimension_ids=("method",),
             ),
@@ -89,6 +90,7 @@ def _comparison_plan() -> ResearchPlan:
                 step_id="b",
                 objective="Find Paper B method",
                 query="Paper B method",
+                corpus_id="T001",
                 target_ids=("b",),
                 dimension_ids=("method",),
             ),

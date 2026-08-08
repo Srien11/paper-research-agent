@@ -10,17 +10,20 @@ from typing import Any, Protocol
 
 import httpx
 
-QUERY_REWRITE_PROMPT_VERSION = "query-rewrite-v2"
+QUERY_REWRITE_PROMPT_VERSION = "query-rewrite-v3"
 DEFAULT_API_KEY_ENV = "DASHSCOPE_API_KEY"
 DEFAULT_BASE_URL_ENV = "DASHSCOPE_BASE_URL"
 DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
-SYSTEM_PROMPT = """You rewrite Chinese research questions into one concise English retrieval query.
+SYSTEM_PROMPT = """Create a faithful English retrieval view of the complete Chinese research question.
+The English view is additional retrieval input and never replaces the original question.
 Do not answer the question. Return exactly one JSON object with the field english_query.
+Do not summarize, generalize, simplify, or infer. Do not add facts, assumptions, entities, or scope.
+Do not omit any entities, relationships, conditions, qualifiers, question intent, or requested comparison.
 Preserve model names, dataset names, abbreviations, metrics, numbers, units, signs, inequalities,
-negations, scope restrictions, comparison direction, and other limiting conditions exactly.
-Translate only descriptive Chinese content. Prefer scientific keywords and noun phrases suitable
-for BM25, embedding retrieval, and an English cross-encoder reranker."""
+negations, scope restrictions, comparison direction, temporal constraints, and limiting conditions
+exactly. Translate descriptive Chinese content faithfully while keeping the complete logical
+structure suitable for BM25, embedding retrieval, and an English cross-encoder reranker."""
 
 
 @dataclass(frozen=True)
@@ -112,7 +115,7 @@ class DashScopeQueryRewriter:
             "temperature": 0.1,
             "top_p": 0.7,
             "enable_thinking": False,
-            "max_tokens": 128,
+            "max_tokens": 512,
         }
         try:
             response = await self._client.post(self._endpoint, json=payload)
@@ -166,8 +169,8 @@ def _parse_rewrite_response(
     if not isinstance(english_query, str) or not english_query.strip():
         raise QueryRewriteError("query rewrite produced an empty query")
     cleaned_query = english_query.strip()
-    if len(cleaned_query) > 1024:
-        raise QueryRewriteError("query rewrite exceeded 1024 characters")
+    if len(cleaned_query) > 4000:
+        raise QueryRewriteError("query rewrite exceeded 4000 characters")
 
     actual_model_value = response.get("model")
     actual_model = (

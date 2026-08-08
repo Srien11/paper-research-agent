@@ -208,6 +208,17 @@ class RouteTaskTests(unittest.TestCase):
             route_task(task, _envelope(rag_mode="disabled")).capability, "dynamic_tools"
         )
 
+    def test_local_corpus_comparison_is_forced_to_fixed_rag_graph(self) -> None:
+        task = _task(
+            capability="dynamic_tools",
+            objective="比较 C001 与 T001 两篇论文的评测指标",
+        )
+
+        decision = route_task(task, _envelope(rag_mode="preferred"))
+
+        self.assertEqual(decision.capability, "local_rag")
+        self.assertIn("固定检索图", decision.reason)
+
     def test_direct_chat_needs_no_external_facts(self) -> None:
         task = _task(task_id="chat", capability="direct_chat")
         decision = route_task(task, _envelope())

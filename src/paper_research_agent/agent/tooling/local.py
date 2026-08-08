@@ -7,7 +7,6 @@ from collections.abc import Mapping, Sequence
 from paper_research_agent.agent.tooling.contracts import (
     AdjacentChunksInput,
     ChunkIdsInput,
-    ComparePapersInput,
     CorpusInput,
     PaperMetadataInput,
     ToolExecutionResult,
@@ -129,45 +128,6 @@ class LocalResearchTools:
             items,
             {"count": len(items), "truncated": len(sections) > len(items)},
         )
-
-    def compare_papers(self, request: ComparePapersInput) -> ToolExecutionResult:
-        items: list[dict[str, object]] = []
-        for corpus_id in request.corpus_ids:
-            corpus_chunks = [chunk for chunk in self._chunks if chunk.corpus_id == corpus_id]
-            for dimension in request.dimensions:
-                terms = tuple(term for term in dimension.casefold().split() if len(term) > 1)
-                ranked = sorted(
-                    corpus_chunks,
-                    key=lambda chunk: (
-                        -sum(term in chunk.text.casefold() for term in terms),
-                        chunk.page_start,
-                        chunk.chunk_id,
-                    ),
-                )
-                evidence = ranked[: request.evidence_per_dimension]
-                items.append(
-                    {
-                        "corpus_id": corpus_id,
-                        "dimension": dimension,
-                        "evidence": tuple(
-                            {
-                                "chunk_id": chunk.chunk_id,
-                                "page_start": chunk.page_start,
-                                "page_end": chunk.page_end,
-                                "text": chunk.text[:1500],
-                                "text_sha256": chunk.text_sha256,
-                            }
-                            for chunk in evidence
-                        ),
-                    }
-                )
-        return _result(
-            "compare_papers",
-            "ok" if items else "not_found",
-            tuple(items),
-            {"paper_count": len(request.corpus_ids), "dimension_count": len(request.dimensions)},
-        )
-
 
 def _chunk_item(chunk: EvidenceChunk, storage: Mapping[str, str]) -> dict[str, object]:
     return {

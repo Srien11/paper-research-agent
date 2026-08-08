@@ -122,7 +122,7 @@ class ToolRoutingDatasetTests(unittest.TestCase):
             PROJECT_ROOT / "evaluation/datasets/tool-routing-v2.jsonl"
         )
 
-        self.assertEqual(len(cases), 124)
+        self.assertEqual(len(cases), 119)
         self.assertEqual(cases[0].case_id, "tr2-001")
         self.assertEqual(cases[0].allowed_tools, ("get_adjacent_chunks",))
         self.assertEqual(cases[0].expected_arguments["before"], 1)

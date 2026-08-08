@@ -37,3 +37,24 @@ def evidence_hit_at_k(
     if not relevant_chunks:
         return None
     return float(bool(set(retrieved_chunks[:k]) & relevant_chunks))
+
+
+def candidate_paper_recall(
+    candidate_corpus_ids: Sequence[str], relevant_corpus_ids: AbstractSet[str]
+) -> float | None:
+    """Recall of gold papers in the independently discovered candidate set."""
+    if not relevant_corpus_ids:
+        return None
+    return len(set(candidate_corpus_ids) & relevant_corpus_ids) / len(relevant_corpus_ids)
+
+
+def explicit_corpus_id_accuracy(
+    predicted: Sequence[Sequence[str]], expected: Sequence[Sequence[str]]
+) -> float | None:
+    """Exact ordered parsing accuracy across explicit-ID diagnostic cases."""
+    if len(predicted) != len(expected):
+        raise ValueError("explicit-ID prediction and expectation counts differ")
+    if not expected:
+        return None
+    correct = sum(tuple(left) == tuple(right) for left, right in zip(predicted, expected, strict=True))
+    return correct / len(expected)

@@ -130,6 +130,14 @@ def build_research_graph(
         )
         if len(plan.steps) > initial_plan_steps:
             raise ValueError("research plan exceeds the graph step budget")
+        if plan.task_type == "comparison":
+            plan = plan.model_copy(
+                update={
+                    "steps": tuple(
+                        step.model_copy(update={"top_k": 20}) for step in plan.steps
+                    )
+                }
+            )
         return {
             "run_id": state.get("run_id", ""),
             "question": graph_input.question,
@@ -176,10 +184,13 @@ def build_research_graph(
         if runtime_policy.max_tool_calls - state["tool_call_count"] < 2:
             return _finish_update("tool_budget")
 
-        executed_queries = {_query_key(item.search.query) for item in observations}
+        executed_queries = {
+            _query_scope_key(item.search.query, item.search.corpus_id)
+            for item in observations
+        }
         planned_next = plan.steps[current_step] if current_step < len(plan.steps) else None
         if plan.task_type == "comparison" and planned_next is not None:
-            if _query_key(planned_next.query) in executed_queries:
+            if _step_query_key(planned_next) in executed_queries:
                 return _finish_update("repeated_query")
             return {
                 "active_step": planned_next.model_dump(mode="json"),
@@ -187,25 +198,28 @@ def build_research_graph(
                 "termination_reason": None,
             }
         if latest.next_query is not None:
-            if _query_key(latest.next_query) in executed_queries:
-                if planned_next is None or _query_key(planned_next.query) in executed_queries:
+            replan_target_ids: tuple[str, ...] = ()
+            replan_dimension_ids: tuple[str, ...] = ()
+            if plan.task_type == "comparison":
+                requirement_by_id = {
+                    item.requirement_id: item for item in plan.requirements
+                }
+                requested = [
+                    requirement_by_id[item] for item in latest.next_requirement_ids
+                ]
+                replan_target_ids = tuple(
+                    dict.fromkeys(item.target_id for item in requested)
+                )
+                replan_dimension_ids = tuple(
+                    dict.fromkeys(item.dimension_id for item in requested)
+                )
+            replan_corpus_id = _comparison_corpus_id(plan, replan_target_ids)
+            next_query_key = _query_scope_key(latest.next_query, replan_corpus_id)
+            if next_query_key in executed_queries:
+                if planned_next is None or _step_query_key(planned_next) in executed_queries:
                     return _finish_update("repeated_query")
             else:
                 replan_count = state["replan_count"] + 1
-                target_ids: tuple[str, ...] = ()
-                dimension_ids: tuple[str, ...] = ()
-                if plan.task_type == "comparison":
-                    requirement_by_id = {
-                        item.requirement_id: item for item in plan.requirements
-                    }
-                    requested = [
-                        requirement_by_id[item]
-                        for item in latest.next_requirement_ids
-                    ]
-                    target_ids = tuple(dict.fromkeys(item.target_id for item in requested))
-                    dimension_ids = tuple(
-                        dict.fromkeys(item.dimension_id for item in requested)
-                    )
                 replacement = ResearchStep(
                     step_id=f"replan-{replan_count}",
                     objective=latest.next_objective or "Refine the evidence search",
@@ -215,8 +229,9 @@ def build_research_graph(
                         if planned_next is not None
                         else min(20, max(10, evidence_per_step))
                     ),
-                    target_ids=target_ids,
-                    dimension_ids=dimension_ids,
+                    corpus_id=replan_corpus_id,
+                    target_ids=replan_target_ids,
+                    dimension_ids=replan_dimension_ids,
                 )
                 steps = list(plan.steps)
                 if current_step < len(steps):
@@ -246,7 +261,7 @@ def build_research_graph(
 
         if planned_next is None:
             return _finish_update("plan_exhausted")
-        if _query_key(planned_next.query) in executed_queries:
+        if _step_query_key(planned_next) in executed_queries:
             return _finish_update("repeated_query")
         return {
             "active_step": planned_next.model_dump(mode="json"),
@@ -277,10 +292,18 @@ def build_research_graph(
             tool_call_count=tool_call_count,
         )
         try:
-            raw_search = await search_tool.ainvoke({"query": step.query, "top_k": step.top_k})
+            raw_search = await search_tool.ainvoke(
+                {
+                    "query": step.query,
+                    "top_k": step.top_k,
+                    "corpus_id": step.corpus_id,
+                }
+            )
             search = SearchCorpusResult.model_validate(raw_search)
             if search.query != step.query:
                 raise ValueError("search tool returned a mismatched query")
+            if search.corpus_id != step.corpus_id:
+                raise ValueError("search tool returned a mismatched corpus scope")
         except Exception as exc:
             _emit_graph_event(
                 state,
@@ -640,8 +663,29 @@ def _elapsed_ms(started: float) -> float:
     return max(0.0, (time.perf_counter() - started) * 1000)
 
 
+def _comparison_corpus_id(
+    plan: ResearchPlan,
+    target_ids: tuple[str, ...],
+) -> str | None:
+    if len(target_ids) != 1:
+        return None
+    target_id = target_ids[0]
+    return next(
+        (target.corpus_id for target in plan.targets if target.target_id == target_id),
+        None,
+    )
+
+
 def _query_key(query: str) -> str:
     return " ".join(query.casefold().split())
+
+
+def _query_scope_key(query: str, corpus_id: str | None) -> tuple[str | None, str]:
+    return corpus_id, _query_key(query)
+
+
+def _step_query_key(step: ResearchStep) -> tuple[str | None, str]:
+    return _query_scope_key(step.query, step.corpus_id)
 
 
 def _finish_update(reason: str) -> ResearchGraphState:

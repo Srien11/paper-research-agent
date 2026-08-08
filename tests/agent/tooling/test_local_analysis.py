@@ -10,7 +10,6 @@ from paper_research_agent.agent.tooling.contracts import (
     AnalyzeExperimentDataInput,
     CalculateInput,
     ChunkIdsInput,
-    ComparePapersInput,
     CorpusInput,
     PaperMetadataInput,
 )
@@ -101,10 +100,6 @@ class LocalAndAnalysisTests(unittest.TestCase):
         self.assertEqual(trace.items[0]["page_start"], 1)
         outline = self.local.get_paper_outline(CorpusInput(corpus_id="C001"))
         self.assertEqual(outline.items[0]["title"], "Methods")
-        compared = self.local.compare_papers(
-            ComparePapersInput(corpus_ids=("C001", "T001"), dimensions=("accuracy",))
-        )
-        self.assertEqual(compared.summary["dimension_count"], 1)
 
     def test_safe_calculation_statistics_and_reproducibility(self) -> None:
         analysis = AnalysisResearchTools(chunks=self.chunks)

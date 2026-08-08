@@ -98,14 +98,6 @@ EXTENDED_TOOL_SPECS: tuple[ToolSpec, ...] = (
         "trace_evidence_source", "local_read", 2, 20, "Trace chunk provenance.", "citation_evidence"
     ),
     _spec("get_paper_outline", "local_read", 2, 100, "Read a paper section outline."),
-    _spec(
-        "compare_papers",
-        "local_read",
-        5,
-        30,
-        "Build a bounded evidence matrix.",
-        "citation_evidence",
-    ),
     _spec("search_scholarly_sources", "network_read", 10, 20, "Search scholarly metadata."),
     _spec("resolve_paper_identifier", "network_read", 10, 5, "Resolve a DOI, title, or paper ID."),
     _spec("get_citation_graph", "network_read", 10, 50, "Read references or citations."),
@@ -136,5 +128,5 @@ EXTENDED_TOOL_SPECS: tuple[ToolSpec, ...] = (
 EXTENDED_TOOL_NAMES = frozenset(spec.name for spec in EXTENDED_TOOL_SPECS)
 TOOL_SPEC_BY_NAME = {spec.name: spec for spec in EXTENDED_TOOL_SPECS}
 
-if len(EXTENDED_TOOL_SPECS) != 19 or len(EXTENDED_TOOL_NAMES) != 19:
-    raise RuntimeError("extended research tool catalog must contain exactly 19 unique tools")
+if len(EXTENDED_TOOL_SPECS) != 18 or len(EXTENDED_TOOL_NAMES) != 18:
+    raise RuntimeError("extended research tool catalog must contain exactly 18 unique tools")
