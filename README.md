@@ -2,16 +2,17 @@
 
 一个面向小型、高质量论文集合的可复现 RAG 与研究 Agent 工程。
 
-当前阶段已经形成从冻结语料、可追溯检索、上下文与短期记忆，到受控 ReAct 研究 Agent 和私有研究界面的本地闭环。
+当前阶段已经形成从冻结语料、可追溯检索、上下文与记忆，到三图分层 Agent 编排和私有研究界面的本地闭环。
 
 ## 核心工程亮点
 
 - **可信检索与引用**：围绕 80 篇、2,286 页英文论文形成 6,252 个检索块和 806 张图表语义，融合中文 BM25 / BGE 与英文科研检索式，经路内和跨语言 RRF、CrossEncoder 重排后生成回答；引用必须命中本轮真实 chunk 白名单。
-- **受控 Agent Runtime**：LangGraph ReAct 工作流覆盖规划、工具执行、证据充分性反思、提前终止和有限重规划；19 项研究工具全部受严格 Schema、总时长、调用次数、重复调用和信任等级约束，不注册任意 Shell、Python 或文件系统能力。
+- **三图分层编排**：在原有固定证据图与动态工具图之上新增跨轮次主 Agent 图；主图统一恢复上下文、对齐目标、拆分任务、选择子图、评估结果并原子提交会话状态，两类子图只执行受控任务，不修改主目标与计划。
+- **受控 Agent Runtime**：LangGraph ReAct 工作流覆盖规划、工具执行、证据充分性反思、提前终止和有限重规划；18 项扩展研究工具全部受严格 Schema、总时长、调用次数、重复调用和信任等级约束，不注册任意 Shell、Python 或文件系统能力。
 - **状态、安全与审批**：SQLite Checkpoint 恢复 thread；笔记、报告和长期记忆写入使用与工具名、参数哈希绑定的一次性审批令牌，避免旧确认复用到新参数。
 - **后端智能路由**：前端提交问题、附件和明确的 `rag_mode`（`disabled` / `preferred` / `required`）；关闭时禁止本地检索，优先模式允许本地 RAG、普通聊天和联网研究动态分流，仅本地模式则强制使用论文库。策略层继续校验路由合法性，高风险覆盖、删除和外发仍要求确认。
 - **隐私可观测性**：事件日志仅记录指纹、耗时、计数、路由和原因码，不记录问题、证据正文或 Provider 原始载荷；论文原文、本地索引、密钥、运行数据库和内部资料均不进入 Git。
-- **资源受控部署**：针对 2 核 2G 环境采用单 worker、串行重任务和 850MB systemd 内存上限，将模型推理与重排交给外部服务；当前完整测试集 283 项通过。
+- **资源受控部署**：针对 2 核 2G 环境采用单 worker、串行重任务和 850MB systemd 内存上限，将模型推理与重排交给外部服务；当前完整测试集 535 项通过。
 
 ## 当前里程碑
 
@@ -39,7 +40,7 @@
 
 ## 主 Agent 统一编排
 
-在本地论文研究图与动态工具图之前新增跨轮次主 Agent 主体图
+在原有本地论文研究图与动态工具图之上新增跨轮次主 Agent 主体图
 （`paper_research_main_v1`）。每轮先恢复最近历史、滚动摘要、活动目标、
 会话任务计划、远距会话召回与长期记忆，再依次解释本轮变化、对齐目标、
 规划任务、按策略路由子图，执行后评估结果并原子提交新的会话状态。普通
@@ -181,10 +182,11 @@ $env:PRA_SECTIONS_PATH = 'data/processed/<current-build>/sections.jsonl'
 $env:PRA_ELEMENTS_PATH = 'data/processed/<current-build>/elements.jsonl'
 ```
 
-默认不开启 Agent，原单次 RAG 路径保持不变。启用后有两条彼此独立的 Graph：默认问答仍只用
-`search_corpus / get_evidence` 形成可验证引用；Web 中手动开启“动态工具模式”后，模型才可在
-固定 19 项扩展工具中逐步选择。两条路径都不是自由工具 Agent；Shell、任意 Python 和任意
-网络/文件能力均未注册，写工具必须经过 Runtime 审批。
+默认不开启 Agent，原单次 RAG 路径保持不变。完整 Agent 架构由一层主编排图和两条执行子图
+组成：主图统一维护跨轮次目标、任务计划和路由；固定证据子图只用
+`search_corpus / get_evidence` 形成可验证引用；动态工具子图才允许模型在固定 18 项扩展工具中
+逐步选择。两条执行子图都不是自由工具 Agent；Shell、任意 Python 和任意网络/文件能力均未注册，
+写工具必须经过 Runtime 审批。
 
 Agent 启用后，结构化事件默认写入与 State Checkpoint 同目录的
 `data/runtime/agent-events-v1.sqlite3`。每次运行生成独立 `run_id`，覆盖运行开始/完成/失败、
@@ -205,18 +207,26 @@ ORDER BY event_id;
 
 ### 扩展研究工具平台
 
-生产 Agent Runtime 现在除核心 `search_corpus / get_evidence` 外，还注册 19 项严格 Schema
+生产 Agent Runtime 现在除核心 `search_corpus / get_evidence` 外，还注册 18 项严格 Schema
 工具。核心可引用证据循环仍用原两工具关闭失败；扩展工具通过
 `ResearchAgentRuntime.execute_tool` 或完整 LangChain registry 调用，结果不会绕过现有引用验证。
 
 - 本地证据：`get_adjacent_chunks`、`get_paper_metadata`、`trace_evidence_source`、
-  `get_paper_outline`、`compare_papers`
+  `get_paper_outline`
 - 学术网络：`search_scholarly_sources`、`resolve_paper_identifier`、`get_citation_graph`、
   `check_paper_status`
 - 非文本理解：`extract_table`、`inspect_figure`、`extract_equation`
 - 计算核验：`calculate`、`analyze_experiment_data`、`verify_claim`、
   `check_reproducibility`
 - 成果管理：`save_research_note`、`export_research_report`、`manage_long_term_memory`
+
+多论文比较不属于动态工具。主路由会把带有多个本地论文 ID 的学术比较交给固定研究图；规划器将
+每篇论文与比较维度拆成独立步骤，`search_corpus` 用对应 `corpus_id` 同时约束 BM25 和向量召回，
+证据充分性校验也只接受当前“论文 × 维度”单元格产生的 chunk，避免跨论文或跨维度串证据。
+最终上下文在 comparison 模式下按 target 轮转 coverage chunk，先让各论文进入回答预算，再补充
+同一论文的其他 requirement；普通单篇问答仍保持全局检索 rank 顺序。
+升级前若有尚未完成、下一步仍指向 `compare_papers` 的动态 Graph checkpoint，应新建任务重新执行；
+该旧工具名已从严格目录移除，恢复时会按未知工具关闭失败。
 
 工具目录为每项能力固定风险级别、默认超时和最大结果数。本地读取直接执行；学术网络只向
 Semantic Scholar 或 Crossref 发送当前检索式/论文标识符，不发送本地 chunk 或论文正文；
