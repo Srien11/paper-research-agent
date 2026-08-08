@@ -120,8 +120,9 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
         "cases": cases,
         "limitations": (
             "银标仅用于诊断：GQ016 更接近单论文识别，GQ017 更接近跨论文多跳问答，"
-            "两者都没有硬编码论文编号。当前向量模型的跨语言能力会影响中文问题的模型分数，"
-            "不影响显式编号、候选边界和 corpus_id 隔离等结构保证。"
+            "两者都没有硬编码论文编号。论文候选层在转化成功时仅使用英文检索视图；"
+            "模型转化波动和银标噪声会影响样本分数，但不影响显式编号、候选边界和 "
+            "corpus_id 隔离等结构保证。"
         ),
     }
     return result

@@ -47,10 +47,14 @@ def _card(
 
 
 class KeywordSemanticEncoder:
+    def __init__(self):
+        self.queries = []
+
     def encode_documents(self, texts):
         return [self._encode(text) for text in texts]
 
     def encode_query(self, query):
+        self.queries.append(query)
         return self._encode(query)
 
     @staticmethod
@@ -148,7 +152,7 @@ class HybridPaperCandidateRetrieverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(hits[1].ranks, {"bm25": 2, "vector": 1})
         self.assertEqual(len({hit.corpus_id for hit in hits}), 2)
 
-    async def test_preserves_original_query_and_adds_english_retrieval_route(self) -> None:
+    async def test_english_paper_candidates_use_only_english_retrieval_view(self) -> None:
         cards = (
             _card(
                 "C001",
@@ -163,9 +167,10 @@ class HybridPaperCandidateRetrieverTests(unittest.IsolatedAsyncioTestCase):
                 evidence_chunk_ids=("c2",),
             ),
         )
+        encoder = KeywordSemanticEncoder()
         retriever = HybridPaperCandidateRetriever(
             build_paper_candidate_documents(cards, ()),
-            KeywordSemanticEncoder(),
+            encoder,
         )
         original = "中文原问题 lexical；保留否定、范围、数字 80%"
 
@@ -174,12 +179,12 @@ class HybridPaperCandidateRetrieverTests(unittest.IsolatedAsyncioTestCase):
                 original_query=original,
                 english_query="English translated semantic with negation scope 80%",
             ),
-            top_k=2,
+            top_k=1,
         )
 
-        self.assertEqual({hit.corpus_id for hit in hits}, {"C001", "T001"})
-        self.assertTrue(any("original." in route for hit in hits for route in hit.ranks))
-        self.assertTrue(any("english." in route for hit in hits for route in hit.ranks))
+        self.assertEqual([hit.corpus_id for hit in hits], ["T001"])
+        self.assertEqual(encoder.queries, ["English translated semantic with negation scope 80%"])
+        self.assertEqual(set(hits[0].ranks), {"bm25", "vector"})
 
 
 if __name__ == "__main__":

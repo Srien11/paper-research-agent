@@ -44,7 +44,7 @@ class PaperCandidateHit:
 
 @dataclass(frozen=True)
 class PaperCandidateQuery:
-    """Lossless query views used only to broaden paper candidate recall."""
+    """Keep the authoritative question while selecting an English retrieval view."""
 
     original_query: str
     english_query: str | None = None
@@ -54,6 +54,11 @@ class PaperCandidateQuery:
             raise ValueError("paper candidate original query cannot be blank")
         if self.english_query is not None and not self.english_query.strip():
             raise ValueError("paper candidate English query cannot be blank")
+
+    @property
+    def retrieval_query(self) -> str:
+        """Use English for English paper cards, falling back only on rewrite failure."""
+        return self.english_query if self.english_query is not None else self.original_query
 
 
 class AsyncPaperCandidateRetriever(Protocol):
@@ -145,34 +150,7 @@ class HybridPaperCandidateRetriever:
     def _search_sync(
         self, query: PaperCandidateQuery, top_k: int
     ) -> tuple[PaperCandidateHit, ...]:
-        original = self._hybrid_route(query.original_query)
-        english_query = query.english_query
-        if english_query is None or english_query.casefold() == query.original_query.casefold():
-            return original[:top_k]
-
-        english = self._hybrid_route(english_query)
-        documents = {document.corpus_id: document for document in self._documents}
-        ranks: dict[str, dict[str, int]] = {}
-        route_ranks: dict[str, dict[str, int]] = {}
-        for language, hits in (("original", original), ("english", english)):
-            for route_rank, hit in enumerate(hits, start=1):
-                route_ranks.setdefault(hit.corpus_id, {})[language] = route_rank
-                ranks.setdefault(hit.corpus_id, {}).update(
-                    {f"{language}.{name}": rank for name, rank in hit.ranks.items()}
-                )
-        fused = [
-            PaperCandidateHit(
-                corpus_id=corpus_id,
-                title=documents[corpus_id].title,
-                abstract=documents[corpus_id].abstract,
-                used_fallback=documents[corpus_id].used_fallback,
-                final_score=sum(1 / (60 + rank) for rank in language_ranks.values()),
-                ranks=ranks[corpus_id],
-            )
-            for corpus_id, language_ranks in route_ranks.items()
-        ]
-        fused.sort(key=lambda item: (-item.final_score, item.corpus_id))
-        return tuple(fused[:top_k])
+        return self._hybrid_route(query.retrieval_query)[:top_k]
 
     def _hybrid_route(self, query: str) -> tuple[PaperCandidateHit, ...]:
         sparse = [
