@@ -30,10 +30,13 @@ class RetrievalConfigTests(unittest.TestCase):
         bilingual = load_bilingual_retrieval_config(
             PROJECT_ROOT / "configs/retrieval/bilingual-qwen-v1.json"
         )
-        self.assertEqual(bilingual.rewrite_timeout_seconds, 2.0)
+        self.assertEqual(bilingual.rewrite_timeout_seconds, 10.0)
         self.assertEqual(bilingual.pipeline_id, "zh-en-two-level-rrf-v1")
         self.assertEqual(bilingual.rewrite_model, "qwen3.7-plus-2026-05-26")
         self.assertEqual(bilingual.rewrite_prompt_version, "query-rewrite-v3")
+
+    def test_bilingual_rewrite_timeout_defaults_to_ten_seconds(self) -> None:
+        self.assertEqual(BilingualRetrievalConfig().rewrite_timeout_seconds, 10.0)
 
     def test_missing_model_revision_is_rejected(self) -> None:
         payload = self._valid_payload()

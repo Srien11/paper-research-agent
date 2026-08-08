@@ -88,7 +88,7 @@ class BilingualRetrievalConfig(FrozenConfig):
     pipeline_id: str = Field(default="zh-en-two-level-rrf-v1", min_length=1)
     rewrite_model: str = Field(default="qwen3.7-plus-2026-05-26", min_length=1)
     rewrite_prompt_version: Literal["query-rewrite-v3"] = "query-rewrite-v3"
-    rewrite_timeout_seconds: float = Field(default=2.0, gt=0, le=30)
+    rewrite_timeout_seconds: float = Field(default=10.0, gt=0, le=30)
     rewrite_cache_fresh_days: int = Field(default=90, gt=0)
     rewrite_cache_stale_days: int = Field(default=365, gt=0)
     audit_plaintext_days: int = Field(default=30, ge=0)

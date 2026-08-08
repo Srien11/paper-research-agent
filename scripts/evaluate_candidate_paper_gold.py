@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import sys
+import time
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -74,10 +75,12 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
         for question in questions:
             english_query: str | None = None
             rewrite_status = "success"
+            rewrite_started = time.perf_counter()
             try:
                 english_query = (await rewriter.rewrite(question.question)).english_query
             except (RuntimeError, TimeoutError):
                 rewrite_status = "fallback_original"
+            rewrite_latency_ms = (time.perf_counter() - rewrite_started) * 1000
             hits = await retriever.search(
                 PaperCandidateQuery(
                     original_query=question.question,
@@ -93,6 +96,7 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
                     relevant_paper_ids=question.relevant_paper_ids,
                     candidate_paper_ids=tuple(hit.corpus_id for hit in hits),
                     rewrite_status=rewrite_status,
+                    rewrite_latency_ms=rewrite_latency_ms,
                 )
             )
     finally:
@@ -124,18 +128,23 @@ def _write_report(result: dict[str, object], path: Path) -> None:
     rewrite_fallback = result["rewrite_fallback"]
     dev = result["dev"]
     sealed = result["sealed_test"]
+    latency = result["rewrite_latency_ms"]
     assert (
         isinstance(primary, dict)
         and isinstance(rewrite_success, dict)
         and isinstance(rewrite_fallback, dict)
         and isinstance(dev, dict)
         and isinstance(sealed, dict)
+        and isinstance(latency, dict)
     )
     lines = [
         "# RAG 候选论文召回评测基线 v1",
         "",
         f"- 金标题数：{result['question_count']}（开发集20，封存集10）",
         f"- 转化降级次数：{result['rewrite_fallback_count']}",
+        f"- 转化延迟 P50：{latency['p50']:.0f} ms",
+        f"- 转化延迟 P95：{latency['p95']:.0f} ms",
+        f"- 转化延迟最大值：{latency['max']:.0f} ms",
         f"- 总体 Recall@5：{_percent(primary['recall_at_5_macro'])}",
         f"- 总体 Recall@8：{_percent(primary['recall_at_8_macro'])}",
         f"- 总体 All-target Hit@8：{_percent(primary['all_target_hit_at_8'])}",

@@ -18,6 +18,7 @@ class CandidatePaperGoldRunnerTests(unittest.TestCase):
                 relevant_paper_ids=("C001", "C002"),
                 candidate_paper_ids=("C001", "C009", "C002"),
                 rewrite_status="fallback_original",
+                rewrite_latency_ms=100,
             ),
             CandidatePaperEvaluationCase(
                 question_id="CPG002",
@@ -26,6 +27,7 @@ class CandidatePaperGoldRunnerTests(unittest.TestCase):
                 relevant_paper_ids=("C003", "C004"),
                 candidate_paper_ids=("C003", "C009", "C008"),
                 rewrite_status="success",
+                rewrite_latency_ms=300,
             ),
             CandidatePaperEvaluationCase(
                 question_id="CPG003",
@@ -34,6 +36,7 @@ class CandidatePaperGoldRunnerTests(unittest.TestCase):
                 relevant_paper_ids=("C010",),
                 candidate_paper_ids=("C099",),
                 rewrite_status="success",
+                rewrite_latency_ms=500,
             ),
         )
 
@@ -47,6 +50,7 @@ class CandidatePaperGoldRunnerTests(unittest.TestCase):
         self.assertEqual(summary["rewrite_fallback_count"], 1)
         self.assertEqual(summary["rewrite_success"]["recall_at_3_macro"], 0.5)
         self.assertEqual(summary["rewrite_fallback"]["recall_at_3_macro"], 1.0)
+        self.assertEqual(summary["rewrite_latency_ms"], {"p50": 300.0, "p95": 500.0, "max": 500.0})
 
     def test_rejects_duplicate_candidate_ids(self) -> None:
         with self.assertRaisesRegex(ValueError, "candidate paper IDs must be unique"):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable, Sequence
 from typing import Literal
 
@@ -22,6 +23,7 @@ class CandidatePaperEvaluationCase(BaseModel):
     relevant_paper_ids: tuple[str, ...] = Field(min_length=1, max_length=4)
     candidate_paper_ids: tuple[str, ...]
     rewrite_status: Literal["success", "cache_hit", "stale_cache", "fallback_original"]
+    rewrite_latency_ms: float = Field(default=0.0, ge=0)
 
     @field_validator("relevant_paper_ids", "candidate_paper_ids")
     @classmethod
@@ -42,6 +44,7 @@ def summarize_candidate_paper_cases(
         raise ValueError("candidate metric cutoffs must be positive")
     primary = tuple(case for case in materialized if case.clue_scope == "title_abstract")
     diagnostic = tuple(case for case in materialized if case.clue_scope == "full_text_detail")
+    latencies = sorted(case.rewrite_latency_ms for case in materialized)
     return {
         "schema_version": "candidate-paper-evaluation-summary-v1",
         "question_count": len(materialized),
@@ -50,6 +53,11 @@ def summarize_candidate_paper_cases(
         "rewrite_fallback_count": sum(
             case.rewrite_status == "fallback_original" for case in materialized
         ),
+        "rewrite_latency_ms": {
+            "p50": _percentile(latencies, 0.50),
+            "p95": _percentile(latencies, 0.95),
+            "max": latencies[-1] if latencies else None,
+        },
         "primary": _metrics(primary, normalized_cutoffs),
         "rewrite_success": _metrics(
             tuple(case for case in primary if case.rewrite_status != "fallback_original"),
@@ -91,3 +99,9 @@ def _metrics(
             sum(all_target_hits) / len(all_target_hits) if all_target_hits else None
         )
     return metrics
+
+
+def _percentile(values: Sequence[float], quantile: float) -> float | None:
+    if not values:
+        return None
+    return values[max(0, math.ceil(len(values) * quantile) - 1)]

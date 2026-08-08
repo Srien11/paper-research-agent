@@ -3,7 +3,7 @@
   "pipeline_id": "zh-en-two-level-rrf-v1",
   "rewrite_model": "qwen3.7-plus-2026-05-26",
   "rewrite_prompt_version": "query-rewrite-v3",
-  "rewrite_timeout_seconds": 2.0,
+  "rewrite_timeout_seconds": 10.0,
   "rewrite_cache_fresh_days": 90,
   "rewrite_cache_stale_days": 365,
   "audit_plaintext_days": 30,
