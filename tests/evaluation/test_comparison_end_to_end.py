@@ -10,6 +10,7 @@ from paper_research_agent.evaluation.comparison_end_to_end import (
     CompilationAuditDiagnostic,
     CompilationRepairDiagnostic,
     RetrievalDiagnostic,
+    aggregate_compilation_audits,
     aggregate_fact_lineage,
     classify_fact_lineage,
     deterministic_rewrite_retention,
@@ -70,6 +71,33 @@ def test_fact_lineage_distinguishes_compiler_visibility_from_compilation() -> No
     assert hidden.loss_stage == "not_visible_to_compiler"
 
 
+def test_fact_lineage_splits_exact_chunk_from_semantic_alternative() -> None:
+    alternative = classify_fact_lineage(
+        "alternative",
+        gold_chunk_ids=("gold-c1",),
+        retrieved_chunk_ids=("gold-c1", "alt-c2"),
+        hydrated_chunk_ids=("gold-c1", "alt-c2"),
+        visible_chunk_ids=("gold-c1", "alt-c2"),
+        compiled_chunk_ids=("alt-c2",),
+        semantic_compiled_chunk_ids=("alt-c2",),
+        same_paper_alternative_chunk_ids=("alt-c2",),
+        in_generation_input=True,
+        expressed=True,
+        citation_correct=True,
+    )
+
+    summary = aggregate_fact_lineage((alternative,))
+
+    assert alternative.exact_gold_chunk_compiled is False
+    assert alternative.same_paper_alternative_chunk_compiled is True
+    assert alternative.semantic_fact_compiled is True
+    assert alternative.compiled is True
+    assert alternative.loss_stage == "complete"
+    assert summary["exact_gold_chunk_recall"] == 0
+    assert summary["same_paper_alternative_chunk_recall"] == 1
+    assert summary["semantic_fact_recall"] == 1
+
+
 def _case(**updates: object) -> ComparisonCaseDiagnostic:
     values: dict[str, object] = {
         "question_id": "CPG001",
@@ -121,6 +149,9 @@ def test_case_diagnostic_persists_body_free_compilation_audit() -> None:
                 failure_code="schema_ledger_too_long",
                 raw_ledger_cell_count=4,
                 raw_fact_count=8,
+                requested_requirement_ids=("a-method", "b-method"),
+                accepted_requirement_ids=("a-method",),
+                failed_requirement_ids=("b-method",),
             ),
         ),
         repair=CompilationRepairDiagnostic(
@@ -139,6 +170,12 @@ def test_case_diagnostic_persists_body_free_compilation_audit() -> None:
 
     assert case.compilation_audit == audit
     assert "secret" not in str(case.compilation_audit.model_dump())
+    summary = aggregate_compilation_audits((case,))
+    assert summary["attempt_count"] == 1
+    assert summary["requested_unit_count"] == 2
+    assert summary["accepted_unit_count"] == 1
+    assert summary["failed_unit_count"] == 1
+    assert summary["schema_failed_unit_count"] == 1
 
 
 def test_rewrite_retention_preserves_identifiers_numbers_and_metrics() -> None:

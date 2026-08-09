@@ -415,12 +415,20 @@ class LangChainEvidenceReasonerTests(unittest.IsolatedAsyncioTestCase):
             model.with_structured_output.call_args_list[-1].args[0],
             EvidenceCompilationBatch,
         )
+        self.assertTrue(
+            model.with_structured_output.call_args_list[-1].kwargs["include_raw"]
+        )
         payload = json.loads(messages[1].content)
         self.assertEqual(payload["kind"], "untrusted_minimal_evidence_compilation")
         self.assertEqual(
             [item["requirement_id"] for item in payload["requirements"]],
             ["a-method", "b-method"],
         )
+        self.assertEqual(len(payload["evidence"]), 1)
+        self.assertEqual(
+            payload["evidence"][0]["eligible_requirement_ids"], ["a-method"]
+        )
+        self.assertIn("Paper A uses method X.", payload["evidence"][0]["text_excerpt"])
 
     async def test_retries_plan_specific_coverage_violation_once(self) -> None:
         model = Mock()

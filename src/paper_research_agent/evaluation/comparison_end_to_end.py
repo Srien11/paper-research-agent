@@ -93,6 +93,9 @@ class FactLineageDiagnostic(FrozenEvaluationModel):
     retrieved: bool
     hydrated: bool
     visible_to_compiler: bool
+    exact_gold_chunk_compiled: bool
+    same_paper_alternative_chunk_compiled: bool
+    semantic_fact_compiled: bool
     compiled: bool
     in_generation_input: bool
     expressed: bool
@@ -102,9 +105,22 @@ class FactLineageDiagnostic(FrozenEvaluationModel):
     @model_validator(mode="before")
     @classmethod
     def derive_legacy_visibility(cls, value: object) -> object:
-        if not isinstance(value, dict) or "visible_to_compiler" in value:
+        if not isinstance(value, dict):
             return value
-        return {**value, "visible_to_compiler": bool(value.get("hydrated"))}
+        compiled = bool(value.get("compiled"))
+        return {
+            **value,
+            "visible_to_compiler": value.get(
+                "visible_to_compiler", bool(value.get("hydrated"))
+            ),
+            "exact_gold_chunk_compiled": value.get(
+                "exact_gold_chunk_compiled", compiled
+            ),
+            "same_paper_alternative_chunk_compiled": value.get(
+                "same_paper_alternative_chunk_compiled", False
+            ),
+            "semantic_fact_compiled": value.get("semantic_fact_compiled", compiled),
+        }
 
     @model_validator(mode="after")
     def validate_stage(self) -> FactLineageDiagnostic:
@@ -132,6 +148,12 @@ class ComparisonDeterministicScore(FrozenEvaluationModel):
     citation_gold_chunk_rate: float | None = Field(default=None, ge=0, le=1)
 
 
+class SemanticFactMatchDiagnostic(FrozenEvaluationModel):
+    claim_id: str = Field(min_length=1)
+    answer_claim_indexes: tuple[int, ...] = ()
+    citation_supported: bool = False
+
+
 class ComparisonModelJudgeScore(FrozenEvaluationModel):
     dimension_hit: int = Field(ge=0)
     dimension_total: int = Field(ge=0)
@@ -143,6 +165,7 @@ class ComparisonModelJudgeScore(FrozenEvaluationModel):
     answer_complete: bool
     supported_answer_claim_count: int = Field(ge=0)
     answer_claim_count: int = Field(ge=0)
+    semantic_fact_matches: tuple[SemanticFactMatchDiagnostic, ...] = ()
     judge_error_type: str | None = None
 
 
@@ -152,6 +175,9 @@ class CompilationAttemptDiagnostic(FrozenEvaluationModel):
     failure_code: str | None = None
     raw_ledger_cell_count: int | None = Field(default=None, ge=0)
     raw_fact_count: int | None = Field(default=None, ge=0)
+    requested_requirement_ids: tuple[str, ...] = ()
+    accepted_requirement_ids: tuple[str, ...] = ()
+    failed_requirement_ids: tuple[str, ...] = ()
 
 
 class CompilationRepairDiagnostic(FrozenEvaluationModel):
@@ -194,7 +220,9 @@ class ComparisonCaseDiagnostic(FrozenEvaluationModel):
     tool_call_budget: int | None = Field(default=None, ge=1)
     citations: tuple[CitationDiagnostic, ...]
     fact_lineage: tuple[FactLineageDiagnostic, ...] = ()
-    answer_status: Literal["answered", "insufficient_evidence"] | None = None
+    answer_status: Literal[
+        "answered", "insufficient_evidence", "compiler_failed"
+    ] | None = None
     deterministic_score: ComparisonDeterministicScore | None = None
     model_judge_score: ComparisonModelJudgeScore | None = None
     total_latency_ms: float = Field(ge=0)
@@ -221,6 +249,8 @@ def classify_fact_lineage(
     retrieved_chunk_ids: Iterable[str],
     hydrated_chunk_ids: Iterable[str],
     compiled_chunk_ids: Iterable[str],
+    semantic_compiled_chunk_ids: Iterable[str] | None = None,
+    same_paper_alternative_chunk_ids: Iterable[str] | None = None,
     visible_chunk_ids: Iterable[str] | None = None,
     in_generation_input: bool,
     expressed: bool,
@@ -234,7 +264,19 @@ def classify_fact_lineage(
         expected
         & set(hydrated_chunk_ids if visible_chunk_ids is None else visible_chunk_ids)
     )
-    compiled = visible and bool(expected & set(compiled_chunk_ids))
+    exact_compiled = visible and bool(expected & set(compiled_chunk_ids))
+    semantic_compiled = (
+        exact_compiled
+        if semantic_compiled_chunk_ids is None
+        else bool(tuple(semantic_compiled_chunk_ids))
+    )
+    alternative_compiled = (
+        semantic_compiled
+        and not exact_compiled
+        and same_paper_alternative_chunk_ids is not None
+        and bool(tuple(same_paper_alternative_chunk_ids))
+    )
+    compiled = semantic_compiled
     input_present = compiled and in_generation_input
     output_present = input_present and expressed
     citation_valid = output_present and citation_correct
@@ -252,6 +294,9 @@ def classify_fact_lineage(
         retrieved=retrieved,
         hydrated=hydrated,
         visible_to_compiler=visible,
+        exact_gold_chunk_compiled=exact_compiled,
+        same_paper_alternative_chunk_compiled=alternative_compiled,
+        semantic_fact_compiled=semantic_compiled,
         compiled=compiled,
         in_generation_input=input_present,
         expressed=output_present,
@@ -283,16 +328,58 @@ def aggregate_fact_lineage(
     )
     return {
         "fact_count": len(materialized),
+        "exact_gold_chunk_recall": rate("exact_gold_chunk_compiled"),
+        "same_paper_alternative_chunk_recall": rate(
+            "same_paper_alternative_chunk_compiled"
+        ),
+        "semantic_fact_recall": rate("semantic_fact_compiled"),
         "stage_rates": {
             "retrieved": rate("retrieved"),
             "hydrated": rate("hydrated"),
             "visible_to_compiler": rate("visible_to_compiler"),
+            "exact_gold_chunk_compiled": rate("exact_gold_chunk_compiled"),
+            "same_paper_alternative_chunk_compiled": rate(
+                "same_paper_alternative_chunk_compiled"
+            ),
+            "semantic_fact_compiled": rate("semantic_fact_compiled"),
             "compiled": rate("compiled"),
             "in_generation_input": rate("in_generation_input"),
             "expressed": rate("expressed"),
             "citation_correct": rate("citation_correct"),
         },
         "earliest_loss_counts": {stage: counts.get(stage, 0) for stage in stages},
+    }
+
+
+def aggregate_compilation_audits(
+    cases: Iterable[ComparisonCaseDiagnostic],
+) -> dict[str, int]:
+    """Aggregate body-free transactional compiler unit counts."""
+    attempts = tuple(
+        attempt
+        for case in cases
+        if case.compilation_audit is not None
+        for attempt in case.compilation_audit.attempts
+    )
+    return {
+        "attempt_count": len(attempts),
+        "requested_unit_count": sum(
+            len(item.requested_requirement_ids) for item in attempts
+        ),
+        "accepted_unit_count": sum(
+            len(item.accepted_requirement_ids) for item in attempts
+        ),
+        "failed_unit_count": sum(len(item.failed_requirement_ids) for item in attempts),
+        "schema_failed_unit_count": sum(
+            len(item.failed_requirement_ids)
+            for item in attempts
+            if item.outcome == "schema_invalid"
+        ),
+        "contract_failed_unit_count": sum(
+            len(item.failed_requirement_ids)
+            for item in attempts
+            if item.outcome == "contract_invalid"
+        ),
     }
 
 

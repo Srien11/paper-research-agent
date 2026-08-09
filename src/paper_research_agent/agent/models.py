@@ -379,9 +379,9 @@ class EvidenceCellCompilation(FrozenContract):
 
 
 class EvidenceCompilationBatch(FrozenContract):
-    """Tolerant transport envelope whose cells are validated transactionally."""
+    """Strict provider schema whose raw cells can still be recovered transactionally."""
 
-    cells: tuple[dict[str, object], ...] = Field(default=(), max_length=20)
+    cells: tuple[EvidenceCellCompilation, ...] = Field(default=(), max_length=20)
 
 
 class CompiledEvidenceFact(FrozenContract):

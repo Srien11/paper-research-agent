@@ -79,20 +79,24 @@ class ResearchToolModelTests(unittest.TestCase):
                 {"requirement_id": "a-method", "facts": [], "status": "missing"}
             )
 
-    def test_compilation_batch_preserves_invalid_units_for_transactional_validation(
-        self,
-    ) -> None:
+    def test_compilation_batch_schema_exposes_strict_minimal_cell_fields(self) -> None:
         batch = EvidenceCompilationBatch.model_validate(
             {
                 "cells": [
                     {"requirement_id": "a-method", "facts": []},
-                    {"requirement_id": "b-method", "facts": "invalid"},
                 ]
             }
         )
 
-        self.assertEqual(len(batch.cells), 2)
-        self.assertEqual(batch.cells[1]["facts"], "invalid")
+        self.assertEqual(len(batch.cells), 1)
+        schema = str(EvidenceCompilationBatch.model_json_schema())
+        self.assertIn("statement", schema)
+        self.assertIn("chunk_ids", schema)
+        self.assertIn("fact_requirement_ids", schema)
+        with self.assertRaises(ValidationError):
+            EvidenceCompilationBatch.model_validate(
+                {"cells": [{"requirement_id": "b-method", "facts": "invalid"}]}
+            )
 
     def test_compiler_failed_is_distinct_from_evidence_insufficiency(self) -> None:
         assessment = EvidenceAssessment(

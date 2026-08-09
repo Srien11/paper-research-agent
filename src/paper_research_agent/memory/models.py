@@ -46,7 +46,7 @@ class ShortTermMemoryTurn(FrozenContract):
     expires_at: datetime
     user_question: str = Field(min_length=1)
     standalone_question: str = Field(min_length=1, max_length=2000)
-    status: Literal["answered", "insufficient_evidence"]
+    status: Literal["answered", "insufficient_evidence", "compiler_failed"]
     assistant_claims: tuple[str, ...] = ()
     source_refs: tuple[MemorySourceRef, ...] = ()
 
@@ -87,8 +87,8 @@ class ShortTermMemoryTurn(FrozenContract):
             raise ValueError("memory expiration must be after creation")
         if self.status == "answered" and not self.assistant_claims:
             raise ValueError("answered memory turn requires validated claims")
-        if self.status == "insufficient_evidence" and (self.assistant_claims or self.source_refs):
-            raise ValueError("insufficient memory turn cannot retain claims or sources")
+        if self.status != "answered" and (self.assistant_claims or self.source_refs):
+            raise ValueError("non-answer memory turn cannot retain claims or sources")
         chunk_ids = [source.chunk_id for source in self.source_refs]
         if len(set(chunk_ids)) != len(chunk_ids):
             raise ValueError("memory source chunk IDs must be unique")

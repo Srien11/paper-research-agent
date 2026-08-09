@@ -244,6 +244,7 @@ class LangChainEvidenceReasoner:
             self._comparison_model = self._model.with_structured_output(
                 EvidenceCompilationBatch,
                 method="function_calling",
+                include_raw=True,
             )
         committed: dict[str, EvidenceCellCompilation] = {}
         errors: dict[str, str] = {}
@@ -363,9 +364,13 @@ def _comparison_compilation_messages(
     scoped_evidence = []
     for item in evidence:
         eligible = item.get("eligible_requirement_ids")
-        if not isinstance(eligible, list):
+        if not isinstance(eligible, Sequence) or isinstance(eligible, (str, bytes)):
             continue
-        scoped_ids = [value for value in eligible if value in requested]
+        scoped_ids = [
+            value
+            for value in eligible
+            if isinstance(value, str) and value in requested
+        ]
         if scoped_ids:
             scoped_evidence.append({**item, "eligible_requirement_ids": scoped_ids})
     payload = {
@@ -420,21 +425,39 @@ def _validate_compilation_batch(
     bool,
 ]:
     """Validate and commit independent cells without losing valid siblings."""
-    try:
-        batch = EvidenceCompilationBatch.model_validate(raw)
-    except ValidationError as error:
-        code = _compilation_failure_code(error)
+    payload = _recover_compilation_payload(raw)
+    if not isinstance(payload, Mapping):
+        code = "compilation_batch_schema_invalid"
         return (
             {},
             {item: code for item in requested_requirement_ids},
             *_raw_cell_compilation_counts(raw),
             True,
         )
-    raw_cell_count, raw_fact_count = _raw_cell_compilation_counts(batch.model_dump())
+    cells = payload.get("cells")
+    if not isinstance(cells, Sequence) or isinstance(cells, (str, bytes)):
+        code = "compilation_cells_schema_invalid"
+        return (
+            {},
+            {item: code for item in requested_requirement_ids},
+            *_raw_cell_compilation_counts(payload),
+            True,
+        )
+    raw_cells = tuple(
+        cell.model_dump(mode="python")
+        if isinstance(cell, EvidenceCellCompilation)
+        else cell
+        for cell in cells
+    )
+    raw_cell_count, raw_fact_count = _raw_cell_compilation_counts(
+        {"cells": raw_cells}
+    )
     grouped: dict[str, list[dict[str, object]]] = {
         item: [] for item in requested_requirement_ids
     }
-    for raw_cell in batch.cells:
+    for raw_cell in raw_cells:
+        if not isinstance(raw_cell, dict):
+            continue
         requirement_id = raw_cell.get("requirement_id")
         if isinstance(requirement_id, str) and requirement_id in grouped:
             grouped[requirement_id].append(raw_cell)
@@ -459,6 +482,51 @@ def _validate_compilation_batch(
             errors[requirement_id] = _compilation_failure_code(error)
             schema_invalid = schema_invalid or isinstance(error, ValidationError)
     return accepted, errors, raw_cell_count, raw_fact_count, schema_invalid
+
+
+def _recover_compilation_payload(raw: Any) -> object:
+    """Recover function arguments even when strict batch parsing failed."""
+    if isinstance(raw, EvidenceCompilationBatch):
+        return raw.model_dump(mode="python")
+    if not isinstance(raw, Mapping) or not {
+        "raw",
+        "parsed",
+        "parsing_error",
+    } <= set(raw):
+        return raw
+    parsed = raw.get("parsed")
+    if isinstance(parsed, EvidenceCompilationBatch):
+        return parsed.model_dump(mode="python")
+    if isinstance(parsed, Mapping):
+        return parsed
+    message = raw.get("raw")
+    tool_calls = getattr(message, "tool_calls", ())
+    if isinstance(tool_calls, Sequence) and tool_calls:
+        first = tool_calls[0]
+        if isinstance(first, Mapping) and isinstance(first.get("args"), Mapping):
+            return first["args"]
+    additional = getattr(message, "additional_kwargs", None)
+    if not isinstance(additional, Mapping):
+        return None
+    provider_calls = additional.get("tool_calls")
+    if not isinstance(provider_calls, Sequence) or not provider_calls:
+        return None
+    first_call = provider_calls[0]
+    if not isinstance(first_call, Mapping):
+        return None
+    function = first_call.get("function")
+    if not isinstance(function, Mapping):
+        return None
+    arguments = function.get("arguments")
+    if isinstance(arguments, Mapping):
+        return arguments
+    if isinstance(arguments, str):
+        try:
+            decoded = json.loads(arguments)
+        except json.JSONDecodeError:
+            return None
+        return decoded
+    return None
 
 
 def _aggregate_unit_failure_code(errors: Mapping[str, str]) -> str:

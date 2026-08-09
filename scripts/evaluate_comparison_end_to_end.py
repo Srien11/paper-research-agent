@@ -28,7 +28,9 @@ from paper_research_agent.evaluation.comparison_end_to_end import (
     ComparisonEndToEndGold,
     ComparisonModelJudgeScore,
     RetrievalDiagnostic,
+    SemanticFactMatchDiagnostic,
     aggregate_answer_scores,
+    aggregate_compilation_audits,
     aggregate_fact_lineage,
     aggregate_smoke_cases,
     classify_fact_lineage,
@@ -44,6 +46,25 @@ class _JudgeItem(BaseModel):
     item_id: str
     hit: bool
     citation_supported: bool = False
+    matched_answer_claim_indexes: tuple[int, ...] = ()
+
+
+def _git_revision() -> str:
+    """Read the local Git revision without invoking a shell or exposing config."""
+    git_dir = PROJECT_ROOT / ".git"
+    head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
+    if not head.startswith("ref: "):
+        return head
+    reference = head.removeprefix("ref: ")
+    loose_ref = git_dir / reference
+    if loose_ref.is_file():
+        return loose_ref.read_text(encoding="utf-8").strip()
+    packed_refs = git_dir / "packed-refs"
+    if packed_refs.is_file():
+        for line in packed_refs.read_text(encoding="utf-8").splitlines():
+            if not line.startswith("#") and line.endswith(f" {reference}"):
+                return line.split(" ", 1)[0]
+    return "unknown"
 
 
 class _ForbiddenJudgeItem(BaseModel):
@@ -89,7 +110,9 @@ class _ComparisonJudge:
                         "requested JSON. Mark a required dimension or fact hit only if the answer "
                         "expresses it with material qualifiers intact. citation_supported is true "
                         "only when the answer's own cited excerpts entail that fact and belong to "
-                        "the stated paper. Mark forbidden facts if stated or clearly implied. Use no "
+                        "the stated paper. For every hit, return all matching zero-based answer claim "
+                        "indexes in matched_answer_claim_indexes; return an empty array for misses. "
+                        "Mark forbidden facts if stated or clearly implied. Use no "
                         "outside knowledge and return every supplied ID exactly once."
                     ),
                 },
@@ -140,7 +163,12 @@ class _ComparisonJudge:
                                     for item_id in dimension_ids
                                 ],
                                 "must_have": [
-                                    {"item_id": item_id, "hit": False, "citation_supported": False}
+                                    {
+                                        "item_id": item_id,
+                                        "hit": False,
+                                        "citation_supported": False,
+                                        "matched_answer_claim_indexes": [],
+                                    }
                                     for item_id in must_ids
                                 ],
                                 "forbidden": [
@@ -177,6 +205,16 @@ class _ComparisonJudge:
                     raise ValueError("judge returned invalid forbidden IDs")
                 if draft.supported_answer_claim_count > len(answer.claims):
                     raise ValueError("judge supported claim count exceeds answer claims")
+                for item in draft.must_have:
+                    indexes = item.matched_answer_claim_indexes
+                    if len(indexes) != len(set(indexes)) or any(
+                        index < 0 or index >= len(answer.claims) for index in indexes
+                    ):
+                        raise ValueError("judge returned invalid answer claim indexes")
+                    if item.hit != bool(indexes):
+                        raise ValueError("judge fact hit must match answer claim indexes")
+                    if item.citation_supported and not item.hit:
+                        raise ValueError("judge cannot support a missed fact")
                 return ComparisonModelJudgeScore(
                     dimension_hit=sum(item.hit for item in draft.dimensions),
                     dimension_total=len(dimension_ids),
@@ -190,6 +228,15 @@ class _ComparisonJudge:
                     answer_complete=draft.answer_complete,
                     supported_answer_claim_count=draft.supported_answer_claim_count,
                     answer_claim_count=len(answer.claims),
+                    semantic_fact_matches=tuple(
+                        SemanticFactMatchDiagnostic(
+                            claim_id=item.item_id,
+                            answer_claim_indexes=item.matched_answer_claim_indexes,
+                            citation_supported=item.citation_supported,
+                        )
+                        for item in draft.must_have
+                        if item.hit
+                    ),
                 )
             except (httpx.HTTPError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 last_error = exc
@@ -423,6 +470,7 @@ def _fact_lineage(
     *,
     research: Any | None,
     answer: Any | None,
+    model_judge_score: ComparisonModelJudgeScore | None,
 ) -> tuple[object, ...]:
     retrieved = tuple(
         hit.chunk_id
@@ -440,6 +488,12 @@ def _fact_lineage(
         else research.assessments[-1].ledger
     )
     compiled_facts = tuple(fact for cell in final_ledger for fact in cell.facts)
+    compiled_fact_by_id = {fact.fact_id: fact for fact in compiled_facts}
+    chunk_corpus_ids = {
+        record.chunk_id: record.corpus_id
+        for observation in (() if research is None else research.observations)
+        for record in observation.evidence.records
+    }
     compiler_visible_chunk_ids = (
         None
         if research is None
@@ -456,6 +510,12 @@ def _fact_lineage(
         {} if answer is None else {item.citation_id: item for item in answer.citations}
     )
     relation_by_id = {item.claim_id: item for item in gold.citation_relations}
+    semantic_match_by_id = {
+        item.claim_id: item
+        for item in (
+            () if model_judge_score is None else model_judge_score.semantic_fact_matches
+        )
+    }
     result = []
     for gold_claim in gold.must_have_claims:
         relation = relation_by_id[gold_claim.claim_id]
@@ -464,15 +524,40 @@ def _fact_lineage(
             fact for fact in compiled_facts if gold_chunks & set(fact.chunk_ids)
         )
         matching_fact_ids = {fact.fact_id for fact in matching_facts}
-        matching_claims = tuple(
+        exact_matching_claims = tuple(
             claim for claim in answer_claims if matching_fact_ids & set(claim.fact_ids)
         )
-        citation_correct = any(
+        exact_citation_correct = any(
             (citation := answer_citations.get(citation_id)) is not None
             and citation.chunk_id in gold_chunks
             and citation.corpus_id == gold_claim.corpus_id
-            for claim in matching_claims
+            for claim in exact_matching_claims
             for citation_id in claim.citation_ids
+        )
+        semantic_match = semantic_match_by_id.get(gold_claim.claim_id)
+        semantic_claims = tuple(
+            answer_claims[index]
+            for index in (
+                () if semantic_match is None else semantic_match.answer_claim_indexes
+            )
+            if 0 <= index < len(answer_claims)
+        )
+        semantic_fact_ids = {
+            fact_id for claim in semantic_claims for fact_id in claim.fact_ids
+        }
+        semantic_fact_by_id = {fact.fact_id: fact for fact in matching_facts}
+        for fact_id in semantic_fact_ids:
+            if fact_id in compiled_fact_by_id:
+                semantic_fact_by_id.setdefault(fact_id, compiled_fact_by_id[fact_id])
+        semantic_facts = tuple(semantic_fact_by_id.values())
+        semantic_chunk_ids = tuple(
+            chunk_id for fact in semantic_facts for chunk_id in fact.chunk_ids
+        )
+        alternative_chunk_ids = tuple(
+            chunk_id
+            for chunk_id in semantic_chunk_ids
+            if chunk_id not in gold_chunks
+            and chunk_corpus_ids.get(chunk_id) == gold_claim.corpus_id
         )
         result.append(
             classify_fact_lineage(
@@ -484,9 +569,15 @@ def _fact_lineage(
                 compiled_chunk_ids=(
                     chunk_id for fact in matching_facts for chunk_id in fact.chunk_ids
                 ),
-                in_generation_input=bool(matching_facts),
-                expressed=bool(matching_claims),
-                citation_correct=citation_correct,
+                semantic_compiled_chunk_ids=semantic_chunk_ids,
+                same_paper_alternative_chunk_ids=alternative_chunk_ids,
+                in_generation_input=bool(semantic_facts),
+                expressed=bool(semantic_claims or exact_matching_claims),
+                citation_correct=(
+                    semantic_match.citation_supported
+                    if semantic_match is not None
+                    else exact_citation_correct
+                ),
             )
         )
     return tuple(result)
@@ -596,6 +687,7 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
                         gold,
                         research=research,
                         answer=(result.answer if result is not None else None),
+                        model_judge_score=model_judge_score,
                     ),
                 }
             )
@@ -665,12 +757,15 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
                 if case.split == split
                 for item in case.fact_lineage
             ),
+            "compilation": aggregate_compilation_audits(
+                case for case in cases if case.split == split
+            ),
         }
         for split in split_counts
     }
     payload = {
         "schema_version": "comparison-e2e-run-v1",
-        "code_revision": "dad78a943330075e95f50ca3aa91341abfe38e8a",
+        "code_revision": _git_revision(),
         "question_count": len(cases),
         "split_counts": dict(split_counts),
         "summary": summary,
@@ -678,6 +773,7 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
         "fact_lineage": aggregate_fact_lineage(
             item for case in cases for item in case.fact_lineage
         ),
+        "compilation": aggregate_compilation_audits(cases),
         "split_summaries": split_summaries,
         "cases": [item.model_dump(mode="json") for item in cases],
     }

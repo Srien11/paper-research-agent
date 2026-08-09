@@ -213,7 +213,7 @@ class RAGAnswer(FrozenContract):
     """Validated local answer output with no evidence body or provider payload."""
 
     schema_version: Literal["rag-answer-v1"] = "rag-answer-v1"
-    status: Literal["answered", "insufficient_evidence"]
+    status: Literal["answered", "insufficient_evidence", "compiler_failed"]
     answer_markdown: str = Field(min_length=1)
     claims: tuple[AnswerClaim, ...]
     citations: tuple[AnswerCitation, ...]
@@ -233,7 +233,7 @@ class RAGAnswer(FrozenContract):
             if not self.claims or not self.citations or self.actual_model is None:
                 raise ValueError("answered result requires claims, citations, and actual_model")
         elif self.claims or self.citations:
-            raise ValueError("insufficient result cannot contain claims or citations")
+            raise ValueError("non-answer result cannot contain claims or citations")
         used = {identifier for claim in self.claims for identifier in claim.citation_ids}
         returned = {citation.citation_id for citation in self.citations}
         if used != returned:

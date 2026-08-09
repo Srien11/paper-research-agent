@@ -34,6 +34,28 @@ class ComparisonAnswerAudit(Protocol):
     def log(self, result: RAGAnswer) -> bool: ...
 
 
+def compiler_failed_comparison_answer(
+    generator: AsyncAnswerGenerator,
+) -> RAGAnswer:
+    """Return a deterministic failure without misreporting missing evidence."""
+    return RAGAnswer(
+        status="compiler_failed",
+        answer_markdown=(
+            "证据编译失败：系统未能把已检索证据转换为满足约束的比较事实。"
+            "这不表示论文证据不足，请稍后重试。"
+        ),
+        claims=(),
+        citations=(),
+        requested_model=generator.model_id,
+        actual_model=None,
+        prompt_version=generator.prompt_version,
+        input_tokens=0,
+        output_tokens=0,
+        latency_ms=0,
+        attempts=0,
+    )
+
+
 def build_comparison_answer_request(
     question: str,
     *,

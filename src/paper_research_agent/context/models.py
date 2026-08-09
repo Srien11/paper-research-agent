@@ -92,7 +92,7 @@ class ContextMemoryTurn(FrozenContract):
 
     turn_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     user_question: str = Field(min_length=1)
-    status: Literal["answered", "insufficient_evidence"]
+    status: Literal["answered", "insufficient_evidence", "compiler_failed"]
     assistant_claims: tuple[str, ...] = ()
 
     @field_validator("user_question")
@@ -117,8 +117,8 @@ class ContextMemoryTurn(FrozenContract):
     def validate_status(self) -> ContextMemoryTurn:
         if self.status == "answered" and not self.assistant_claims:
             raise ValueError("answered memory requires claims")
-        if self.status == "insufficient_evidence" and self.assistant_claims:
-            raise ValueError("insufficient memory cannot contain claims")
+        if self.status != "answered" and self.assistant_claims:
+            raise ValueError("non-answer memory cannot contain claims")
         return self
 
 

@@ -23,6 +23,7 @@ from paper_research_agent.answering.audit import SQLiteAnswerAuditLogger
 from paper_research_agent.answering.comparison import (
     answer_comparison,
     build_comparison_answer_request,
+    compiler_failed_comparison_answer,
 )
 from paper_research_agent.answering.config import load_answering_config
 from paper_research_agent.answering.dashscope import (
@@ -175,6 +176,9 @@ class SafeComparisonTrace(_FrozenWebModel):
     visible_compiler_chunk_count: int = Field(default=0, ge=0)
     compilation_attempt_outcomes: tuple[str, ...] = ()
     compilation_failure_codes: tuple[str, ...] = ()
+    compilation_accepted_requirement_ids: tuple[str, ...] = ()
+    compilation_failed_requirement_ids: tuple[str, ...] = ()
+    compilation_failed_unit_count: int = Field(default=0, ge=0)
     compilation_repair_applied: bool = False
     compilation_input_fact_count: int = Field(default=0, ge=0)
     compilation_retained_fact_count: int = Field(default=0, ge=0)
@@ -827,9 +831,19 @@ class RAGRuntime:
             and research.assessments
             else None
         )
-        if comparison_assessment is not None and any(
-            cell.facts for cell in comparison_assessment.ledger
+        has_compiled_comparison_facts = (
+            comparison_assessment is not None
+            and any(cell.facts for cell in comparison_assessment.ledger)
+        )
+        if (
+            comparison_assessment is not None
+            and comparison_assessment.status == "compiler_failed"
+            and not has_compiled_comparison_facts
         ):
+            context_request = context_request.model_copy(update={"evidence": ()})
+            context = assemble_context(context_request)
+            answer = compiler_failed_comparison_answer(self._generator)
+        elif comparison_assessment is not None and has_compiled_comparison_facts:
             assert research is not None
             context = assemble_comparison_context(
                 context_request,
@@ -1148,6 +1162,27 @@ class RAGRuntime:
                     )
                     if compilation_audit is not None
                     else ()
+                ),
+                compilation_accepted_requirement_ids=(
+                    tuple(
+                        dict.fromkeys(
+                            requirement_id
+                            for item in compilation_audit.attempts
+                            for requirement_id in item.accepted_requirement_ids
+                        )
+                    )
+                    if compilation_audit is not None
+                    else ()
+                ),
+                compilation_failed_requirement_ids=(
+                    compilation_audit.attempts[-1].failed_requirement_ids
+                    if compilation_audit is not None and compilation_audit.attempts
+                    else ()
+                ),
+                compilation_failed_unit_count=(
+                    len(compilation_audit.attempts[-1].failed_requirement_ids)
+                    if compilation_audit is not None and compilation_audit.attempts
+                    else 0
                 ),
                 compilation_repair_applied=(
                     repair_audit.applied if repair_audit is not None else False

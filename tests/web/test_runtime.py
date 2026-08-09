@@ -414,12 +414,17 @@ def _comparison_research_result(
                     failure_code="ledger_ids_mismatch",
                     raw_ledger_cell_count=1,
                     raw_fact_count=1,
+                    requested_requirement_ids=("a-method", "b-method"),
+                    accepted_requirement_ids=("a-method",),
+                    failed_requirement_ids=("b-method",),
                 ),
                 EvidenceCompilationAttemptAudit(
                     attempt=2,
                     outcome="validated",
                     raw_ledger_cell_count=2,
                     raw_fact_count=2,
+                    requested_requirement_ids=("b-method",),
+                    accepted_requirement_ids=("b-method",),
                 ),
             ),
             repair=EvidenceCompilationRepairAudit(
@@ -827,7 +832,121 @@ class RAGRuntimeTests(unittest.IsolatedAsyncioTestCase):
             ("ledger_ids_mismatch",),
         )
         self.assertEqual(result.comparison.compilation_retained_fact_count, 2)
+        self.assertEqual(
+            result.comparison.compilation_accepted_requirement_ids,
+            ("a-method", "b-method"),
+        )
+        self.assertFalse(result.comparison.compilation_failed_requirement_ids)
+        self.assertEqual(result.comparison.compilation_failed_unit_count, 0)
         self.assertEqual(len(result.sources), 2)
+
+    async def test_zero_fact_compiler_failure_is_not_reported_as_insufficient(self) -> None:
+        first = _chunk()
+        second_text = "SECOND_RAW_EVIDENCE_BODY"
+        second = first.model_copy(
+            update={
+                "chunk_id": "chunk-2",
+                "asset_id": "asset-2",
+                "corpus_id": "T001",
+                "text": second_text,
+                "text_sha256": _digest(second_text),
+            }
+        )
+        research = _comparison_research_result(first, second)
+        requirements = research.plan.requirements
+        failed_ids = tuple(item.requirement_id for item in requirements)
+        failed_assessment = EvidenceAssessment(
+            evidence_sufficient=False,
+            status="compiler_failed",
+            coverage=tuple(
+                EvidenceCoverage(requirement_id=item.requirement_id, covered=False)
+                for item in requirements
+            ),
+            ledger=tuple(
+                EvidenceLedgerCell(
+                    requirement_id=item.requirement_id,
+                    status="missing",
+                    missing_fact_requirement_ids=tuple(
+                        fact.fact_requirement_id for fact in item.fact_requirements
+                    ),
+                )
+                for item in requirements
+            ),
+            compilation_audit=EvidenceCompilationAudit(
+                attempts=(
+                    EvidenceCompilationAttemptAudit(
+                        attempt=1,
+                        outcome="schema_invalid",
+                        failure_code="compilation_units_invalid",
+                        requested_requirement_ids=failed_ids,
+                        failed_requirement_ids=failed_ids,
+                    ),
+                    EvidenceCompilationAttemptAudit(
+                        attempt=2,
+                        outcome="schema_invalid",
+                        failure_code="compilation_units_invalid",
+                        requested_requirement_ids=failed_ids,
+                        failed_requirement_ids=failed_ids,
+                    ),
+                ),
+                repair=EvidenceCompilationRepairAudit(
+                    applied=False,
+                    source_assessment_available=True,
+                    missing_ledger_cell_count=2,
+                ),
+            ),
+        )
+        research = research.model_copy(
+            update={
+                "assessments": (failed_assessment,),
+                "action_history": (
+                    ResearchActionRecord(
+                        sequence=1,
+                        action="finish",
+                        outcome="compiler_failed",
+                    ),
+                ),
+                "evidence_sufficient": False,
+                "termination_reason": "compiler_failed",
+            }
+        )
+        agent = FakeResearchAgent(research)
+        generator = FakeComparisonGenerator()
+        runtime = RAGRuntime(
+            RuntimeDependencies(
+                chunks=(first, second),
+                papers={
+                    "C001": SafePaperMetadata(
+                        corpus_id="C001",
+                        title="Paper A",
+                        official_url="https://example.test/a",
+                        storage_class="internal_research_only",
+                    ),
+                    "T001": SafePaperMetadata(
+                        corpus_id="T001",
+                        title="Paper B",
+                        official_url="https://example.test/b",
+                        storage_class="internal_research_only",
+                    ),
+                },
+                retriever=FakeRetriever(first),
+                generator=generator,
+                memory_store=FakeMemoryStore(),
+                memory_config=ShortTermMemoryConfig(),
+                research_agent=agent,
+                paper_candidate_retriever=AsyncMock(),
+            ),
+            research_agent_mode="always",
+        )
+
+        result = await runtime.ask("比较 A 和 B 的方法", session_id="compiler-failed")
+
+        self.assertEqual(result.answer.status, "compiler_failed")
+        self.assertIn("不表示论文证据不足", result.answer.answer_markdown)
+        self.assertEqual(generator.calls, 0)
+        self.assertEqual(result.comparison.compilation_failed_requirement_ids, failed_ids)
+        self.assertEqual(result.comparison.compilation_failed_unit_count, 2)
+        self.assertFalse(result.sources)
 
     async def test_shared_conversation_context_drives_retrieval_and_answer_prompt(self) -> None:
         runtime, retriever, generator = _runtime()

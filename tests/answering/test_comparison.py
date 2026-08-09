@@ -4,7 +4,10 @@ import hashlib
 import json
 import unittest
 
-from paper_research_agent.answering.comparison import answer_comparison
+from paper_research_agent.answering.comparison import (
+    answer_comparison,
+    compiler_failed_comparison_answer,
+)
 from paper_research_agent.answering.dashscope import AnswerGenerationError
 from paper_research_agent.answering.models import (
     ComparisonAnswerRequest,
@@ -117,6 +120,17 @@ class FailingGenerator:
 
 
 class ComparisonAnswerTests(unittest.IsolatedAsyncioTestCase):
+    def test_compiler_failure_is_not_reported_as_insufficient_evidence(self) -> None:
+        generator = FakeGenerator(({},))
+
+        result = compiler_failed_comparison_answer(generator)
+
+        self.assertEqual(result.status, "compiler_failed")
+        self.assertIn("不表示论文证据不足", result.answer_markdown)
+        self.assertFalse(result.claims)
+        self.assertFalse(result.citations)
+        self.assertEqual(generator.calls, 0)
+
     async def test_renders_every_ledger_fact_and_trusted_citation(self) -> None:
         generator = FakeGenerator(
             (

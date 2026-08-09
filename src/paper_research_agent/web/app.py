@@ -349,7 +349,11 @@ def _rag_answer_summary(
     if not summary:
         summary = _value(answer, "answer_markdown") or _value(answer, "answer")
     answer_status: ConversationStatus = (
-        "insufficient_evidence" if status_value == "insufficient_evidence" else "completed"
+        "failed"
+        if status_value == "compiler_failed"
+        else "insufficient_evidence"
+        if status_value == "insufficient_evidence"
+        else "completed"
     )
     source_ids = tuple(
         value
