@@ -6,6 +6,9 @@ from paper_research_agent.evaluation.comparison_end_to_end import (
     ComparisonEndToEndGold,
     ComparisonGoldCitationRelation,
     ComparisonGoldClaim,
+    CompilationAttemptDiagnostic,
+    CompilationAuditDiagnostic,
+    CompilationRepairDiagnostic,
     RetrievalDiagnostic,
     aggregate_fact_lineage,
     classify_fact_lineage,
@@ -107,6 +110,35 @@ def _case(**updates: object) -> ComparisonCaseDiagnostic:
     }
     values.update(updates)
     return ComparisonCaseDiagnostic.model_validate(values)
+
+
+def test_case_diagnostic_persists_body_free_compilation_audit() -> None:
+    audit = CompilationAuditDiagnostic(
+        attempts=(
+            CompilationAttemptDiagnostic(
+                attempt=1,
+                outcome="schema_invalid",
+                failure_code="schema_ledger_too_long",
+                raw_ledger_cell_count=4,
+                raw_fact_count=8,
+            ),
+        ),
+        repair=CompilationRepairDiagnostic(
+            applied=True,
+            source_assessment_available=True,
+            input_fact_count=8,
+            retained_fact_count=8,
+            dropped_chunk_scope_count=0,
+            dropped_fact_mapping_count=0,
+            missing_ledger_cell_count=0,
+            fallback_empty_used=False,
+        ),
+    )
+
+    case = _case(compilation_audit=audit)
+
+    assert case.compilation_audit == audit
+    assert "secret" not in str(case.compilation_audit.model_dump())
 
 
 def test_rewrite_retention_preserves_identifiers_numbers_and_metrics() -> None:

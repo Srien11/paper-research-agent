@@ -5,6 +5,7 @@ from __future__ import annotations
 from paper_research_agent.agent.models import (
     CompiledEvidenceFact,
     EvidenceAssessment,
+    EvidenceCompilationRepairAudit,
     EvidenceCoverage,
     EvidenceFollowup,
     EvidenceLedgerCell,
@@ -138,10 +139,27 @@ def repair_evidence_assessment(
     assessment: EvidenceAssessment | None,
 ) -> EvidenceAssessment:
     """Conservatively repair model-only structural drift without inventing evidence."""
+    repaired, _ = repair_evidence_assessment_with_audit(plan, observations, assessment)
+    return repaired
+
+
+def repair_evidence_assessment_with_audit(
+    plan: ResearchPlan,
+    observations: tuple[ResearchObservation, ...],
+    assessment: EvidenceAssessment | None,
+) -> tuple[EvidenceAssessment, EvidenceCompilationRepairAudit]:
+    """Repair an assessment and report body-free fact retention counts."""
     if assessment is None:
-        return _empty_assessment(plan, observations)
+        empty = _empty_assessment(plan, observations)
+        return empty, EvidenceCompilationRepairAudit(
+            applied=True,
+            source_assessment_available=False,
+            missing_ledger_cell_count=len(plan.requirements),
+            fallback_empty_used=True,
+        )
 
     if plan.task_type == "direct":
+        input_fact_count = sum(len(cell.facts) for cell in assessment.ledger)
         repaired = assessment.model_copy(
             update={
                 "coverage": (),
@@ -150,37 +168,57 @@ def repair_evidence_assessment(
                 "next_requirement_ids": (),
             }
         )
-        return validate_evidence_assessment(plan, observations, repaired)
+        validated = validate_evidence_assessment(plan, observations, repaired)
+        return validated, EvidenceCompilationRepairAudit(
+            applied=True,
+            source_assessment_available=True,
+            input_fact_count=input_fact_count,
+            dropped_fact_mapping_count=input_fact_count,
+        )
 
     available_by_requirement = _available_chunks_by_requirement(plan, observations)
     supplied = {item.requirement_id: item for item in assessment.coverage}
     supplied_ledger = {item.requirement_id: item for item in assessment.ledger}
+    expected_ids = {item.requirement_id for item in plan.requirements}
+    input_fact_count = sum(len(cell.facts) for cell in assessment.ledger)
+    dropped_chunk_scope_count = 0
+    dropped_fact_mapping_count = sum(
+        len(cell.facts)
+        for cell in assessment.ledger
+        if cell.requirement_id not in expected_ids
+    )
+    retained_fact_count = 0
+    missing_ledger_cell_count = sum(
+        item.requirement_id not in supplied_ledger for item in plan.requirements
+    )
     coverage: list[EvidenceCoverage] = []
     ledger: list[EvidenceLedgerCell] = []
     for requirement in plan.requirements:
         item = supplied.get(requirement.requirement_id)
         ledger_item = supplied_ledger.get(requirement.requirement_id)
-        facts = tuple(
-            CompiledEvidenceFact(
-                fact_id=fact.fact_id,
-                statement=fact.statement,
-                chunk_ids=tuple(
-                    chunk_id
-                    for chunk_id in fact.chunk_ids
-                    if chunk_id in available_by_requirement[requirement.requirement_id]
-                ),
-                fact_requirement_ids=_repair_fact_requirement_ids(
-                    fact, requirement
-                ),
-                qualifiers=fact.qualifiers,
-            )
-            for fact in (() if ledger_item is None else ledger_item.facts)
-            if all(
+        repaired_facts: list[CompiledEvidenceFact] = []
+        for fact in (() if ledger_item is None else ledger_item.facts):
+            if not all(
                 chunk_id in available_by_requirement[requirement.requirement_id]
                 for chunk_id in fact.chunk_ids
+            ):
+                dropped_chunk_scope_count += 1
+                continue
+            mapped_ids = _repair_fact_requirement_ids(fact, requirement)
+            if not mapped_ids:
+                dropped_fact_mapping_count += 1
+                continue
+            repaired_facts.append(
+                CompiledEvidenceFact(
+                    fact_id=fact.fact_id,
+                    statement=fact.statement,
+                    chunk_ids=fact.chunk_ids,
+                    fact_requirement_ids=mapped_ids,
+                    qualifiers=fact.qualifiers,
+                )
             )
-            and bool(_repair_fact_requirement_ids(fact, requirement))
-        )
+            retained_fact_count += 1
+        facts = tuple(repaired_facts)
         satisfied_fact_ids = {
             fact_requirement_id
             for fact in facts
@@ -226,7 +264,16 @@ def repair_evidence_assessment(
             coverage=tuple(coverage),
             ledger=tuple(ledger),
         )
-        return validate_evidence_assessment(plan, observations, repaired)
+        validated = validate_evidence_assessment(plan, observations, repaired)
+        return validated, EvidenceCompilationRepairAudit(
+            applied=True,
+            source_assessment_available=True,
+            input_fact_count=input_fact_count,
+            retained_fact_count=retained_fact_count,
+            dropped_chunk_scope_count=dropped_chunk_scope_count,
+            dropped_fact_mapping_count=dropped_fact_mapping_count,
+            missing_ledger_cell_count=missing_ledger_cell_count,
+        )
 
     requested_ids = tuple(
         requirement_id
@@ -258,7 +305,16 @@ def repair_evidence_assessment(
         next_objective=assessment.next_objective if has_follow_up else None,
         next_requirement_ids=requested_ids if has_follow_up else (),
     )
-    return validate_evidence_assessment(plan, observations, repaired)
+    validated = validate_evidence_assessment(plan, observations, repaired)
+    return validated, EvidenceCompilationRepairAudit(
+        applied=True,
+        source_assessment_available=True,
+        input_fact_count=input_fact_count,
+        retained_fact_count=retained_fact_count,
+        dropped_chunk_scope_count=dropped_chunk_scope_count,
+        dropped_fact_mapping_count=dropped_fact_mapping_count,
+        missing_ledger_cell_count=missing_ledger_cell_count,
+    )
 
 
 def ensure_incomplete_followups(

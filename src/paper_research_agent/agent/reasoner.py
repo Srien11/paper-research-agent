@@ -3,18 +3,24 @@
 from __future__ import annotations
 
 import json
+import re
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
+from pydantic import ValidationError
 
 from paper_research_agent.agent.coverage import (
     ensure_incomplete_followups,
-    repair_evidence_assessment,
+    repair_evidence_assessment_with_audit,
     validate_evidence_assessment,
 )
 from paper_research_agent.agent.models import (
     EvidenceAssessment,
+    EvidenceCompilationAttemptAudit,
+    EvidenceCompilationAudit,
+    EvidenceCompilationRepairAudit,
     EvidenceCompilationVisibility,
     EvidenceRecord,
     ResearchObservation,
@@ -120,14 +126,28 @@ class LangChainEvidenceReasoner:
             ),
         ]
         last_assessment: EvidenceAssessment | None = None
+        attempt_audits: list[EvidenceCompilationAttemptAudit] = []
         for attempt in range(2):
+            raw_ledger_cell_count: int | None = None
+            raw_fact_count: int | None = None
             try:
                 raw = await self._structured_model.ainvoke(messages)
+                raw_ledger_cell_count, raw_fact_count = _raw_compilation_counts(raw)
                 assessment = EvidenceAssessment.model_validate(raw)
                 last_assessment = assessment
+                raw_ledger_cell_count = len(assessment.ledger)
+                raw_fact_count = sum(len(cell.facts) for cell in assessment.ledger)
                 validated = validate_evidence_assessment(plan, observations, assessment)
                 if plan.task_type == "comparison" and not validated.ledger:
                     raise ValueError("comparison assessment requires a compiled evidence ledger")
+                attempt_audits.append(
+                    EvidenceCompilationAttemptAudit(
+                        attempt=attempt + 1,
+                        outcome="validated",
+                        raw_ledger_cell_count=raw_ledger_cell_count,
+                        raw_fact_count=raw_fact_count,
+                    )
+                )
                 completed = ensure_incomplete_followups(
                     plan,
                     observations,
@@ -135,9 +155,33 @@ class LangChainEvidenceReasoner:
                     remaining_steps=remaining_steps,
                 )
                 return completed.model_copy(
-                    update={"compilation_visibility": compilation_visibility}
+                    update={
+                        "compilation_visibility": compilation_visibility,
+                        "compilation_audit": EvidenceCompilationAudit(
+                            attempts=tuple(attempt_audits),
+                            repair=EvidenceCompilationRepairAudit(
+                                applied=False,
+                                source_assessment_available=True,
+                                input_fact_count=raw_fact_count,
+                                retained_fact_count=raw_fact_count,
+                            ),
+                        ),
+                    }
                 )
-            except ValueError:
+            except ValueError as error:
+                attempt_audits.append(
+                    EvidenceCompilationAttemptAudit(
+                        attempt=attempt + 1,
+                        outcome=(
+                            "schema_invalid"
+                            if isinstance(error, ValidationError)
+                            else "contract_invalid"
+                        ),
+                        failure_code=_compilation_failure_code(error),
+                        raw_ledger_cell_count=raw_ledger_cell_count,
+                        raw_fact_count=raw_fact_count,
+                    )
+                )
                 if attempt == 0:
                     messages = [
                         *messages,
@@ -153,7 +197,9 @@ class LangChainEvidenceReasoner:
                             )
                         ),
                     ]
-        repaired = repair_evidence_assessment(plan, observations, last_assessment)
+        repaired, repair_audit = repair_evidence_assessment_with_audit(
+            plan, observations, last_assessment
+        )
         completed = ensure_incomplete_followups(
             plan,
             observations,
@@ -161,8 +207,79 @@ class LangChainEvidenceReasoner:
             remaining_steps=remaining_steps,
         )
         return completed.model_copy(
-            update={"compilation_visibility": compilation_visibility}
+            update={
+                "compilation_visibility": compilation_visibility,
+                "compilation_audit": EvidenceCompilationAudit(
+                    attempts=tuple(attempt_audits),
+                    repair=repair_audit,
+                ),
+            }
         )
+
+
+def _compilation_failure_code(error: ValueError) -> str:
+    """Map validation failures to stable, body-free diagnostic codes."""
+    messages = [str(error)]
+    if isinstance(error, ValidationError):
+        messages = [str(item.get("msg", "")) for item in error.errors()]
+    mappings = (
+        ("coverage IDs", "coverage_ids_mismatch"),
+        ("coverage references evidence outside", "coverage_chunk_scope_invalid"),
+        ("ledger IDs", "ledger_ids_mismatch"),
+        ("requires a compiled evidence ledger", "ledger_missing"),
+        ("requires a fact requirement mapping", "fact_mapping_missing"),
+        ("unknown fact requirement", "fact_mapping_unknown"),
+        ("omits a required qualifier", "required_qualifier_missing"),
+        ("missing fact requirement IDs", "missing_fact_ids_mismatch"),
+        ("ledger fact references evidence outside", "fact_chunk_scope_invalid"),
+        ("exactly project to coverage chunks", "coverage_projection_mismatch"),
+        ("fact state must match coverage", "coverage_fact_state_mismatch"),
+        ("ledger status", "ledger_status_mismatch"),
+        ("cannot be sufficient with missing coverage", "sufficiency_mismatch"),
+        ("missing-coverage status", "assessment_status_mismatch"),
+        ("follow-up", "followup_contract_invalid"),
+        ("next requirement IDs", "next_requirement_invalid"),
+    )
+    for message in messages:
+        for fragment, code in mappings:
+            if fragment in message:
+                return code
+    if isinstance(error, ValidationError):
+        detail = error.errors(include_url=False, include_input=False)[0]
+        error_type = str(detail.get("type", "invalid"))
+        location = "_".join(
+            str(part)
+            for part in detail.get("loc", ())
+            if isinstance(part, str)
+        )
+        normalized = re.sub(
+            r"[^a-z0-9_]+",
+            "_",
+            f"schema_{location}_{error_type}".lower(),
+        ).strip("_")
+        return normalized[:96] or "assessment_schema_invalid"
+    return (
+        "assessment_schema_invalid"
+        if isinstance(error, ValidationError)
+        else "assessment_contract_invalid"
+    )
+
+
+def _raw_compilation_counts(raw: Any) -> tuple[int | None, int | None]:
+    """Count ledger cells and facts before schema validation, without retaining text."""
+    if not isinstance(raw, Mapping) or "ledger" not in raw:
+        return None, None
+    ledger = raw["ledger"]
+    if not isinstance(ledger, Sequence) or isinstance(ledger, (str, bytes)):
+        return None, None
+    fact_count = 0
+    for cell in ledger:
+        if not isinstance(cell, Mapping):
+            continue
+        facts = cell.get("facts", ())
+        if isinstance(facts, Sequence) and not isinstance(facts, (str, bytes)):
+            fact_count += len(facts)
+    return len(ledger), fact_count
 
 
 def _bounded_evidence(

@@ -4,6 +4,7 @@ import unittest
 
 from paper_research_agent.agent.coverage import (
     repair_evidence_assessment,
+    repair_evidence_assessment_with_audit,
     validate_evidence_assessment,
 )
 from paper_research_agent.agent.models import (
@@ -443,6 +444,48 @@ class EvidenceCoverageValidationTests(unittest.TestCase):
         self.assertTrue(all(not item.covered for item in repaired.coverage))
         self.assertEqual(repaired.next_requirement_ids, ("a-method",))
         validate_evidence_assessment(_plan(), (_observation(),), repaired)
+
+    def test_repair_audit_distinguishes_empty_fallback_from_fact_drops(self) -> None:
+        fallback, fallback_audit = repair_evidence_assessment_with_audit(
+            _plan(), (_observation(),), None
+        )
+        self.assertFalse(fallback.ledger[0].facts)
+        self.assertTrue(fallback_audit.fallback_empty_used)
+        self.assertFalse(fallback_audit.source_assessment_available)
+        self.assertEqual(fallback_audit.missing_ledger_cell_count, 2)
+
+        assessment = EvidenceAssessment(
+            evidence_sufficient=False,
+            status="missing_coverage",
+            ledger=(
+                EvidenceLedgerCell(
+                    requirement_id="a-method",
+                    status="sufficient",
+                    facts=(
+                        CompiledEvidenceFact(
+                            fact_id="valid",
+                            statement="Paper A uses method X.",
+                            chunk_ids=("chunk-a",),
+                        ),
+                        CompiledEvidenceFact(
+                            fact_id="outside",
+                            statement="Outside evidence.",
+                            chunk_ids=("chunk-outside",),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        repaired, audit = repair_evidence_assessment_with_audit(
+            _plan(), (_observation(),), assessment
+        )
+
+        self.assertEqual([fact.fact_id for fact in repaired.ledger[0].facts], ["valid"])
+        self.assertEqual(audit.input_fact_count, 2)
+        self.assertEqual(audit.retained_fact_count, 1)
+        self.assertEqual(audit.dropped_chunk_scope_count, 1)
+        self.assertEqual(audit.dropped_fact_mapping_count, 0)
+        self.assertEqual(audit.missing_ledger_cell_count, 1)
 
     def test_repair_limits_follow_up_to_the_first_requirement_cell(self) -> None:
         assessment = EvidenceAssessment(

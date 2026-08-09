@@ -10,6 +10,9 @@ from paper_research_agent.agent.dynamic.models import DynamicResearchResult
 from paper_research_agent.agent.models import (
     CompiledEvidenceFact,
     EvidenceAssessment,
+    EvidenceCompilationAttemptAudit,
+    EvidenceCompilationAudit,
+    EvidenceCompilationRepairAudit,
     EvidenceCompilationVisibility,
     EvidenceCoverage,
     EvidenceLedgerCell,
@@ -403,6 +406,29 @@ def _comparison_research_result(
                 requirements, (first, second), strict=True
             )
         ),
+        compilation_audit=EvidenceCompilationAudit(
+            attempts=(
+                EvidenceCompilationAttemptAudit(
+                    attempt=1,
+                    outcome="contract_invalid",
+                    failure_code="ledger_ids_mismatch",
+                    raw_ledger_cell_count=1,
+                    raw_fact_count=1,
+                ),
+                EvidenceCompilationAttemptAudit(
+                    attempt=2,
+                    outcome="validated",
+                    raw_ledger_cell_count=2,
+                    raw_fact_count=2,
+                ),
+            ),
+            repair=EvidenceCompilationRepairAudit(
+                applied=False,
+                source_assessment_available=True,
+                input_fact_count=2,
+                retained_fact_count=2,
+            ),
+        ),
     )
     context_evidence = tuple(
         ContextEvidence(
@@ -792,6 +818,15 @@ class RAGRuntimeTests(unittest.IsolatedAsyncioTestCase):
             ("a-method-primary", "b-method-primary"),
         )
         self.assertEqual(result.comparison.visible_compiler_chunk_count, 2)
+        self.assertEqual(
+            result.comparison.compilation_attempt_outcomes,
+            ("contract_invalid", "validated"),
+        )
+        self.assertEqual(
+            result.comparison.compilation_failure_codes,
+            ("ledger_ids_mismatch",),
+        )
+        self.assertEqual(result.comparison.compilation_retained_fact_count, 2)
         self.assertEqual(len(result.sources), 2)
 
     async def test_shared_conversation_context_drives_retrieval_and_answer_prompt(self) -> None:

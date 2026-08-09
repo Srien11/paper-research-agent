@@ -173,6 +173,15 @@ class SafeComparisonTrace(_FrozenWebModel):
     partial_requirement_ids: tuple[str, ...] = ()
     available_compiler_chunk_count: int = Field(default=0, ge=0)
     visible_compiler_chunk_count: int = Field(default=0, ge=0)
+    compilation_attempt_outcomes: tuple[str, ...] = ()
+    compilation_failure_codes: tuple[str, ...] = ()
+    compilation_repair_applied: bool = False
+    compilation_input_fact_count: int = Field(default=0, ge=0)
+    compilation_retained_fact_count: int = Field(default=0, ge=0)
+    compilation_dropped_chunk_scope_count: int = Field(default=0, ge=0)
+    compilation_dropped_fact_mapping_count: int = Field(default=0, ge=0)
+    compilation_missing_ledger_cell_count: int = Field(default=0, ge=0)
+    compilation_fallback_empty_used: bool = False
 
 
 class SafeEvidenceSource(_FrozenWebModel):
@@ -1067,6 +1076,10 @@ class RAGRuntime:
         comparison_trace = None
         if research is not None and research.plan.task_type == "comparison":
             final_assessment = research.assessments[-1]
+            compilation_audit = final_assessment.compilation_audit
+            repair_audit = (
+                compilation_audit.repair if compilation_audit is not None else None
+            )
             comparison_trace = SafeComparisonTrace(
                 requirement_count=len(research.plan.requirements),
                 fact_requirement_count=sum(
@@ -1121,6 +1134,49 @@ class RAGRuntime:
                         for item in final_assessment.compilation_visibility
                         for chunk_id in item.visible_chunk_ids
                     }
+                ),
+                compilation_attempt_outcomes=(
+                    tuple(item.outcome for item in compilation_audit.attempts)
+                    if compilation_audit is not None
+                    else ()
+                ),
+                compilation_failure_codes=(
+                    tuple(
+                        item.failure_code
+                        for item in compilation_audit.attempts
+                        if item.failure_code is not None
+                    )
+                    if compilation_audit is not None
+                    else ()
+                ),
+                compilation_repair_applied=(
+                    repair_audit.applied if repair_audit is not None else False
+                ),
+                compilation_input_fact_count=(
+                    repair_audit.input_fact_count if repair_audit is not None else 0
+                ),
+                compilation_retained_fact_count=(
+                    repair_audit.retained_fact_count if repair_audit is not None else 0
+                ),
+                compilation_dropped_chunk_scope_count=(
+                    repair_audit.dropped_chunk_scope_count
+                    if repair_audit is not None
+                    else 0
+                ),
+                compilation_dropped_fact_mapping_count=(
+                    repair_audit.dropped_fact_mapping_count
+                    if repair_audit is not None
+                    else 0
+                ),
+                compilation_missing_ledger_cell_count=(
+                    repair_audit.missing_ledger_cell_count
+                    if repair_audit is not None
+                    else 0
+                ),
+                compilation_fallback_empty_used=(
+                    repair_audit.fallback_empty_used
+                    if repair_audit is not None
+                    else False
                 ),
             )
         return RuntimeExecutionResult(

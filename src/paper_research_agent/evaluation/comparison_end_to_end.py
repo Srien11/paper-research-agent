@@ -146,6 +146,30 @@ class ComparisonModelJudgeScore(FrozenEvaluationModel):
     judge_error_type: str | None = None
 
 
+class CompilationAttemptDiagnostic(FrozenEvaluationModel):
+    attempt: int = Field(ge=1, le=2)
+    outcome: Literal["validated", "schema_invalid", "contract_invalid"]
+    failure_code: str | None = None
+    raw_ledger_cell_count: int | None = Field(default=None, ge=0)
+    raw_fact_count: int | None = Field(default=None, ge=0)
+
+
+class CompilationRepairDiagnostic(FrozenEvaluationModel):
+    applied: bool
+    source_assessment_available: bool
+    input_fact_count: int = Field(ge=0)
+    retained_fact_count: int = Field(ge=0)
+    dropped_chunk_scope_count: int = Field(ge=0)
+    dropped_fact_mapping_count: int = Field(ge=0)
+    missing_ledger_cell_count: int = Field(ge=0)
+    fallback_empty_used: bool
+
+
+class CompilationAuditDiagnostic(FrozenEvaluationModel):
+    attempts: tuple[CompilationAttemptDiagnostic, ...] = Field(max_length=2)
+    repair: CompilationRepairDiagnostic
+
+
 class ComparisonCaseDiagnostic(FrozenEvaluationModel):
     schema_version: Literal["comparison-e2e-diagnostic-v1"] = (
         "comparison-e2e-diagnostic-v1"
@@ -165,6 +189,7 @@ class ComparisonCaseDiagnostic(FrozenEvaluationModel):
     retrievals: tuple[RetrievalDiagnostic, ...]
     step_budget: int | None = Field(default=None, ge=1)
     assessment_count: int = Field(default=0, ge=0)
+    compilation_audit: CompilationAuditDiagnostic | None = None
     tool_call_count: int = Field(default=0, ge=0)
     tool_call_budget: int | None = Field(default=None, ge=1)
     citations: tuple[CitationDiagnostic, ...]

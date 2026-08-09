@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic.json_schema import SkipJsonSchema
 
 from paper_research_agent.ingestion.models import Sha256
 
@@ -439,6 +440,68 @@ class EvidenceCompilationVisibility(FrozenContract):
         return self
 
 
+class EvidenceCompilationAttemptAudit(FrozenContract):
+    """Body-free result of one structured evidence-compilation attempt."""
+
+    attempt: int = Field(ge=1, le=2)
+    outcome: Literal["validated", "schema_invalid", "contract_invalid"]
+    failure_code: str | None = Field(
+        default=None, pattern=r"^[a-z][a-z0-9_]{0,95}$"
+    )
+    raw_ledger_cell_count: int | None = Field(default=None, ge=0)
+    raw_fact_count: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def validate_attempt_outcome(self) -> EvidenceCompilationAttemptAudit:
+        if self.outcome == "validated" and self.failure_code is not None:
+            raise ValueError("validated compilation attempt cannot have a failure code")
+        if self.outcome != "validated" and self.failure_code is None:
+            raise ValueError("failed compilation attempt requires a failure code")
+        return self
+
+
+class EvidenceCompilationRepairAudit(FrozenContract):
+    """Body-free counts for conservative assessment repair."""
+
+    applied: bool
+    source_assessment_available: bool
+    input_fact_count: int = Field(default=0, ge=0)
+    retained_fact_count: int = Field(default=0, ge=0)
+    dropped_chunk_scope_count: int = Field(default=0, ge=0)
+    dropped_fact_mapping_count: int = Field(default=0, ge=0)
+    missing_ledger_cell_count: int = Field(default=0, ge=0)
+    fallback_empty_used: bool = False
+
+    @model_validator(mode="after")
+    def validate_repair_counts(self) -> EvidenceCompilationRepairAudit:
+        accounted = (
+            self.retained_fact_count
+            + self.dropped_chunk_scope_count
+            + self.dropped_fact_mapping_count
+        )
+        if accounted != self.input_fact_count:
+            raise ValueError("repair fact counts must account for every input fact")
+        if self.fallback_empty_used and self.source_assessment_available:
+            raise ValueError("empty fallback cannot have a source assessment")
+        return self
+
+
+class EvidenceCompilationAudit(FrozenContract):
+    """Local-only compilation diagnostics excluded from the provider schema."""
+
+    attempts: tuple[EvidenceCompilationAttemptAudit, ...] = Field(
+        default=(), max_length=2
+    )
+    repair: EvidenceCompilationRepairAudit
+
+    @model_validator(mode="after")
+    def validate_attempt_order(self) -> EvidenceCompilationAudit:
+        attempts = [item.attempt for item in self.attempts]
+        if attempts != list(range(1, len(attempts) + 1)):
+            raise ValueError("compilation audit attempts must be consecutive")
+        return self
+
+
 class EvidenceFollowup(FrozenContract):
     """One atomic retry query for one uncovered comparison requirement."""
 
@@ -592,6 +655,7 @@ class EvidenceAssessment(FrozenContract):
     compilation_visibility: tuple[EvidenceCompilationVisibility, ...] = Field(
         default=(), max_length=20
     )
+    compilation_audit: SkipJsonSchema[EvidenceCompilationAudit | None] = None
     followups: tuple[EvidenceFollowup, ...] = Field(default=(), max_length=4)
     next_query: str | None = Field(default=None, min_length=1, max_length=2000)
     next_objective: str | None = Field(default=None, min_length=1, max_length=500)

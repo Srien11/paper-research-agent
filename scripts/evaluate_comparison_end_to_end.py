@@ -348,6 +348,11 @@ def _diagnostic(
                     ),
                 )
             )
+    compilation_audit = None
+    if research is not None and research.assessments:
+        audit = research.assessments[-1].compilation_audit
+        if audit is not None:
+            compilation_audit = audit.model_dump(mode="json")
     citations: list[CitationDiagnostic] = []
     if answer is not None:
         citation_by_id = {item.citation_id: item for item in answer.citations}
@@ -394,6 +399,7 @@ def _diagnostic(
         retrievals=tuple(retrievals),
         step_budget=(int(research.step_budget) if research is not None else None),
         assessment_count=(len(research.assessments) if research is not None else 0),
+        compilation_audit=compilation_audit,
         tool_call_count=(int(research.tool_call_count) if research is not None else 0),
         tool_call_budget=(
             int(research.tool_call_budget) if research is not None else None

@@ -4,6 +4,8 @@ import json
 import unittest
 from unittest.mock import AsyncMock, Mock
 
+from pydantic import ValidationError
+
 from paper_research_agent.agent.models import (
     EvidenceAssessment,
     EvidenceFactRequirement,
@@ -20,6 +22,8 @@ from paper_research_agent.agent.models import (
 from paper_research_agent.agent.reasoner import (
     LangChainEvidenceReasoner,
     _bounded_evidence,
+    _compilation_failure_code,
+    _raw_compilation_counts,
 )
 
 
@@ -103,6 +107,26 @@ def _comparison_plan() -> ResearchPlan:
 
 
 class LangChainEvidenceReasonerTests(unittest.IsolatedAsyncioTestCase):
+    def test_schema_diagnostics_count_raw_facts_without_retaining_content(self) -> None:
+        raw = {
+            "ledger": [
+                {"facts": [{"statement": "secret"}, {"statement": "secret"}]},
+                {"facts": []},
+            ]
+        }
+        self.assertEqual(_raw_compilation_counts(raw), (2, 2))
+        self.assertEqual(_raw_compilation_counts({}), (None, None))
+
+        try:
+            EvidenceAssessment.model_validate(
+                {"evidence_sufficient": "invalid", "status": "missing_coverage"}
+            )
+        except ValidationError as error:
+            code = _compilation_failure_code(error)
+        else:  # pragma: no cover - protects the diagnostic fixture itself
+            self.fail("invalid assessment unexpectedly validated")
+        self.assertEqual(code, "schema_evidence_sufficient_bool_parsing")
+
     async def test_synthesizes_followup_for_partial_cell_when_model_omits_it(self) -> None:
         base = _comparison_plan()
         requirements = list(base.requirements)
@@ -352,6 +376,13 @@ class LangChainEvidenceReasonerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.evidence_sufficient)
         self.assertEqual(result.status, "missing_coverage")
         self.assertEqual(structured.ainvoke.await_count, 2)
+        self.assertIsNotNone(result.compilation_audit)
+        assert result.compilation_audit is not None
+        self.assertEqual(
+            [item.outcome for item in result.compilation_audit.attempts],
+            ["schema_invalid", "schema_invalid"],
+        )
+        self.assertTrue(result.compilation_audit.repair.fallback_empty_used)
         with self.assertRaisesRegex(ValueError, "remaining_steps"):
             await reasoner.assess(
                 "Question",
@@ -423,6 +454,11 @@ class LangChainEvidenceReasonerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.next_requirement_ids, ("b-method",))
         self.assertEqual(result.ledger[0].facts[0].fact_id, "a-method-f1")
+        self.assertIsNotNone(result.compilation_audit)
+        assert result.compilation_audit is not None
+        self.assertEqual(result.compilation_audit.attempts[0].outcome, "validated")
+        self.assertFalse(result.compilation_audit.repair.applied)
+        self.assertEqual(result.compilation_audit.repair.retained_fact_count, 1)
         messages = structured.ainvoke.await_args.args[0]
         self.assertIn("coverage", messages[0].content)
         payload = json.loads(messages[1].content)
@@ -546,6 +582,15 @@ class LangChainEvidenceReasonerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(structured.ainvoke.await_count, 2)
         self.assertEqual(result.next_requirement_ids, ("b-method",))
+        self.assertIsNotNone(result.compilation_audit)
+        assert result.compilation_audit is not None
+        self.assertEqual(
+            [item.outcome for item in result.compilation_audit.attempts],
+            ["contract_invalid", "contract_invalid"],
+        )
+        self.assertFalse(result.compilation_audit.repair.fallback_empty_used)
+        self.assertTrue(result.compilation_audit.repair.source_assessment_available)
+        self.assertEqual(result.compilation_audit.repair.retained_fact_count, 1)
 
 
 if __name__ == "__main__":

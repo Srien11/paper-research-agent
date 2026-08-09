@@ -7,6 +7,9 @@ from pydantic import ValidationError
 from paper_research_agent.agent.models import (
     CompiledEvidenceFact,
     EvidenceAssessment,
+    EvidenceCompilationAttemptAudit,
+    EvidenceCompilationAudit,
+    EvidenceCompilationRepairAudit,
     EvidenceCompilationVisibility,
     EvidenceCoverage,
     EvidenceFactRequirement,
@@ -42,6 +45,30 @@ def _hit(*, rank: int = 1) -> SearchCorpusHit:
 
 
 class ResearchToolModelTests(unittest.TestCase):
+    def test_compilation_audit_is_persisted_but_excluded_from_provider_schema(self) -> None:
+        audit = EvidenceCompilationAudit(
+            attempts=(
+                EvidenceCompilationAttemptAudit(attempt=1, outcome="validated"),
+            ),
+            repair=EvidenceCompilationRepairAudit(
+                applied=False,
+                source_assessment_available=True,
+            ),
+        )
+        assessment = EvidenceAssessment(
+            evidence_sufficient=False,
+            status="missing_coverage",
+            compilation_audit=audit,
+        )
+
+        self.assertEqual(
+            assessment.model_dump()["compilation_audit"]["attempts"][0]["outcome"],
+            "validated",
+        )
+        self.assertNotIn(
+            "compilation_audit", str(EvidenceAssessment.model_json_schema())
+        )
+
     def test_fact_requirements_support_partial_ledger_coverage(self) -> None:
         requirement = EvidenceRequirement(
             requirement_id="a-method",
