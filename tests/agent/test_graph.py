@@ -621,6 +621,44 @@ class ResearchGraphTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(service.search_corpus.await_count, 1)
         self.assertEqual(service.get_evidence.await_count, 1)
 
+    async def test_compiler_failure_terminates_without_becoming_insufficient(self) -> None:
+        planner = FakePlanner(
+            ResearchPlan(
+                steps=(
+                    ResearchStep(
+                        step_id="methods",
+                        objective="Find methods",
+                        query="RAG evaluation methods",
+                        top_k=1,
+                    ),
+                )
+            )
+        )
+        reasoner = FakeReasoner(_assessment(False, status="compiler_failed"))
+        service = AsyncMock()
+        service.search_corpus.return_value = SearchCorpusResult(
+            query="RAG evaluation methods",
+            index_id="idx-test",
+            degraded=False,
+            hits=(_hit("chunk-1", "C001", 1),),
+        )
+        service.get_evidence.return_value = GetEvidenceResult(
+            records=(_record("chunk-1", "C001"),)
+        )
+        graph = build_research_graph(
+            planner=planner,
+            reasoner=reasoner,
+            service=service,
+            max_steps=1,
+        )
+
+        state = await graph.ainvoke({"question": "Compare RAG evaluation methods"})
+
+        self.assertFalse(state["evidence_sufficient"])
+        self.assertEqual(state["assessments"][-1]["status"], "compiler_failed")
+        self.assertEqual(state["termination_reason"], "compiler_failed")
+        self.assertEqual(state["next_action"], "finish")
+
     async def test_replans_next_step_from_insufficient_evidence(self) -> None:
         planner = FakePlanner(
             ResearchPlan(

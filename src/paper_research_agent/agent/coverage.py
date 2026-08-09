@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from paper_research_agent.agent.models import (
+    AssessmentStatus,
     CompiledEvidenceFact,
     EvidenceAssessment,
+    EvidenceCellCompilation,
     EvidenceCompilationRepairAudit,
     EvidenceCoverage,
     EvidenceFollowup,
@@ -13,6 +17,134 @@ from paper_research_agent.agent.models import (
     ResearchObservation,
     ResearchPlan,
 )
+
+
+def validate_evidence_compilation_cell(
+    plan: ResearchPlan,
+    observations: tuple[ResearchObservation, ...],
+    cell: EvidenceCellCompilation,
+) -> EvidenceCellCompilation:
+    """Validate one minimal model-authored cell against trusted plan scope."""
+    if plan.task_type != "comparison":
+        raise ValueError("evidence cell compilation requires a comparison plan")
+    requirement_by_id = {item.requirement_id: item for item in plan.requirements}
+    requirement = requirement_by_id.get(cell.requirement_id)
+    if requirement is None:
+        raise ValueError("compiled evidence cell references an unknown requirement")
+    allowed_chunks = _available_chunks_by_requirement(plan, observations)[
+        cell.requirement_id
+    ]
+    expected_fact_ids = {
+        item.fact_requirement_id for item in requirement.fact_requirements
+    }
+    for fact in cell.facts:
+        if not set(fact.chunk_ids) <= allowed_chunks:
+            raise ValueError(
+                "compiled evidence fact references evidence outside its comparison cell"
+            )
+        if not set(fact.fact_requirement_ids) <= expected_fact_ids:
+            raise ValueError(
+                "compiled evidence fact references an unknown fact requirement"
+            )
+        required_qualifiers = {
+            kind
+            for item in requirement.fact_requirements
+            if item.fact_requirement_id in fact.fact_requirement_ids
+            for kind in item.required_qualifier_kinds
+        }
+        if not required_qualifiers <= {item.kind for item in fact.qualifiers}:
+            raise ValueError("compiled evidence fact omits a required qualifier")
+    return cell
+
+
+def project_evidence_compilation(
+    plan: ResearchPlan,
+    observations: tuple[ResearchObservation, ...],
+    *,
+    committed_cells: Mapping[str, EvidenceCellCompilation],
+    compiler_failed_requirement_ids: tuple[str, ...] = (),
+) -> EvidenceAssessment:
+    """Deterministically project committed minimal cells into a strict assessment."""
+    if plan.task_type != "comparison":
+        raise ValueError("evidence compilation projection requires a comparison plan")
+    expected_ids = {item.requirement_id for item in plan.requirements}
+    if set(committed_cells) - expected_ids:
+        raise ValueError("committed evidence contains an unknown requirement")
+    failed_ids = set(compiler_failed_requirement_ids)
+    if failed_ids - expected_ids:
+        raise ValueError("compiler failure references an unknown requirement")
+    if failed_ids & set(committed_cells):
+        raise ValueError("a compilation unit cannot be both committed and failed")
+
+    coverage: list[EvidenceCoverage] = []
+    ledger: list[EvidenceLedgerCell] = []
+    for requirement in plan.requirements:
+        cell = committed_cells.get(requirement.requirement_id)
+        if cell is not None:
+            validate_evidence_compilation_cell(plan, observations, cell)
+        facts = tuple(
+            CompiledEvidenceFact(
+                fact_id=f"{requirement.requirement_id}-f{index}",
+                statement=fact.statement,
+                chunk_ids=fact.chunk_ids,
+                fact_requirement_ids=fact.fact_requirement_ids,
+                qualifiers=fact.qualifiers,
+            )
+            for index, fact in enumerate(() if cell is None else cell.facts, 1)
+        )
+        satisfied_fact_ids = {
+            fact_requirement_id
+            for fact in facts
+            for fact_requirement_id in fact.fact_requirement_ids
+        }
+        missing_fact_ids = tuple(
+            item.fact_requirement_id
+            for item in requirement.fact_requirements
+            if item.fact_requirement_id not in satisfied_fact_ids
+        )
+        chunk_ids = tuple(
+            dict.fromkeys(chunk_id for fact in facts for chunk_id in fact.chunk_ids)
+        )
+        coverage.append(
+            EvidenceCoverage(
+                requirement_id=requirement.requirement_id,
+                covered=bool(facts),
+                chunk_ids=chunk_ids,
+            )
+        )
+        ledger.append(
+            EvidenceLedgerCell(
+                requirement_id=requirement.requirement_id,
+                status=(
+                    "missing"
+                    if not facts
+                    else "partial" if missing_fact_ids else "sufficient"
+                ),
+                facts=facts,
+                missing_fact_requirement_ids=missing_fact_ids,
+            )
+        )
+
+    evidence_sufficient = all(item.status == "sufficient" for item in ledger)
+    status: AssessmentStatus
+    if failed_ids:
+        status = "compiler_failed"
+        evidence_sufficient = False
+    elif evidence_sufficient:
+        status = "sufficient"
+    else:
+        has_evidence = any(item.evidence.records for item in observations)
+        status = "missing_coverage" if has_evidence else "no_hits"
+    return validate_evidence_assessment(
+        plan,
+        observations,
+        EvidenceAssessment(
+            evidence_sufficient=evidence_sufficient,
+            status=status,
+            coverage=tuple(coverage),
+            ledger=tuple(ledger),
+        ),
+    )
 
 
 def validate_evidence_assessment(

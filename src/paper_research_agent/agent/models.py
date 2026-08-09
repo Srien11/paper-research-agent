@@ -17,6 +17,7 @@ AssessmentStatus = Literal[
     "missing_coverage",
     "conflicting_evidence",
     "no_hits",
+    "compiler_failed",
 ]
 EvidenceLedgerStatus = Literal["sufficient", "partial", "missing", "conflicting"]
 EvidenceQualifierKind = Literal[
@@ -36,6 +37,7 @@ TerminationReason = Literal[
     "repeated_query",
     "step_budget",
     "time_budget",
+    "compiler_failed",
 ]
 ResearchActionName = Literal[
     "search_corpus",
@@ -46,7 +48,13 @@ ResearchActionName = Literal[
 ]
 
 ASSESSMENT_STATUSES: frozenset[str] = frozenset(
-    {"sufficient", "missing_coverage", "conflicting_evidence", "no_hits"}
+    {
+        "sufficient",
+        "missing_coverage",
+        "conflicting_evidence",
+        "no_hits",
+        "compiler_failed",
+    }
 )
 TERMINATION_REASONS: frozenset[str] = frozenset(
     {
@@ -57,6 +65,7 @@ TERMINATION_REASONS: frozenset[str] = frozenset(
         "repeated_query",
         "step_budget",
         "time_budget",
+        "compiler_failed",
     }
 )
 
@@ -334,6 +343,47 @@ class EvidenceQualifier(FrozenContract):
             raise ValueError("evidence qualifier value must not be blank")
         return normalized
 
+
+class EvidenceFactCompilation(FrozenContract):
+    """Minimal model-authored fact before deterministic ledger projection."""
+
+    statement: str = Field(min_length=1, max_length=1200)
+    chunk_ids: tuple[str, ...] = Field(min_length=1, max_length=20)
+    fact_requirement_ids: tuple[str, ...] = Field(min_length=1, max_length=6)
+    qualifiers: tuple[EvidenceQualifier, ...] = Field(default=(), max_length=12)
+
+    @field_validator("statement")
+    @classmethod
+    def normalize_statement(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("compiled evidence statement must not be blank")
+        return normalized
+
+    @field_validator("chunk_ids", "fact_requirement_ids")
+    @classmethod
+    def validate_identifier_list(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(value.strip() for value in values)
+        if any(not value for value in normalized):
+            raise ValueError("compiled evidence identifiers must not be blank")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("compiled evidence identifiers must be unique")
+        return normalized
+
+
+class EvidenceCellCompilation(FrozenContract):
+    """Minimal facts authored for one target-by-dimension requirement."""
+
+    requirement_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+    facts: tuple[EvidenceFactCompilation, ...] = Field(default=(), max_length=24)
+
+
+class EvidenceCompilationBatch(FrozenContract):
+    """Tolerant transport envelope whose cells are validated transactionally."""
+
+    cells: tuple[dict[str, object], ...] = Field(default=(), max_length=20)
+
+
 class CompiledEvidenceFact(FrozenContract):
     """One answer-ready atomic fact compiled from trusted local evidence IDs."""
 
@@ -450,6 +500,23 @@ class EvidenceCompilationAttemptAudit(FrozenContract):
     )
     raw_ledger_cell_count: int | None = Field(default=None, ge=0)
     raw_fact_count: int | None = Field(default=None, ge=0)
+    requested_requirement_ids: tuple[str, ...] = Field(default=(), max_length=20)
+    accepted_requirement_ids: tuple[str, ...] = Field(default=(), max_length=20)
+    failed_requirement_ids: tuple[str, ...] = Field(default=(), max_length=20)
+
+    @field_validator(
+        "requested_requirement_ids",
+        "accepted_requirement_ids",
+        "failed_requirement_ids",
+    )
+    @classmethod
+    def validate_requirement_ids(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(value.strip() for value in values)
+        if any(not value for value in normalized):
+            raise ValueError("compilation audit requirement IDs must not be blank")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("compilation audit requirement IDs must be unique")
+        return normalized
 
     @model_validator(mode="after")
     def validate_attempt_outcome(self) -> EvidenceCompilationAttemptAudit:
@@ -457,6 +524,15 @@ class EvidenceCompilationAttemptAudit(FrozenContract):
             raise ValueError("validated compilation attempt cannot have a failure code")
         if self.outcome != "validated" and self.failure_code is None:
             raise ValueError("failed compilation attempt requires a failure code")
+        requested = set(self.requested_requirement_ids)
+        accepted = set(self.accepted_requirement_ids)
+        failed = set(self.failed_requirement_ids)
+        if accepted & failed:
+            raise ValueError("accepted and failed compilation units must be disjoint")
+        if requested and accepted | failed != requested:
+            raise ValueError("compilation attempt must account for every requested unit")
+        if self.outcome == "validated" and failed:
+            raise ValueError("validated compilation attempt cannot contain failed units")
         return self
 
 

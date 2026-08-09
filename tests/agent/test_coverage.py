@@ -3,13 +3,16 @@ from __future__ import annotations
 import unittest
 
 from paper_research_agent.agent.coverage import (
+    project_evidence_compilation,
     repair_evidence_assessment,
     repair_evidence_assessment_with_audit,
     validate_evidence_assessment,
+    validate_evidence_compilation_cell,
 )
 from paper_research_agent.agent.models import (
     CompiledEvidenceFact,
     EvidenceAssessment,
+    EvidenceCellCompilation,
     EvidenceCoverage,
     EvidenceFactRequirement,
     EvidenceFollowup,
@@ -144,6 +147,88 @@ def _two_dimension_plan() -> ResearchPlan:
 
 
 class EvidenceCoverageValidationTests(unittest.TestCase):
+    def test_minimal_cell_validation_enforces_plan_fact_and_chunk_scope(self) -> None:
+        valid = EvidenceCellCompilation.model_validate(
+            {
+                "requirement_id": "a-method",
+                "facts": [
+                    {
+                        "statement": "Paper A uses method X.",
+                        "chunk_ids": ["chunk-a"],
+                        "fact_requirement_ids": ["a-method-primary"],
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(
+            validate_evidence_compilation_cell(
+                _plan(), (_observation(),), valid
+            ),
+            valid,
+        )
+        with self.assertRaisesRegex(ValueError, "outside its comparison cell"):
+            validate_evidence_compilation_cell(
+                _plan(),
+                (_observation(),),
+                valid.model_copy(
+                    update={
+                        "facts": (
+                            valid.facts[0].model_copy(
+                                update={"chunk_ids": ("chunk-b",)}
+                            ),
+                        )
+                    }
+                ),
+            )
+        with self.assertRaisesRegex(ValueError, "unknown fact requirement"):
+            validate_evidence_compilation_cell(
+                _plan(),
+                (_observation(),),
+                valid.model_copy(
+                    update={
+                        "facts": (
+                            valid.facts[0].model_copy(
+                                update={"fact_requirement_ids": ("unknown",)}
+                            ),
+                        )
+                    }
+                ),
+            )
+
+    def test_projection_derives_ledger_state_and_preserves_committed_units(self) -> None:
+        cell = EvidenceCellCompilation.model_validate(
+            {
+                "requirement_id": "a-method",
+                "facts": [
+                    {
+                        "statement": "Paper A uses method X.",
+                        "chunk_ids": ["chunk-a"],
+                        "fact_requirement_ids": ["a-method-primary"],
+                    }
+                ],
+            }
+        )
+
+        assessment = project_evidence_compilation(
+            _plan(),
+            (_observation(),),
+            committed_cells={"a-method": cell},
+            compiler_failed_requirement_ids=("b-method",),
+        )
+
+        self.assertEqual(assessment.status, "compiler_failed")
+        self.assertFalse(assessment.evidence_sufficient)
+        self.assertEqual(
+            [item.requirement_id for item in assessment.ledger],
+            ["a-method", "b-method"],
+        )
+        self.assertEqual(assessment.ledger[0].status, "sufficient")
+        self.assertEqual(assessment.ledger[0].facts[0].fact_id, "a-method-f1")
+        self.assertEqual(assessment.coverage[0].chunk_ids, ("chunk-a",))
+        self.assertEqual(assessment.ledger[1].status, "missing")
+        self.assertFalse(assessment.followups)
+
     def test_partial_cell_tracks_unsatisfied_fact_intent_and_allows_followup(self) -> None:
         base = _plan()
         requirements = list(base.requirements)

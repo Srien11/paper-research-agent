@@ -255,6 +255,8 @@ def build_research_graph(
         latest = assessments[-1]
         if latest.evidence_sufficient:
             return finish_or_assess("evidence_sufficient")
+        if latest.status == "compiler_failed":
+            return finish_or_assess("compiler_failed")
         if _remaining_runtime_seconds(
             state, runtime_policy
         ) < _supplemental_completion_reserve_seconds(state, runtime_policy):

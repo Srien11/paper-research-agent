@@ -7,8 +7,10 @@ from pydantic import ValidationError
 from paper_research_agent.agent.models import (
     CompiledEvidenceFact,
     EvidenceAssessment,
+    EvidenceCellCompilation,
     EvidenceCompilationAttemptAudit,
     EvidenceCompilationAudit,
+    EvidenceCompilationBatch,
     EvidenceCompilationRepairAudit,
     EvidenceCompilationVisibility,
     EvidenceCoverage,
@@ -45,6 +47,61 @@ def _hit(*, rank: int = 1) -> SearchCorpusHit:
 
 
 class ResearchToolModelTests(unittest.TestCase):
+    def test_minimal_compilation_contract_excludes_all_derived_state(self) -> None:
+        cell = EvidenceCellCompilation.model_validate(
+            {
+                "requirement_id": "a-method",
+                "facts": [
+                    {
+                        "statement": "Paper A uses method X.",
+                        "chunk_ids": ["chunk-a"],
+                        "fact_requirement_ids": ["a-method-primary"],
+                        "qualifiers": [{"kind": "method", "value": "method X"}],
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(cell.requirement_id, "a-method")
+        self.assertEqual(cell.facts[0].statement, "Paper A uses method X.")
+        schema = str(EvidenceCellCompilation.model_json_schema())
+        for derived in (
+            "coverage",
+            "status",
+            "missing_fact_requirement_ids",
+            "evidence_sufficient",
+            "followups",
+            "fact_id",
+        ):
+            self.assertNotIn(derived, schema)
+        with self.assertRaises(ValidationError):
+            EvidenceCellCompilation.model_validate(
+                {"requirement_id": "a-method", "facts": [], "status": "missing"}
+            )
+
+    def test_compilation_batch_preserves_invalid_units_for_transactional_validation(
+        self,
+    ) -> None:
+        batch = EvidenceCompilationBatch.model_validate(
+            {
+                "cells": [
+                    {"requirement_id": "a-method", "facts": []},
+                    {"requirement_id": "b-method", "facts": "invalid"},
+                ]
+            }
+        )
+
+        self.assertEqual(len(batch.cells), 2)
+        self.assertEqual(batch.cells[1]["facts"], "invalid")
+
+    def test_compiler_failed_is_distinct_from_evidence_insufficiency(self) -> None:
+        assessment = EvidenceAssessment(
+            evidence_sufficient=False,
+            status="compiler_failed",
+        )
+
+        self.assertEqual(assessment.status, "compiler_failed")
+
     def test_compilation_audit_is_persisted_but_excluded_from_provider_schema(self) -> None:
         audit = EvidenceCompilationAudit(
             attempts=(

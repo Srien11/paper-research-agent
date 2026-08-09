@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from paper_research_agent.agent.models import (
     EvidenceAssessment,
+    EvidenceCompilationBatch,
     EvidenceFactRequirement,
     EvidenceRecord,
     EvidenceRequirement,
@@ -148,35 +149,18 @@ class LangChainEvidenceReasonerTests(unittest.IsolatedAsyncioTestCase):
         model = Mock()
         structured = AsyncMock()
         structured.ainvoke.return_value = {
-            "evidence_sufficient": False,
-            "status": "missing_coverage",
-            "coverage": [
+            "cells": [
                 {
                     "requirement_id": "a-method",
-                    "covered": True,
-                    "chunk_ids": ["chunk-1"],
-                },
-                {"requirement_id": "b-method", "covered": False},
-            ],
-            "ledger": [
-                {
-                    "requirement_id": "a-method",
-                    "status": "partial",
                     "facts": [
                         {
-                            "fact_id": "a-method-f1",
                             "statement": "Paper A uses method X.",
                             "chunk_ids": ["chunk-1"],
                             "fact_requirement_ids": ["a-method-mechanism"],
                         }
                     ],
-                    "missing_fact_requirement_ids": ["a-method-input"],
                 },
-                {
-                    "requirement_id": "b-method",
-                    "status": "missing",
-                    "missing_fact_requirement_ids": ["b-method-primary"],
-                },
+                {"requirement_id": "b-method", "facts": []},
             ],
         }
         model.with_structured_output.return_value = structured
@@ -289,23 +273,9 @@ class LangChainEvidenceReasonerTests(unittest.IsolatedAsyncioTestCase):
         model = Mock()
         structured = AsyncMock()
         structured.ainvoke.return_value = {
-            "evidence_sufficient": False,
-            "status": "missing_coverage",
-            "coverage": [
-                {"requirement_id": "a-method", "covered": False},
-                {"requirement_id": "b-method", "covered": False},
-            ],
-            "followups": [
-                {
-                    "requirement_id": "a-method",
-                    "query": "Paper A method retry",
-                    "objective": "Retry Paper A method",
-                },
-                {
-                    "requirement_id": "b-method",
-                    "query": "Paper B method retry",
-                    "objective": "Retry Paper B method",
-                },
+            "cells": [
+                {"requirement_id": "a-method", "facts": []},
+                {"requirement_id": "b-method", "facts": []},
             ],
         }
         model.with_structured_output.return_value = structured
@@ -395,42 +365,20 @@ class LangChainEvidenceReasonerTests(unittest.IsolatedAsyncioTestCase):
         model = Mock()
         structured = AsyncMock()
         structured.ainvoke.return_value = {
-            "evidence_sufficient": False,
-            "status": "missing_coverage",
-            "coverage": [
+            "cells": [
                 {
                     "requirement_id": "a-method",
-                    "covered": True,
-                    "chunk_ids": ["chunk-1"],
-                },
-                {
-                    "requirement_id": "b-method",
-                    "covered": False,
-                    "chunk_ids": [],
-                },
-            ],
-            "ledger": [
-                {
-                    "requirement_id": "a-method",
-                    "status": "sufficient",
                     "facts": [
                         {
-                            "fact_id": "a-method-f1",
                             "statement": "Paper A uses method X.",
                             "chunk_ids": ["chunk-1"],
+                            "fact_requirement_ids": ["a-method-primary"],
                             "qualifiers": [{"kind": "method", "value": "X"}],
                         }
                     ],
                 },
-                {
-                    "requirement_id": "b-method",
-                    "status": "missing",
-                    "facts": [],
-                },
+                {"requirement_id": "b-method", "facts": []},
             ],
-            "next_query": "Paper B method",
-            "next_objective": "Cover Paper B method",
-            "next_requirement_ids": ["b-method"],
         }
         model.with_structured_output.return_value = structured
         reasoner = LangChainEvidenceReasoner(model)
@@ -452,7 +400,9 @@ class LangChainEvidenceReasonerTests(unittest.IsolatedAsyncioTestCase):
             remaining_steps=2,
         )
 
-        self.assertEqual(result.next_requirement_ids, ("b-method",))
+        self.assertEqual(
+            [item.requirement_id for item in result.followups], ["b-method"]
+        )
         self.assertEqual(result.ledger[0].facts[0].fact_id, "a-method-f1")
         self.assertIsNotNone(result.compilation_audit)
         assert result.compilation_audit is not None
@@ -460,11 +410,15 @@ class LangChainEvidenceReasonerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.compilation_audit.repair.applied)
         self.assertEqual(result.compilation_audit.repair.retained_fact_count, 1)
         messages = structured.ainvoke.await_args.args[0]
-        self.assertIn("coverage", messages[0].content)
+        self.assertIn("do not output fact_id, coverage", messages[0].content.lower())
+        self.assertIs(
+            model.with_structured_output.call_args_list[-1].args[0],
+            EvidenceCompilationBatch,
+        )
         payload = json.loads(messages[1].content)
-        self.assertEqual(payload["plan"]["task_type"], "comparison")
+        self.assertEqual(payload["kind"], "untrusted_minimal_evidence_compilation")
         self.assertEqual(
-            [item["requirement_id"] for item in payload["plan"]["requirements"]],
+            [item["requirement_id"] for item in payload["requirements"]],
             ["a-method", "b-method"],
         )
 
@@ -473,93 +427,73 @@ class LangChainEvidenceReasonerTests(unittest.IsolatedAsyncioTestCase):
         structured = AsyncMock()
         structured.ainvoke.side_effect = (
             {
-                "evidence_sufficient": False,
-                "status": "missing_coverage",
-                "coverage": [
+                "cells": [
                     {
                         "requirement_id": "a-method",
-                        "covered": True,
-                        "chunk_ids": ["chunk-1"],
-                    }
+                        "facts": [
+                            {
+                                "statement": "Paper A uses method X.",
+                                "chunk_ids": ["chunk-1"],
+                                "fact_requirement_ids": ["a-method-primary"],
+                            }
+                        ],
+                    },
                 ],
             },
             {
-                "evidence_sufficient": False,
-                "status": "missing_coverage",
-                "coverage": [
-                    {
-                        "requirement_id": "a-method",
-                        "covered": True,
-                        "chunk_ids": ["chunk-1"],
-                    },
-                    {
-                        "requirement_id": "b-method",
-                        "covered": False,
-                        "chunk_ids": [],
-                    },
-                ],
-                "next_query": "Paper B method",
-                "next_objective": "Cover Paper B method",
-                "next_requirement_ids": ["b-method"],
+                "cells": [{"requirement_id": "b-method", "facts": []}],
             },
         )
         model.with_structured_output.return_value = structured
         reasoner = LangChainEvidenceReasoner(model)
+        observation = _observation("Paper A uses method X.").model_copy(
+            update={"step_id": "a", "objective": "Find Paper A method"}
+        )
 
         result = await reasoner.assess(
             "Compare Paper A and Paper B",
             plan=_comparison_plan(),
-            observations=(_observation("Paper A uses method X."),),
+            observations=(observation,),
             remaining_steps=2,
         )
 
         self.assertEqual(structured.ainvoke.await_count, 2)
-        self.assertEqual(result.next_requirement_ids, ("b-method",))
+        self.assertEqual(result.ledger[0].facts[0].fact_id, "a-method-f1")
+        self.assertEqual(
+            [item.requirement_id for item in result.followups], ["b-method"]
+        )
         retry_messages = structured.ainvoke.await_args_list[1].args[0]
-        self.assertIn("previous structured decision", retry_messages[-1].content.lower())
+        retry_payload = json.loads(retry_messages[-1].content)
+        self.assertEqual(
+            [item["requirement_id"] for item in retry_payload["requirements"]],
+            ["b-method"],
+        )
+        self.assertEqual(
+            retry_payload["repair_errors"], {"b-method": "compilation_unit_missing"}
+        )
 
     async def test_repairs_multiple_follow_up_cells_after_retry(self) -> None:
         model = Mock()
         structured = AsyncMock()
         invalid = {
-            "evidence_sufficient": False,
-            "status": "missing_coverage",
-            "coverage": [
+            "cells": [
                 {
                     "requirement_id": "a-method",
-                    "covered": True,
-                    "chunk_ids": ["chunk-1"],
-                },
-                {
-                    "requirement_id": "b-method",
-                    "covered": False,
-                    "chunk_ids": [],
-                },
-            ],
-            "ledger": [
-                {
-                    "requirement_id": "a-method",
-                    "status": "sufficient",
                     "facts": [
                         {
-                            "fact_id": "a-method-f1",
                             "statement": "Paper A uses method X.",
                             "chunk_ids": ["chunk-1"],
-                            "qualifiers": [{"kind": "method", "value": "X"}],
+                            "fact_requirement_ids": ["a-method-primary"],
                         }
                     ],
                 },
-                {
-                    "requirement_id": "b-method",
-                    "status": "missing",
-                    "facts": [],
-                },
+                {"requirement_id": "b-method", "facts": "invalid"},
             ],
-            "next_query": "Paper B method",
-            "next_objective": "Cover the remaining method cell",
-            "next_requirement_ids": ["b-method", "a-method"],
         }
-        structured.ainvoke.return_value = invalid
+        structured.ainvoke.side_effect = (
+            invalid,
+            {"cells": [{"requirement_id": "b-method", "facts": "invalid"}]},
+        )
         model.with_structured_output.return_value = structured
         reasoner = LangChainEvidenceReasoner(model)
         observation = _observation("Paper A uses method X.")
@@ -581,12 +515,15 @@ class LangChainEvidenceReasonerTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(structured.ainvoke.await_count, 2)
-        self.assertEqual(result.next_requirement_ids, ("b-method",))
+        self.assertEqual(result.status, "compiler_failed")
+        self.assertEqual(result.ledger[0].facts[0].fact_id, "a-method-f1")
+        self.assertFalse(result.ledger[1].facts)
+        self.assertFalse(result.followups)
         self.assertIsNotNone(result.compilation_audit)
         assert result.compilation_audit is not None
         self.assertEqual(
             [item.outcome for item in result.compilation_audit.attempts],
-            ["contract_invalid", "contract_invalid"],
+            ["schema_invalid", "schema_invalid"],
         )
         self.assertFalse(result.compilation_audit.repair.fallback_empty_used)
         self.assertTrue(result.compilation_audit.repair.source_assessment_available)
