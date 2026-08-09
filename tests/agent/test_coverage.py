@@ -7,8 +7,12 @@ from paper_research_agent.agent.coverage import (
     validate_evidence_assessment,
 )
 from paper_research_agent.agent.models import (
+    CompiledEvidenceFact,
     EvidenceAssessment,
     EvidenceCoverage,
+    EvidenceFactRequirement,
+    EvidenceFollowup,
+    EvidenceLedgerCell,
     EvidenceRecord,
     EvidenceRequirement,
     GetEvidenceResult,
@@ -91,7 +95,204 @@ def _observation() -> ResearchObservation:
     )
 
 
+def _two_dimension_plan() -> ResearchPlan:
+    base = _plan()
+    return ResearchPlan.model_validate(
+        {
+            **base.model_dump(mode="json"),
+            "dimensions": [
+                *[item.model_dump(mode="json") for item in base.dimensions],
+                {"dimension_id": "metric", "label": "Metric"},
+            ],
+            "requirements": [
+                *[item.model_dump(mode="json") for item in base.requirements],
+                {
+                    "requirement_id": "a-metric",
+                    "target_id": "a",
+                    "dimension_id": "metric",
+                    "description": "Paper A metric",
+                },
+                {
+                    "requirement_id": "b-metric",
+                    "target_id": "b",
+                    "dimension_id": "metric",
+                    "description": "Paper B metric",
+                },
+            ],
+            "steps": [
+                *[item.model_dump(mode="json") for item in base.steps],
+                {
+                    "step_id": "a-metric",
+                    "objective": "Find A metric",
+                    "query": "Paper A metric",
+                    "corpus_id": "C001",
+                    "target_ids": ["a"],
+                    "dimension_ids": ["metric"],
+                },
+                {
+                    "step_id": "b-metric",
+                    "objective": "Find B metric",
+                    "query": "Paper B metric",
+                    "corpus_id": "T001",
+                    "target_ids": ["b"],
+                    "dimension_ids": ["metric"],
+                },
+            ],
+        }
+    )
+
+
 class EvidenceCoverageValidationTests(unittest.TestCase):
+    def test_partial_cell_tracks_unsatisfied_fact_intent_and_allows_followup(self) -> None:
+        base = _plan()
+        requirements = list(base.requirements)
+        requirements[0] = requirements[0].model_copy(
+            update={
+                "fact_requirements": (
+                    EvidenceFactRequirement(
+                        fact_requirement_id="a-method-mechanism",
+                        description="Core mechanism",
+                    ),
+                    EvidenceFactRequirement(
+                        fact_requirement_id="a-method-input",
+                        description="Input dependency",
+                    ),
+                )
+            }
+        )
+        plan = base.model_copy(update={"requirements": tuple(requirements)})
+        assessment = EvidenceAssessment(
+            evidence_sufficient=False,
+            status="missing_coverage",
+            coverage=(
+                EvidenceCoverage(
+                    requirement_id="a-method",
+                    covered=True,
+                    chunk_ids=("chunk-a",),
+                ),
+                EvidenceCoverage(requirement_id="b-method", covered=False),
+            ),
+            ledger=(
+                EvidenceLedgerCell(
+                    requirement_id="a-method",
+                    status="partial",
+                    facts=(
+                        CompiledEvidenceFact(
+                            fact_id="a-method-f1",
+                            statement="Paper A uses method X.",
+                            chunk_ids=("chunk-a",),
+                            fact_requirement_ids=("a-method-mechanism",),
+                        ),
+                    ),
+                    missing_fact_requirement_ids=("a-method-input",),
+                ),
+                EvidenceLedgerCell(
+                    requirement_id="b-method",
+                    status="missing",
+                    missing_fact_requirement_ids=("b-method-primary",),
+                ),
+            ),
+            followups=(
+                EvidenceFollowup(
+                    requirement_id="a-method",
+                    query="Paper A input dependency",
+                    objective="Find the missing Paper A input dependency",
+                ),
+            ),
+        )
+
+        self.assertIs(
+            validate_evidence_assessment(plan, (_observation(),), assessment),
+            assessment,
+        )
+        with self.assertRaisesRegex(ValueError, "missing coverage"):
+            validate_evidence_assessment(
+                plan,
+                (_observation(),),
+                assessment.model_copy(
+                    update={"evidence_sufficient": True, "status": "sufficient"}
+                ),
+            )
+
+    def test_validates_compiled_fact_against_its_requirement_cell(self) -> None:
+        assessment = EvidenceAssessment(
+            evidence_sufficient=False,
+            status="missing_coverage",
+            coverage=(
+                EvidenceCoverage(
+                    requirement_id="a-method",
+                    covered=True,
+                    chunk_ids=("chunk-a",),
+                ),
+                EvidenceCoverage(requirement_id="b-method", covered=False),
+            ),
+            ledger=(
+                EvidenceLedgerCell(
+                    requirement_id="a-method",
+                    status="sufficient",
+                    facts=(
+                        CompiledEvidenceFact(
+                            fact_id="a-method-f1",
+                            statement="Paper A uses method X.",
+                            chunk_ids=("chunk-a",),
+                        ),
+                    ),
+                ),
+                EvidenceLedgerCell(requirement_id="b-method", status="missing"),
+            ),
+        )
+
+        self.assertIs(
+            validate_evidence_assessment(_plan(), (_observation(),), assessment),
+            assessment,
+        )
+        tampered = assessment.model_copy(
+            update={
+                "ledger": (
+                    assessment.ledger[0].model_copy(
+                        update={
+                            "facts": (
+                                assessment.ledger[0].facts[0].model_copy(
+                                    update={"chunk_ids": ("outside",)}
+                                ),
+                            )
+                        }
+                    ),
+                    assessment.ledger[1],
+                )
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "outside its comparison cell"):
+            validate_evidence_assessment(_plan(), (_observation(),), tampered)
+
+    def test_accepts_queue_of_distinct_atomic_followups(self) -> None:
+        plan = _two_dimension_plan()
+        assessment = EvidenceAssessment(
+            evidence_sufficient=False,
+            status="missing_coverage",
+            coverage=tuple(
+                EvidenceCoverage(requirement_id=item.requirement_id, covered=False)
+                for item in plan.requirements
+            ),
+            followups=(
+                EvidenceFollowup(
+                    requirement_id="a-method",
+                    query="Paper A method retry",
+                    objective="Retry Paper A method",
+                ),
+                EvidenceFollowup(
+                    requirement_id="a-metric",
+                    query="Paper A metric retry",
+                    objective="Retry Paper A metric",
+                ),
+            ),
+        )
+
+        self.assertIs(
+            validate_evidence_assessment(plan, (_observation(),), assessment),
+            assessment,
+        )
+
     def test_accepts_complete_and_traceable_comparison_coverage(self) -> None:
         assessment = EvidenceAssessment(
             evidence_sufficient=False,
@@ -165,51 +366,8 @@ class EvidenceCoverageValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "comparison cell"):
             validate_evidence_assessment(_plan(), (_observation(),), assessment)
 
-    def test_rejects_chunk_from_the_wrong_dimension_cell(self) -> None:
-        base = _plan()
-        plan = ResearchPlan.model_validate(
-            {
-                **base.model_dump(mode="json"),
-                "dimensions": [
-                    *[item.model_dump(mode="json") for item in base.dimensions],
-                    {"dimension_id": "metric", "label": "Metric"},
-                ],
-                "requirements": [
-                    *[item.model_dump(mode="json") for item in base.requirements],
-                    {
-                        "requirement_id": "a-metric",
-                        "target_id": "a",
-                        "dimension_id": "metric",
-                        "description": "Paper A metric",
-                    },
-                    {
-                        "requirement_id": "b-metric",
-                        "target_id": "b",
-                        "dimension_id": "metric",
-                        "description": "Paper B metric",
-                    },
-                ],
-                "steps": [
-                    *[item.model_dump(mode="json") for item in base.steps],
-                    {
-                        "step_id": "a-metric",
-                        "objective": "Find A metric",
-                        "query": "Paper A metric",
-                        "corpus_id": "C001",
-                        "target_ids": ["a"],
-                        "dimension_ids": ["metric"],
-                    },
-                    {
-                        "step_id": "b-metric",
-                        "objective": "Find B metric",
-                        "query": "Paper B metric",
-                        "corpus_id": "T001",
-                        "target_ids": ["b"],
-                        "dimension_ids": ["metric"],
-                    },
-                ],
-            }
-        )
+    def test_accepts_same_paper_chunk_from_another_dimension_cell(self) -> None:
+        plan = _two_dimension_plan()
         assessment = EvidenceAssessment(
             evidence_sufficient=False,
             status="missing_coverage",
@@ -223,10 +381,12 @@ class EvidenceCoverageValidationTests(unittest.TestCase):
             ),
         )
 
-        with self.assertRaisesRegex(ValueError, "comparison cell"):
-            validate_evidence_assessment(plan, (_observation(),), assessment)
+        self.assertIs(
+            validate_evidence_assessment(plan, (_observation(),), assessment),
+            assessment,
+        )
 
-    def test_rejects_follow_up_that_spans_multiple_target_corpora(self) -> None:
+    def test_rejects_follow_up_that_spans_multiple_requirement_cells(self) -> None:
         assessment = EvidenceAssessment(
             evidence_sufficient=False,
             status="missing_coverage",
@@ -239,7 +399,7 @@ class EvidenceCoverageValidationTests(unittest.TestCase):
             next_requirement_ids=("a-method", "b-method"),
         )
 
-        with self.assertRaisesRegex(ValueError, "one corpus"):
+        with self.assertRaisesRegex(ValueError, "one requirement cell"):
             validate_evidence_assessment(_plan(), (_observation(),), assessment)
 
     def test_direct_plan_rejects_comparison_only_fields(self) -> None:
@@ -284,7 +444,7 @@ class EvidenceCoverageValidationTests(unittest.TestCase):
         self.assertEqual(repaired.next_requirement_ids, ("a-method",))
         validate_evidence_assessment(_plan(), (_observation(),), repaired)
 
-    def test_repair_limits_follow_up_to_the_first_target_corpus(self) -> None:
+    def test_repair_limits_follow_up_to_the_first_requirement_cell(self) -> None:
         assessment = EvidenceAssessment(
             evidence_sufficient=False,
             status="missing_coverage",
@@ -301,6 +461,28 @@ class EvidenceCoverageValidationTests(unittest.TestCase):
 
         self.assertEqual(repaired.next_requirement_ids, ("a-method",))
         validate_evidence_assessment(_plan(), (_observation(),), repaired)
+
+    def test_rejects_and_repairs_follow_up_with_multiple_dimensions_for_one_target(self) -> None:
+        plan = _two_dimension_plan()
+        assessment = EvidenceAssessment(
+            evidence_sufficient=False,
+            status="missing_coverage",
+            coverage=tuple(
+                EvidenceCoverage(requirement_id=item.requirement_id, covered=False)
+                for item in plan.requirements
+            ),
+            next_query="Paper A method and metric",
+            next_objective="Fill Paper A missing evidence",
+            next_requirement_ids=("a-method", "a-metric"),
+        )
+
+        with self.assertRaisesRegex(ValueError, "one requirement cell"):
+            validate_evidence_assessment(plan, (_observation(),), assessment)
+
+        repaired = repair_evidence_assessment(plan, (_observation(),), assessment)
+
+        self.assertEqual(repaired.next_requirement_ids, ("a-method",))
+        validate_evidence_assessment(plan, (_observation(),), repaired)
 
 
 if __name__ == "__main__":

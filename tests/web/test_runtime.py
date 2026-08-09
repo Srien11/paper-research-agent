@@ -8,13 +8,20 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from paper_research_agent.agent.dynamic.models import DynamicResearchResult
 from paper_research_agent.agent.models import (
+    CompiledEvidenceFact,
     EvidenceAssessment,
+    EvidenceCompilationVisibility,
+    EvidenceCoverage,
+    EvidenceLedgerCell,
     EvidenceRecord,
+    EvidenceRequirement,
     GetEvidenceResult,
     ResearchActionRecord,
+    ResearchDimension,
     ResearchObservation,
     ResearchPlan,
     ResearchStep,
+    ResearchTarget,
     SearchCorpusHit,
     SearchCorpusResult,
 )
@@ -154,6 +161,27 @@ class FakeGenerator:
         self.closed += 1
 
 
+class FakeComparisonGenerator(FakeGenerator):
+    async def generate(self, request: AnswerRequest) -> GenerationResult:
+        self.calls += 1
+        self.requests.append(request)
+        return GenerationResult(
+            content=(
+                '{"status":"answered","claims":[{"text":"organized",'
+                '"citation_ids":["E1","E2"],'
+                '"fact_ids":["a-method-f1","b-method-f1"]}],'
+                '"insufficient_reason":null}'
+            ),
+            requested_model=self.model_id,
+            actual_model=self.model_id,
+            prompt_version=self.prompt_version,
+            input_tokens=20,
+            output_tokens=10,
+            latency_ms=2,
+            attempts=1,
+        )
+
+
 class FakeMemoryStore:
     def __init__(self):
         self.turns: list[ShortTermMemoryTurn] = []
@@ -216,12 +244,7 @@ def _research_result(chunk: EvidenceChunk) -> ResearchRuntimeResult:
                 evidence=GetEvidenceResult(records=(record,)),
             ),
         ),
-        assessments=(
-            EvidenceAssessment(
-                evidence_sufficient=True,
-                status="sufficient",
-            ),
-        ),
+        assessments=(EvidenceAssessment(evidence_sufficient=True, status="sufficient"),),
         action_history=(
             ResearchActionRecord(
                 sequence=1,
@@ -262,11 +285,167 @@ def _research_result(chunk: EvidenceChunk) -> ResearchRuntimeResult:
                 final_rank=1,
             ),
         ),
+        step_budget=3,
         tool_call_count=2,
+        tool_call_budget=6,
         replan_count=0,
         evidence_sufficient=True,
         termination_reason="evidence_sufficient",
         task_state='{"kind":"untrusted_research_task_state","step_id":"methods"}',
+    )
+
+
+def _comparison_research_result(
+    first: EvidenceChunk,
+    second: EvidenceChunk,
+) -> ResearchRuntimeResult:
+    targets = (
+        ResearchTarget(target_id="a", label="Paper A", corpus_id=first.corpus_id),
+        ResearchTarget(target_id="b", label="Paper B", corpus_id=second.corpus_id),
+    )
+    dimension = ResearchDimension(dimension_id="method", label="方法")
+    requirements = tuple(
+        EvidenceRequirement(
+            requirement_id=f"{target.target_id}-method",
+            target_id=target.target_id,
+            dimension_id="method",
+            description=f"{target.label} method",
+        )
+        for target in targets
+    )
+    steps = tuple(
+        ResearchStep(
+            step_id=item.requirement_id,
+            objective=item.description,
+            query=item.description,
+            corpus_id=target.corpus_id,
+            target_ids=(target.target_id,),
+            dimension_ids=("method",),
+        )
+        for item, target in zip(requirements, targets, strict=True)
+    )
+    observations = []
+    for step, chunk in zip(steps, (first, second), strict=True):
+        record = EvidenceRecord(
+            chunk_id=chunk.chunk_id,
+            corpus_id=chunk.corpus_id,
+            section_id=chunk.section_id,
+            page_start=chunk.page_start,
+            page_end=chunk.page_end,
+            text=chunk.text,
+            text_sha256=chunk.text_sha256,
+            storage_class="internal_research_only",
+        )
+        observations.append(
+            ResearchObservation(
+                step_id=step.step_id,
+                objective=step.objective,
+                search=SearchCorpusResult(
+                    query=step.query,
+                    corpus_id=chunk.corpus_id,
+                    index_id="idx-agent",
+                    degraded=False,
+                    hits=(
+                        SearchCorpusHit(
+                            chunk_id=chunk.chunk_id,
+                            corpus_id=chunk.corpus_id,
+                            section_id=chunk.section_id,
+                            page_start=chunk.page_start,
+                            page_end=chunk.page_end,
+                            text_sha256=chunk.text_sha256,
+                            storage_class="internal_research_only",
+                            final_rank=1,
+                        ),
+                    ),
+                ),
+                evidence=GetEvidenceResult(records=(record,)),
+            )
+        )
+    coverage = tuple(
+        EvidenceCoverage(
+            requirement_id=requirement.requirement_id,
+            covered=True,
+            chunk_ids=(chunk.chunk_id,),
+        )
+        for requirement, chunk in zip(requirements, (first, second), strict=True)
+    )
+    ledger = tuple(
+        EvidenceLedgerCell(
+            requirement_id=requirement.requirement_id,
+            status="sufficient",
+            facts=(
+                CompiledEvidenceFact(
+                    fact_id=f"{requirement.requirement_id}-f1",
+                    statement=f"{target.label} uses a verified method.",
+                    chunk_ids=(chunk.chunk_id,),
+                    fact_requirement_ids=(
+                        requirement.fact_requirements[0].fact_requirement_id,
+                    ),
+                ),
+            ),
+        )
+        for requirement, target, chunk in zip(
+            requirements, targets, (first, second), strict=True
+        )
+    )
+    assessment = EvidenceAssessment(
+        evidence_sufficient=True,
+        status="sufficient",
+        coverage=coverage,
+        ledger=ledger,
+        compilation_visibility=tuple(
+            EvidenceCompilationVisibility(
+                requirement_id=requirement.requirement_id,
+                available_chunk_ids=(chunk.chunk_id,),
+                visible_chunk_ids=(chunk.chunk_id,),
+            )
+            for requirement, chunk in zip(
+                requirements, (first, second), strict=True
+            )
+        ),
+    )
+    context_evidence = tuple(
+        ContextEvidence(
+            chunk_id=chunk.chunk_id,
+            corpus_id=chunk.corpus_id,
+            asset_id=chunk.asset_id,
+            section_id=chunk.section_id,
+            page_start=chunk.page_start,
+            page_end=chunk.page_end,
+            text=chunk.text,
+            text_sha256=chunk.text_sha256,
+            storage_class="internal_research_only",
+            final_score=1 / index,
+            final_rank=index,
+        )
+        for index, chunk in enumerate((first, second), 1)
+    )
+    return ResearchRuntimeResult(
+        question="比较 A 和 B 的方法",
+        plan=ResearchPlan(
+            task_type="comparison",
+            targets=targets,
+            dimensions=(dimension,),
+            requirements=requirements,
+            steps=steps,
+        ),
+        observations=tuple(observations),
+        assessments=(assessment,),
+        action_history=(
+            ResearchActionRecord(
+                sequence=1,
+                action="finish",
+                outcome="evidence_sufficient",
+            ),
+        ),
+        evidence=context_evidence,
+        step_budget=2,
+        tool_call_count=4,
+        tool_call_budget=4,
+        replan_count=0,
+        evidence_sufficient=True,
+        termination_reason="evidence_sufficient",
+        task_state='{"kind":"untrusted_research_task_state"}',
     )
 
 
@@ -388,11 +567,14 @@ def _runtime(
 
 
 class RAGRuntimeTests(unittest.IsolatedAsyncioTestCase):
-    def test_research_policy_default_timeout_covers_six_step_budget(self) -> None:
+    def test_research_policy_defaults_cover_bounded_dynamic_budget(self) -> None:
         with patch.dict("os.environ", {}, clear=True):
             policy = _research_policy_from_environment()
 
-        self.assertEqual(policy.timeout_seconds, 120)
+        self.assertEqual(policy.max_steps, 24)
+        self.assertEqual(policy.max_followup_steps, 4)
+        self.assertEqual(policy.max_tool_calls, 48)
+        self.assertEqual(policy.timeout_seconds, 180)
 
     def test_from_environment_requires_corpus_and_forwards_optional_paths(self) -> None:
         with (
@@ -482,9 +664,9 @@ class RAGRuntimeTests(unittest.IsolatedAsyncioTestCase):
             kwargs["checkpoint_path"],
             Path("project-root/private/agent.sqlite3"),
         )
-        self.assertEqual(kwargs["policy"].max_steps, 4)
+        self.assertEqual(kwargs["policy"].max_steps, 24)
         self.assertEqual(kwargs["policy"].evidence_per_step, 3)
-        self.assertEqual(kwargs["policy"].max_tool_calls, 12)
+        self.assertEqual(kwargs["policy"].max_tool_calls, 48)
         self.assertEqual(kwargs["policy"].timeout_seconds, 45)
         self.assertEqual(kwargs["mode"], "auto")
 
@@ -550,6 +732,67 @@ class RAGRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(agent.clear_calls, ["d" * 32])
         await runtime.aclose()
         self.assertEqual(agent.closed, 1)
+
+    async def test_comparison_uses_compiled_ledger_without_raw_evidence_text(self) -> None:
+        first = _chunk()
+        second_text = "SECOND_RAW_EVIDENCE_BODY"
+        second = first.model_copy(
+            update={
+                "chunk_id": "chunk-2",
+                "asset_id": "asset-2",
+                "corpus_id": "T001",
+                "text": second_text,
+                "text_sha256": _digest(second_text),
+            }
+        )
+        agent = FakeResearchAgent(_comparison_research_result(first, second))
+        generator = FakeComparisonGenerator()
+        runtime = RAGRuntime(
+            RuntimeDependencies(
+                chunks=(first, second),
+                papers={
+                    "C001": SafePaperMetadata(
+                        corpus_id="C001",
+                        title="Paper A",
+                        official_url="https://example.test/a",
+                        storage_class="internal_research_only",
+                    ),
+                    "T001": SafePaperMetadata(
+                        corpus_id="T001",
+                        title="Paper B",
+                        official_url="https://example.test/b",
+                        storage_class="internal_research_only",
+                    ),
+                },
+                retriever=FakeRetriever(first),
+                generator=generator,
+                memory_store=FakeMemoryStore(),
+                memory_config=ShortTermMemoryConfig(),
+                research_agent=agent,
+                paper_candidate_retriever=AsyncMock(),
+            ),
+            research_agent_mode="always",
+        )
+
+        result = await runtime.ask("比较 A 和 B 的方法", session_id="ledger-test")
+
+        prompt = "\n".join(
+            message.content for request in generator.requests for message in request.context.messages
+        )
+        self.assertNotIn(first.text, prompt)
+        self.assertNotIn(second.text, prompt)
+        self.assertIn("Paper A uses a verified method", result.answer.answer_markdown)
+        self.assertEqual(
+            result.comparison.expressed_fact_ids,
+            ("a-method-f1", "b-method-f1"),
+        )
+        self.assertEqual(result.comparison.fact_requirement_count, 2)
+        self.assertEqual(
+            result.comparison.satisfied_fact_requirement_ids,
+            ("a-method-primary", "b-method-primary"),
+        )
+        self.assertEqual(result.comparison.visible_compiler_chunk_count, 2)
+        self.assertEqual(len(result.sources), 2)
 
     async def test_shared_conversation_context_drives_retrieval_and_answer_prompt(self) -> None:
         runtime, retriever, generator = _runtime()

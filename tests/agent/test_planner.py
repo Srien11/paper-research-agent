@@ -239,12 +239,28 @@ class LangChainResearchPlannerTests(unittest.IsolatedAsyncioTestCase):
                         "target_id": "a",
                         "dimension_id": "method",
                         "description": "Paper A method",
+                        "fact_requirements": [
+                            {
+                                "fact_requirement_id": "a-method-mechanism",
+                                "description": "Paper A core mechanism",
+                            },
+                            {
+                                "fact_requirement_id": "a-method-input",
+                                "description": "Paper A input dependency",
+                            },
+                        ],
                     },
                     {
                         "requirement_id": "b-method",
                         "target_id": "b",
                         "dimension_id": "method",
                         "description": "Paper B method",
+                        "fact_requirements": [
+                            {
+                                "fact_requirement_id": "b-method-mechanism",
+                                "description": "Paper B core mechanism",
+                            }
+                        ],
                     },
                 ],
                 "steps": [
@@ -277,6 +293,14 @@ class LangChainResearchPlannerTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(plan.task_type, "comparison")
+        self.assertTrue(
+            all(
+                intent.origin == "planned"
+                for requirement in plan.requirements
+                for intent in requirement.fact_requirements
+            )
+        )
+        self.assertEqual(len(plan.requirements[0].fact_requirements), 2)
         self.assertEqual(structured.ainvoke.await_count, 2)
 
     async def test_required_comparison_fails_closed_after_two_invalid_plans(self) -> None:

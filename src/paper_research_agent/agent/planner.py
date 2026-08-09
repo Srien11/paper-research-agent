@@ -11,6 +11,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from paper_research_agent.agent.models import ResearchPlan, ResearchStep
+from paper_research_agent.agent.policy import MAX_INITIAL_PLAN_STEPS
 from paper_research_agent.retrieval.contracts import QueryRewriteTrace
 from paper_research_agent.retrieval.papers import (
     AsyncPaperCandidateRetriever,
@@ -124,8 +125,10 @@ class LangChainResearchPlanner:
         max_steps: int,
         planning_required: bool = False,
     ) -> ResearchPlan:
-        if max_steps <= 0 or max_steps > 6:
-            raise ValueError("max_steps must be between 1 and 6")
+        if max_steps <= 0 or max_steps > MAX_INITIAL_PLAN_STEPS:
+            raise ValueError(
+                f"max_steps must be between 1 and {MAX_INITIAL_PLAN_STEPS}"
+            )
         resolved_catalog: Mapping[str, str] = self._corpus_catalog
         if planning_required and self._target_resolver is not None:
             resolved_catalog = await self._target_resolver.resolve(question)
@@ -145,10 +148,25 @@ class LangChainResearchPlanner:
                 "检索步骤；禁止用一个宽泛查询代替所有对象的检索。每个 comparison step 必须填写"
                 "对应 target_ids 和 dimension_ids；每一步只能对应一个 target 和一个 dimension，"
                 "每个 requirement 单元都必须有自己的独立查询，不能合并多个维度。"
+                "comparison 的 steps 数必须等于 targets 数×dimensions 数，且不得超过步数预算；"
+                "因此维度数不得超过 floor(步数预算/targets 数)。只保留用户问题明确要求且预算"
+                "允许的最高优先级维度，不得生成无法放入完整网格的额外维度。"
                 "若比较对象能对应下方本地论文目录，target 和其逐对象 step 都必须填写相同的 "
                 "corpus_id，使 BM25 与向量召回在该论文范围内执行；不得把一个论文范围用于另一个对象。"
                 "非比较问题使用 task_type=direct，且不填写比较元数据。不要回答问题，不要请求"
                 "网络、代码执行、文件写入或数据库修改。"
+                "The step budget accommodates the full supported comparison schema. Preserve "
+                "all comparison dimensions explicitly required by the user; do not compress, "
+                "merge, or discard them to save steps. For every comparison requirement, derive "
+                "one to six atomic fact_requirements only from the user's question and that "
+                "dimension. Give each a globally unique fact_requirement_id and a precise "
+                "description. Split materially distinct needs such as mechanism, input or "
+                "dependency, dataset, metric, numeric result, baseline, time, limitation, and "
+                "applicability condition when the question asks for them. Include "
+                "required_qualifier_kinds when omission would change the meaning. Do not use "
+                "private references, gold answers, or facts not requested by the question. Keep "
+                "one search step per target-by-dimension cell; its query and objective must cover "
+                "all fact requirements in that cell. "
                 f"\nLOCAL_CORPUS_CATALOG_JSON={catalog}"
                 + (
                     "上游语义路由已确认本题必须进行多对象研究规划，因此必须返回 "
@@ -167,6 +185,14 @@ class LangChainResearchPlanner:
                     raise ValueError("research plan exceeds the requested step budget")
                 if planning_required and plan.task_type != "comparison":
                     raise ValueError("planned research requires a comparison plan")
+                if plan.task_type == "comparison" and any(
+                    fact_requirement.origin != "planned"
+                    for requirement in plan.requirements
+                    for fact_requirement in requirement.fact_requirements
+                ):
+                    raise ValueError(
+                        "comparison plan requires explicit atomic fact requirements"
+                    )
                 if planning_required and self._target_resolver is not None:
                     planned_corpora = {target.corpus_id for target in plan.targets}
                     if not planned_corpora <= set(resolved_catalog):
@@ -180,7 +206,12 @@ class LangChainResearchPlanner:
                             content=(
                                 "The previous plan violated the structured planning contract. "
                                 "Return a valid full target-by-dimension comparison grid within "
-                                "the step budget."
+                                f"the {max_steps}-step budget. The number of steps must equal "
+                                "the target count multiplied by the dimension count. Preserve "
+                                "every comparison dimension required by the question; never "
+                                "return a partial grid. Every requirement must include one to six "
+                                "explicit, question-derived atomic fact_requirements with globally "
+                                "unique IDs; do not rely on a derived compatibility intent."
                             )
                         ),
                     ]

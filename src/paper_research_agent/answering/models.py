@@ -24,6 +24,7 @@ class AnswerClaim(FrozenContract):
 
     text: str = Field(min_length=1)
     citation_ids: tuple[CitationId, ...] = Field(min_length=1)
+    fact_ids: tuple[str, ...] = ()
 
     @field_validator("text")
     @classmethod
@@ -42,6 +43,15 @@ class AnswerClaim(FrozenContract):
             raise ValueError("answer claim citation_ids must be unique")
         if any(re.fullmatch(r"E[1-9]\d*", identifier) is None for identifier in value):
             raise ValueError("answer claim contains an invalid citation ID")
+        return value
+
+    @field_validator("fact_ids")
+    @classmethod
+    def validate_fact_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(set(value)) != len(value):
+            raise ValueError("answer claim fact_ids must be unique")
+        if any(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,95}", item) is None for item in value):
+            raise ValueError("answer claim contains an invalid fact ID")
         return value
 
 
@@ -104,6 +114,64 @@ class AnswerRequest(FrozenContract):
             raise ValueError(
                 f"answer context has citations without loaded rights: {missing_rights}"
             )
+        return self
+
+
+class ComparisonTarget(FrozenContract):
+    target_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+    label: str = Field(min_length=1, max_length=200)
+    corpus_id: str = Field(pattern=r"^[CT]\d{3}$")
+
+
+class ComparisonDimension(FrozenContract):
+    dimension_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+    label: str = Field(min_length=1, max_length=200)
+
+
+class ComparisonFact(FrozenContract):
+    fact_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$")
+    requirement_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+    target_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+    dimension_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+    statement: str = Field(min_length=1, max_length=1200)
+    fact_requirement_ids: tuple[str, ...] = Field(default=(), max_length=6)
+    citation_ids: tuple[CitationId, ...] = Field(min_length=1, max_length=20)
+    qualifiers: tuple[dict[str, str], ...] = ()
+
+
+class ComparisonAnswerRequest(FrozenContract):
+    """Trusted comparison-generation boundary containing compiled facts, never raw blocks."""
+
+    schema_version: Literal["comparison-answer-request-v1"] = "comparison-answer-request-v1"
+    question: str = Field(min_length=1, max_length=10_000)
+    context: AssembledContext
+    targets: tuple[ComparisonTarget, ...] = Field(min_length=2, max_length=4)
+    dimensions: tuple[ComparisonDimension, ...] = Field(min_length=1, max_length=5)
+    facts: tuple[ComparisonFact, ...] = Field(min_length=1, max_length=480)
+
+    @model_validator(mode="after")
+    def validate_grid_references(self) -> ComparisonAnswerRequest:
+        target_ids = {item.target_id for item in self.targets}
+        target_corpora = {item.target_id: item.corpus_id for item in self.targets}
+        dimension_ids = {item.dimension_id for item in self.dimensions}
+        context_citations = {
+            item.citation_id: item.corpus_id for item in self.context.citations
+        }
+        fact_ids = [item.fact_id for item in self.facts]
+        if len(fact_ids) != len(set(fact_ids)):
+            raise ValueError("comparison answer fact IDs must be unique")
+        if any(item.target_id not in target_ids for item in self.facts):
+            raise ValueError("comparison fact references an unknown target")
+        if any(item.dimension_id not in dimension_ids for item in self.facts):
+            raise ValueError("comparison fact references an unknown dimension")
+        if any(not set(item.citation_ids) <= set(context_citations) for item in self.facts):
+            raise ValueError("comparison fact references an unknown citation")
+        if any(
+            context_citations[citation_id] != target_corpora[item.target_id]
+            for item in self.facts
+            for citation_id in item.citation_ids
+        ):
+            raise ValueError("comparison fact citation belongs to a different target corpus")
         return self
 
 

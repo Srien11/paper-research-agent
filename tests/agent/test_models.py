@@ -5,8 +5,13 @@ import unittest
 from pydantic import ValidationError
 
 from paper_research_agent.agent.models import (
+    CompiledEvidenceFact,
     EvidenceAssessment,
+    EvidenceCompilationVisibility,
     EvidenceCoverage,
+    EvidenceFactRequirement,
+    EvidenceLedgerCell,
+    EvidenceQualifier,
     EvidenceRecord,
     EvidenceRequirement,
     GetEvidenceInput,
@@ -37,6 +42,144 @@ def _hit(*, rank: int = 1) -> SearchCorpusHit:
 
 
 class ResearchToolModelTests(unittest.TestCase):
+    def test_fact_requirements_support_partial_ledger_coverage(self) -> None:
+        requirement = EvidenceRequirement(
+            requirement_id="a-method",
+            target_id="a",
+            dimension_id="method",
+            description="Paper A method and input dependency",
+            fact_requirements=(
+                EvidenceFactRequirement(
+                    fact_requirement_id="a-method-mechanism",
+                    description="Core mechanism",
+                ),
+                EvidenceFactRequirement(
+                    fact_requirement_id="a-method-input",
+                    description="Input dependency",
+                    required_qualifier_kinds=("method",),
+                ),
+            ),
+        )
+        fact = CompiledEvidenceFact(
+            fact_id="a-method-f1",
+            statement="Paper A uses retrieval augmentation.",
+            chunk_ids=("chunk-1",),
+            fact_requirement_ids=("a-method-mechanism",),
+        )
+        cell = EvidenceLedgerCell(
+            requirement_id=requirement.requirement_id,
+            status="partial",
+            facts=(fact,),
+            missing_fact_requirement_ids=("a-method-input",),
+        )
+        visibility = EvidenceCompilationVisibility(
+            requirement_id=requirement.requirement_id,
+            available_chunk_ids=("chunk-1", "chunk-2"),
+            visible_chunk_ids=("chunk-1",),
+            truncated_chunk_ids=("chunk-1",),
+        )
+
+        self.assertEqual(cell.status, "partial")
+        self.assertEqual(cell.missing_fact_requirement_ids, ("a-method-input",))
+        self.assertEqual(visibility.visible_chunk_ids, ("chunk-1",))
+        with self.assertRaisesRegex(ValidationError, "partial.*missing"):
+            EvidenceLedgerCell(
+                requirement_id=requirement.requirement_id,
+                status="partial",
+                facts=(fact,),
+            )
+        with self.assertRaisesRegex(ValidationError, "sufficient.*missing"):
+            EvidenceLedgerCell(
+                requirement_id=requirement.requirement_id,
+                status="sufficient",
+                facts=(fact,),
+                missing_fact_requirement_ids=("a-method-input",),
+            )
+
+    def test_compiled_evidence_ledger_requires_atomic_traceable_facts(self) -> None:
+        fact = CompiledEvidenceFact(
+            fact_id="a-method-f1",
+            statement="论文 A 使用检索增强生成方法。",
+            chunk_ids=("chunk-1",),
+            qualifiers=(EvidenceQualifier(kind="method", value="RAG"),),
+        )
+        cell = EvidenceLedgerCell(
+            requirement_id="a-method",
+            status="sufficient",
+            facts=(fact,),
+        )
+
+        self.assertEqual(cell.facts[0].qualifiers[0].value, "RAG")
+        with self.assertRaisesRegex(ValidationError, "requires facts"):
+            EvidenceLedgerCell(requirement_id="a-method", status="sufficient")
+        with self.assertRaisesRegex(ValidationError, "cannot contain facts"):
+            EvidenceLedgerCell(
+                requirement_id="a-method",
+                status="missing",
+                facts=(fact,),
+            )
+        with self.assertRaisesRegex(ValidationError, "globally unique"):
+            EvidenceAssessment(
+                evidence_sufficient=False,
+                status="missing_coverage",
+                ledger=(
+                    cell,
+                    EvidenceLedgerCell(
+                        requirement_id="b-method",
+                        status="sufficient",
+                        facts=(fact,),
+                    ),
+                ),
+            )
+
+    def test_comparison_plan_accepts_maximum_twenty_cell_initial_grid(self) -> None:
+        targets = tuple(
+            ResearchTarget(
+                target_id=f"paper{index}",
+                label=f"Paper {index}",
+                corpus_id=f"C{index:03d}",
+            )
+            for index in range(1, 5)
+        )
+        dimensions = tuple(
+            ResearchDimension(dimension_id=f"dim{index}", label=f"Dimension {index}")
+            for index in range(1, 6)
+        )
+        requirements = tuple(
+            EvidenceRequirement(
+                requirement_id=f"{target.target_id}-{dimension.dimension_id}",
+                target_id=target.target_id,
+                dimension_id=dimension.dimension_id,
+                description=f"{target.label} {dimension.label}",
+            )
+            for target in targets
+            for dimension in dimensions
+        )
+
+        plan = ResearchPlan(
+            task_type="comparison",
+            targets=targets,
+            dimensions=dimensions,
+            requirements=requirements,
+            steps=tuple(
+                ResearchStep(
+                    step_id=item.requirement_id,
+                    objective=item.description,
+                    query=f"query {item.requirement_id}",
+                    corpus_id=next(
+                        target.corpus_id
+                        for target in targets
+                        if target.target_id == item.target_id
+                    ),
+                    target_ids=(item.target_id,),
+                    dimension_ids=(item.dimension_id,),
+                )
+                for item in requirements
+            ),
+        )
+
+        self.assertEqual(len(plan.steps), 20)
+
     def test_scoped_search_result_rejects_cross_corpus_hits(self) -> None:
         hit = SearchCorpusHit(
             chunk_id="chunk-1",

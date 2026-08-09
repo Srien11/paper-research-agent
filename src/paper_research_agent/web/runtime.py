@@ -20,6 +20,10 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from paper_research_agent.agent.intent import requires_research_planning
 from paper_research_agent.answering.audit import SQLiteAnswerAuditLogger
+from paper_research_agent.answering.comparison import (
+    answer_comparison,
+    build_comparison_answer_request,
+)
 from paper_research_agent.answering.config import load_answering_config
 from paper_research_agent.answering.dashscope import (
     AsyncAnswerGenerator,
@@ -29,7 +33,10 @@ from paper_research_agent.answering.models import AnswerRequest, RAGAnswer
 from paper_research_agent.answering.service import AnswerAuditLogger, answer_context
 from paper_research_agent.chunking.models import EvidenceChunk, PaperCard
 from paper_research_agent.context.adapters import join_retrieval_evidence
-from paper_research_agent.context.assembler import assemble_context
+from paper_research_agent.context.assembler import (
+    assemble_comparison_context,
+    assemble_context,
+)
 from paper_research_agent.context.models import (
     AssembledContext,
     ContextMemoryTurn,
@@ -155,6 +162,19 @@ class SafeGenerationTrace(_FrozenWebModel):
     audit_persisted: bool
 
 
+class SafeComparisonTrace(_FrozenWebModel):
+    requirement_count: int = Field(ge=0)
+    fact_requirement_count: int = Field(default=0, ge=0)
+    compiled_fact_ids: tuple[str, ...] = ()
+    satisfied_fact_requirement_ids: tuple[str, ...] = ()
+    missing_fact_requirement_ids: tuple[str, ...] = ()
+    expressed_fact_ids: tuple[str, ...] = ()
+    missing_requirement_ids: tuple[str, ...] = ()
+    partial_requirement_ids: tuple[str, ...] = ()
+    available_compiler_chunk_count: int = Field(default=0, ge=0)
+    visible_compiler_chunk_count: int = Field(default=0, ge=0)
+
+
 class SafeEvidenceSource(_FrozenWebModel):
     citation_id: str
     chunk_id: str
@@ -178,6 +198,7 @@ class RuntimeExecutionResult(_FrozenWebModel):
     retrieval: SafeRetrievalTrace
     context: SafeContextTrace
     generation: SafeGenerationTrace
+    comparison: SafeComparisonTrace | None = None
 
 
 class RuntimeBusyError(RuntimeError):
@@ -561,7 +582,9 @@ class RAGRuntime:
         if self._research_agent is not None:
             raise RuntimeError("research agent is already enabled")
         from paper_research_agent.agent.factory import create_research_agent_runtime
+        from paper_research_agent.agent.planner import ComparisonQueryResolver
         from paper_research_agent.agent.policy import ResearchRuntimePolicy
+        from paper_research_agent.agent.service import AsyncResearchRetriever
 
         runtime_policy = ResearchRuntimePolicy.model_validate(policy)
         if mode not in {"auto", "always"}:
@@ -570,9 +593,9 @@ class RAGRuntime:
             corpus_id: paper.storage_class for corpus_id, paper in self._papers.items()
         }
         self._research_agent = await create_research_agent_runtime(
-            retriever=self._retriever,
+            retriever=cast(AsyncResearchRetriever, self._retriever),
             paper_candidate_retriever=self._require_paper_candidate_retriever(),
-            paper_candidate_query_resolver=self._retriever,
+            paper_candidate_query_resolver=cast(ComparisonQueryResolver, self._retriever),
             chunks=self._chunks,
             storage_classes=storage_classes,
             model_id=model_id,
@@ -771,30 +794,59 @@ class RAGRuntime:
                 research=research,
                 conversation_context=conversation_context,
             )
-        context = assemble_context(
-            ContextRequest(
-                system_rules=self._system_rules,
-                user_question=question,
-                standalone_question=resolved_question,
-                evidence=evidence,
-                task_state=task_state,
-                allow_partial_answer=(
-                    research is not None
-                    and bool(evidence)
-                    and not research.evidence_sufficient
-                ),
-                short_term_memory=context_memory,
-                memory_token_budget=policy.context_token_budget,
-                protected_evidence_count=policy.protected_evidence_count,
-                token_budget=self._token_budget,
-                output_reserve_tokens=self._output_reserve_tokens,
+        context_request = ContextRequest(
+            system_rules=self._system_rules,
+            user_question=question,
+            standalone_question=resolved_question,
+            evidence=evidence,
+            task_state=task_state,
+            allow_partial_answer=(
+                research is not None
+                and bool(evidence)
+                and not research.evidence_sufficient
+            ),
+            short_term_memory=context_memory,
+            memory_token_budget=policy.context_token_budget,
+            protected_evidence_count=policy.protected_evidence_count,
+            token_budget=self._token_budget,
+            output_reserve_tokens=self._output_reserve_tokens,
+        )
+        comparison_assessment = (
+            research.assessments[-1]
+            if research is not None
+            and research.plan.task_type == "comparison"
+            and research.assessments
+            else None
+        )
+        if comparison_assessment is not None and any(
+            cell.facts for cell in comparison_assessment.ledger
+        ):
+            assert research is not None
+            context = assemble_comparison_context(
+                context_request,
+                plan=research.plan,
+                assessment=comparison_assessment,
             )
-        )
-        answer = await answer_context(
-            AnswerRequest(context=context),
-            self._generator,
-            audit=self._answer_audit,
-        )
+            comparison_request = build_comparison_answer_request(
+                resolved_question,
+                plan=research.plan,
+                assessment=comparison_assessment,
+                context=context,
+            )
+            answer = await answer_comparison(
+                comparison_request,
+                self._generator,
+                audit=self._answer_audit,
+            )
+        else:
+            if comparison_assessment is not None:
+                context_request = context_request.model_copy(update={"evidence": ()})
+            context = assemble_context(context_request)
+            answer = await answer_context(
+                AnswerRequest(context=context),
+                self._generator,
+                audit=self._answer_audit,
+            )
         if conversation_context is None:
             try:
                 self._memory_store.append(
@@ -813,6 +865,7 @@ class RAGRuntime:
             retrieval=retrieval_trace,
             context=context,
             answer=answer,
+            research=research,
         )
     def _safe_retrieval_trace(
         self,
@@ -985,6 +1038,7 @@ class RAGRuntime:
         retrieval: SafeRetrievalTrace,
         context: AssembledContext,
         answer: RAGAnswer,
+        research: ResearchRuntimeResult | None = None,
     ) -> RuntimeExecutionResult:
         rank_by_chunk = {hit.chunk_id: hit.final_rank for hit in retrieval.hits}
         sources: list[SafeEvidenceSource] = []
@@ -1010,6 +1064,65 @@ class RAGRuntime:
                     final_rank=final_rank,
                 )
             )
+        comparison_trace = None
+        if research is not None and research.plan.task_type == "comparison":
+            final_assessment = research.assessments[-1]
+            comparison_trace = SafeComparisonTrace(
+                requirement_count=len(research.plan.requirements),
+                fact_requirement_count=sum(
+                    len(requirement.fact_requirements)
+                    for requirement in research.plan.requirements
+                ),
+                compiled_fact_ids=tuple(
+                    fact.fact_id
+                    for cell in final_assessment.ledger
+                    for fact in cell.facts
+                ),
+                satisfied_fact_requirement_ids=tuple(
+                    dict.fromkeys(
+                        fact_requirement_id
+                        for cell in final_assessment.ledger
+                        for fact in cell.facts
+                        for fact_requirement_id in fact.fact_requirement_ids
+                    )
+                ),
+                missing_fact_requirement_ids=tuple(
+                    dict.fromkeys(
+                        fact_requirement_id
+                        for cell in final_assessment.ledger
+                        for fact_requirement_id in cell.missing_fact_requirement_ids
+                    )
+                ),
+                expressed_fact_ids=tuple(
+                    dict.fromkeys(
+                        fact_id for claim in answer.claims for fact_id in claim.fact_ids
+                    )
+                ),
+                missing_requirement_ids=tuple(
+                    cell.requirement_id
+                    for cell in final_assessment.ledger
+                    if cell.status in {"missing", "partial"}
+                ),
+                partial_requirement_ids=tuple(
+                    cell.requirement_id
+                    for cell in final_assessment.ledger
+                    if cell.status == "partial"
+                ),
+                available_compiler_chunk_count=len(
+                    {
+                        chunk_id
+                        for item in final_assessment.compilation_visibility
+                        for chunk_id in item.available_chunk_ids
+                    }
+                ),
+                visible_compiler_chunk_count=len(
+                    {
+                        chunk_id
+                        for item in final_assessment.compilation_visibility
+                        for chunk_id in item.visible_chunk_ids
+                    }
+                ),
+            )
         return RuntimeExecutionResult(
             answer=answer,
             sources=tuple(sources),
@@ -1034,6 +1147,7 @@ class RAGRuntime:
                 attempts=answer.attempts,
                 audit_persisted=answer.audit_persisted,
             ),
+            comparison=comparison_trace,
         )
 
 
@@ -1140,15 +1254,19 @@ def _research_policy_from_environment() -> object:
     from paper_research_agent.agent.policy import ResearchRuntimePolicy
 
     return ResearchRuntimePolicy(
-        max_steps=_environment_int("PRA_RESEARCH_AGENT_MAX_STEPS", 4),
+        max_steps=_environment_int("PRA_RESEARCH_AGENT_MAX_STEPS", 24),
+        max_followup_steps=_environment_int(
+            "PRA_RESEARCH_AGENT_MAX_FOLLOWUP_STEPS",
+            4,
+        ),
         evidence_per_step=_environment_int(
             "PRA_RESEARCH_AGENT_EVIDENCE_PER_STEP",
             3,
         ),
-        max_tool_calls=_environment_int("PRA_RESEARCH_AGENT_MAX_TOOL_CALLS", 12),
+        max_tool_calls=_environment_int("PRA_RESEARCH_AGENT_MAX_TOOL_CALLS", 48),
         timeout_seconds=_environment_float(
             "PRA_RESEARCH_AGENT_TIMEOUT_SECONDS",
-            120,
+            180,
         ),
     )
 

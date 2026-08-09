@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from langgraph.checkpoint.memory import InMemorySaver
 
-from paper_research_agent.agent.graph import build_research_graph
+from paper_research_agent.agent.graph import (
+    _remaining_runtime_seconds,
+    _supplemental_completion_reserve_seconds,
+    build_research_graph,
+)
 from paper_research_agent.agent.models import (
     EvidenceAssessment,
     EvidenceCoverage,
+    EvidenceFollowup,
     EvidenceRecord,
     EvidenceRequirement,
     GetEvidenceResult,
@@ -112,6 +117,55 @@ class EventRecorder:
 
 
 class ResearchGraphTests(unittest.IsolatedAsyncioTestCase):
+    def test_remaining_runtime_uses_persisted_wall_clock_start(self) -> None:
+        with patch(
+            "paper_research_agent.agent.graph.time.time", return_value=150.0
+        ):
+            remaining = _remaining_runtime_seconds(
+                {"started_at_epoch_seconds": 100.0},
+                ResearchRuntimePolicy(timeout_seconds=180),
+            )
+
+        self.assertEqual(remaining, 130.0)
+
+    def test_supplemental_reserve_uses_latest_compilation_duration(self) -> None:
+        reserve = _supplemental_completion_reserve_seconds(
+            {
+                "assessment_durations_ms": [60_000.0],
+                "pending_followups": [{}, {}],
+                "current_step": 6,
+                "step_budget": 8,
+                "tool_call_count": 12,
+                "tool_call_budget": 16,
+            },
+            ResearchRuntimePolicy(
+                max_steps=8,
+                max_tool_calls=16,
+                timeout_seconds=180,
+            ),
+        )
+
+        self.assertEqual(reserve, 97.0)
+
+    def test_supplemental_reserve_has_safety_floor(self) -> None:
+        reserve = _supplemental_completion_reserve_seconds(
+            {
+                "assessment_durations_ms": [10_000.0],
+                "pending_followups": [{}],
+                "current_step": 1,
+                "step_budget": 2,
+                "tool_call_count": 2,
+                "tool_call_budget": 4,
+            },
+            ResearchRuntimePolicy(
+                max_steps=2,
+                max_tool_calls=4,
+                timeout_seconds=180,
+            ),
+        )
+
+        self.assertEqual(reserve, 45.0)
+
     async def test_comparison_executes_each_planned_target_before_dynamic_replan(self) -> None:
         planner = FakePlanner(
             ResearchPlan(
@@ -158,19 +212,6 @@ class ResearchGraphTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         reasoner = FakeReasoner(
-            EvidenceAssessment(
-                evidence_sufficient=False,
-                status="missing_coverage",
-                coverage=(
-                    EvidenceCoverage(
-                        requirement_id="a-method", covered=True, chunk_ids=("chunk-1",)
-                    ),
-                    EvidenceCoverage(requirement_id="b-method", covered=False),
-                ),
-                next_query="Paper B refined method",
-                next_objective="Refine Paper B method",
-                next_requirement_ids=("b-method",),
-            ),
             EvidenceAssessment(
                 evidence_sufficient=True,
                 status="sufficient",
@@ -228,6 +269,304 @@ class ResearchGraphTests(unittest.IsolatedAsyncioTestCase):
             [call.args[0].top_k for call in service.search_corpus.await_args_list],
             [20, 20],
         )
+        self.assertEqual(len(reasoner.calls), 1)
+        self.assertEqual(len(reasoner.calls[0][2]), 2)
+
+    async def test_comparison_executes_six_cell_grid_before_one_assessment(self) -> None:
+        targets = (
+            ResearchTarget(target_id="a", label="Paper A", corpus_id="C001"),
+            ResearchTarget(target_id="b", label="Paper B", corpus_id="T001"),
+        )
+        dimensions = tuple(
+            ResearchDimension(dimension_id=value, label=value.title())
+            for value in ("method", "metric", "dataset")
+        )
+        requirements = tuple(
+            EvidenceRequirement(
+                requirement_id=f"{target.target_id}-{dimension.dimension_id}",
+                target_id=target.target_id,
+                dimension_id=dimension.dimension_id,
+                description=f"{target.label} {dimension.label}",
+            )
+            for target in targets
+            for dimension in dimensions
+        )
+        steps = tuple(
+            ResearchStep(
+                step_id=requirement.requirement_id,
+                objective=requirement.description,
+                query=f"query {requirement.requirement_id}",
+                corpus_id=("C001" if requirement.target_id == "a" else "T001"),
+                target_ids=(requirement.target_id,),
+                dimension_ids=(requirement.dimension_id,),
+            )
+            for requirement in requirements
+        )
+        planner = FakePlanner(
+            ResearchPlan(
+                task_type="comparison",
+                targets=targets,
+                dimensions=dimensions,
+                requirements=requirements,
+                steps=steps,
+            )
+        )
+        reasoner = FakeReasoner(
+            EvidenceAssessment(
+                evidence_sufficient=True,
+                status="sufficient",
+                coverage=tuple(
+                    EvidenceCoverage(
+                        requirement_id=requirement.requirement_id,
+                        covered=True,
+                        chunk_ids=(f"chunk-{requirement.requirement_id}",),
+                    )
+                    for requirement in requirements
+                ),
+            )
+        )
+        service = AsyncMock()
+        service.search_corpus.side_effect = tuple(
+            SearchCorpusResult(
+                query=step.query,
+                corpus_id=step.corpus_id,
+                index_id="idx-test",
+                degraded=False,
+                hits=(_hit(f"chunk-{step.step_id}", str(step.corpus_id), 1),),
+            )
+            for step in steps
+        )
+        service.get_evidence.side_effect = tuple(
+            GetEvidenceResult(
+                records=(_record(f"chunk-{step.step_id}", str(step.corpus_id)),)
+            )
+            for step in steps
+        )
+        graph = build_research_graph(
+            planner=planner,
+            reasoner=reasoner,
+            service=service,
+            policy=ResearchRuntimePolicy(),
+        )
+
+        state = await graph.ainvoke({"question": "Compare three dimensions"})
+
+        self.assertEqual(planner.calls, [("Compare three dimensions", 20, False)])
+        self.assertEqual(state["current_step"], 6)
+        self.assertEqual(state["tool_call_count"], 12)
+        self.assertEqual(service.search_corpus.await_count, 6)
+        self.assertEqual(service.get_evidence.await_count, 6)
+        self.assertEqual(len(reasoner.calls), 1)
+        self.assertEqual(len(reasoner.calls[0][2]), 6)
+        self.assertTrue(state["evidence_sufficient"])
+
+    async def test_comparison_freezes_budget_from_ten_cell_grid(self) -> None:
+        targets = (
+            ResearchTarget(target_id="a", label="Paper A", corpus_id="C001"),
+            ResearchTarget(target_id="b", label="Paper B", corpus_id="T001"),
+        )
+        dimensions = tuple(
+            ResearchDimension(dimension_id=f"dim{index}", label=f"Dimension {index}")
+            for index in range(1, 6)
+        )
+        requirements = tuple(
+            EvidenceRequirement(
+                requirement_id=f"{target.target_id}-{dimension.dimension_id}",
+                target_id=target.target_id,
+                dimension_id=dimension.dimension_id,
+                description=f"{target.label} {dimension.label}",
+            )
+            for target in targets
+            for dimension in dimensions
+        )
+        steps = tuple(
+            ResearchStep(
+                step_id=item.requirement_id,
+                objective=item.description,
+                query=f"query {item.requirement_id}",
+                corpus_id=("C001" if item.target_id == "a" else "T001"),
+                target_ids=(item.target_id,),
+                dimension_ids=(item.dimension_id,),
+            )
+            for item in requirements
+        )
+        planner = FakePlanner(
+            ResearchPlan(
+                task_type="comparison",
+                targets=targets,
+                dimensions=dimensions,
+                requirements=requirements,
+                steps=steps,
+            )
+        )
+        reasoner = FakeReasoner(
+            EvidenceAssessment(
+                evidence_sufficient=True,
+                status="sufficient",
+                coverage=tuple(
+                    EvidenceCoverage(
+                        requirement_id=item.requirement_id,
+                        covered=True,
+                        chunk_ids=(f"chunk-{item.requirement_id}",),
+                    )
+                    for item in requirements
+                ),
+            )
+        )
+        service = AsyncMock()
+        service.search_corpus.side_effect = tuple(
+            SearchCorpusResult(
+                query=step.query,
+                corpus_id=step.corpus_id,
+                index_id="idx-test",
+                degraded=False,
+                hits=(_hit(f"chunk-{step.step_id}", str(step.corpus_id), 1),),
+            )
+            for step in steps
+        )
+        service.get_evidence.side_effect = tuple(
+            GetEvidenceResult(
+                records=(_record(f"chunk-{step.step_id}", str(step.corpus_id)),)
+            )
+            for step in steps
+        )
+        graph = build_research_graph(
+            planner=planner,
+            reasoner=reasoner,
+            service=service,
+            policy=ResearchRuntimePolicy(),
+        )
+
+        state = await graph.ainvoke({"question": "Compare five dimensions"})
+
+        self.assertEqual(planner.calls, [("Compare five dimensions", 20, False)])
+        self.assertEqual(state["step_budget"], 13)
+        self.assertEqual(state["tool_call_budget"], 26)
+        self.assertEqual(state["current_step"], 10)
+        self.assertEqual(state["tool_call_count"], 20)
+
+    async def test_comparison_followups_stop_at_frozen_dynamic_budget(self) -> None:
+        targets = (
+            ResearchTarget(target_id="a", label="Paper A", corpus_id="C001"),
+            ResearchTarget(target_id="b", label="Paper B", corpus_id="T001"),
+        )
+        dimension = ResearchDimension(dimension_id="method", label="Method")
+        requirements = (
+            EvidenceRequirement(
+                requirement_id="a-method",
+                target_id="a",
+                dimension_id="method",
+                description="Paper A method",
+            ),
+            EvidenceRequirement(
+                requirement_id="b-method",
+                target_id="b",
+                dimension_id="method",
+                description="Paper B method",
+            ),
+        )
+        planner = FakePlanner(
+            ResearchPlan(
+                task_type="comparison",
+                targets=targets,
+                dimensions=(dimension,),
+                requirements=requirements,
+                steps=(
+                    ResearchStep(
+                        step_id="a-method",
+                        objective="Find A method",
+                        query="initial A",
+                        corpus_id="C001",
+                        target_ids=("a",),
+                        dimension_ids=("method",),
+                    ),
+                    ResearchStep(
+                        step_id="b-method",
+                        objective="Find B method",
+                        query="initial B",
+                        corpus_id="T001",
+                        target_ids=("b",),
+                        dimension_ids=("method",),
+                    ),
+                ),
+            )
+        )
+
+        reasoner = FakeReasoner(
+            EvidenceAssessment(
+                evidence_sufficient=False,
+                status="missing_coverage",
+                coverage=(
+                    EvidenceCoverage(requirement_id="a-method", covered=False),
+                    EvidenceCoverage(requirement_id="b-method", covered=False),
+                ),
+                followups=(
+                    EvidenceFollowup(
+                        requirement_id="a-method",
+                        query="followup A",
+                        objective="Retry A method",
+                    ),
+                    EvidenceFollowup(
+                        requirement_id="b-method",
+                        query="followup B",
+                        objective="Retry B method",
+                    ),
+                ),
+            ),
+            EvidenceAssessment(
+                evidence_sufficient=False,
+                status="missing_coverage",
+                coverage=(
+                    EvidenceCoverage(requirement_id="a-method", covered=False),
+                    EvidenceCoverage(requirement_id="b-method", covered=False),
+                ),
+                next_query="followup B three",
+                next_objective="Retry B method again",
+                next_requirement_ids=("b-method",),
+            ),
+        )
+        queries = ("initial A", "initial B", "followup A")
+        corpora = ("C001", "T001", "C001")
+        chunk_ids = (
+            "chunk-a-initial",
+            "chunk-b-initial",
+            "chunk-a-followup",
+        )
+        service = AsyncMock()
+        service.search_corpus.side_effect = tuple(
+            SearchCorpusResult(
+                query=query,
+                corpus_id=corpus_id,
+                index_id="idx-test",
+                degraded=False,
+                hits=(_hit(chunk_id, corpus_id, 1),),
+            )
+            for query, corpus_id, chunk_id in zip(
+                queries, corpora, chunk_ids, strict=True
+            )
+        )
+        service.get_evidence.side_effect = tuple(
+            GetEvidenceResult(records=(_record(chunk_id, corpus_id),))
+            for chunk_id, corpus_id in zip(chunk_ids, corpora, strict=True)
+        )
+        graph = build_research_graph(
+            planner=planner,
+            reasoner=reasoner,
+            service=service,
+            policy=ResearchRuntimePolicy(max_steps=3, max_tool_calls=6),
+        )
+
+        state = await graph.ainvoke({"question": "Compare methods"})
+
+        self.assertEqual(state["step_budget"], 3)
+        self.assertEqual(state["tool_call_budget"], 6)
+        self.assertEqual(state["current_step"], 3)
+        self.assertEqual(state["tool_call_count"], 6)
+        self.assertEqual(state["termination_reason"], "step_budget")
+        self.assertEqual(service.search_corpus.await_count, 3)
+        self.assertEqual(len(reasoner.calls), 2)
+        self.assertEqual([len(call[2]) for call in reasoner.calls], [2, 3])
+        self.assertEqual(state["assessment_observation_counts"], [2, 3])
 
     async def test_stops_early_when_first_observation_is_sufficient(self) -> None:
         planner = FakePlanner(
@@ -442,7 +781,7 @@ class ResearchGraphTests(unittest.IsolatedAsyncioTestCase):
             planner=planner,
             reasoner=reasoner,
             service=service,
-            policy=ResearchRuntimePolicy(max_steps=1, max_tool_calls=4),
+            policy=ResearchRuntimePolicy(max_steps=2, max_tool_calls=4),
         )
 
         state = await graph.ainvoke({"question": "Research beyond the initial plan"})
@@ -538,7 +877,7 @@ class ResearchGraphTests(unittest.IsolatedAsyncioTestCase):
             planner=planner,
             reasoner=reasoner,
             service=service,
-            policy=ResearchRuntimePolicy(max_steps=1, max_tool_calls=2),
+            policy=ResearchRuntimePolicy(max_steps=3, max_tool_calls=2),
         )
 
         state = await graph.ainvoke({"question": "Use the safe tool budget"})

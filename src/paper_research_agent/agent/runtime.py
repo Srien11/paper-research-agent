@@ -82,7 +82,9 @@ class ResearchRuntimeResult(BaseModel):
     assessments: tuple[EvidenceAssessment, ...]
     action_history: tuple[ResearchActionRecord, ...]
     evidence: tuple[ContextEvidence, ...]
+    step_budget: int = Field(ge=1)
     tool_call_count: int = Field(ge=0)
+    tool_call_budget: int = Field(ge=1)
     replan_count: int = Field(ge=0)
     evidence_sufficient: bool
     termination_reason: TerminationReason
@@ -221,7 +223,7 @@ class ResearchAgentRuntime:
         question_sha256 = safe_fingerprint(normalized_question)
         thread_sha256 = safe_fingerprint(normalized_thread)
         started = time.perf_counter()
-        common = {
+        common: dict[str, Any] = {
             "run_id": run_id,
             "question_sha256": question_sha256,
             "thread_sha256": thread_sha256,
@@ -343,6 +345,14 @@ class ResearchAgentRuntime:
 
         plan = ResearchPlan.model_validate(state.get("plan"))
         current_step = _strict_non_negative_int(state.get("current_step"), "current_step")
+        step_budget = _strict_positive_int(
+            state.get("step_budget", self._policy.max_steps),
+            "step_budget",
+        )
+        if step_budget > self._policy.max_steps:
+            raise ValueError("research graph exceeded the absolute step budget")
+        if current_step > step_budget:
+            raise ValueError("research graph exceeded the frozen step budget")
         if current_step > len(plan.steps):
             raise ValueError("research graph completed an invalid number of steps")
 
@@ -365,10 +375,36 @@ class ResearchAgentRuntime:
         if not isinstance(raw_assessments, list):
             raise TypeError("research graph assessments are missing")
         assessments = tuple(EvidenceAssessment.model_validate(value) for value in raw_assessments)
-        if len(assessments) != len(observations):
+        if plan.task_type == "direct" and len(assessments) != len(observations):
             raise ValueError("research assessments do not match observations")
-        for index, assessment in enumerate(assessments, start=1):
-            validate_evidence_assessment(plan, observations[:index], assessment)
+        if plan.task_type == "comparison" and (
+            not assessments or len(assessments) > len(observations)
+        ):
+            raise ValueError("comparison assessments do not match observation batches")
+        if plan.task_type == "comparison":
+            raw_assessment_counts = state.get("assessment_observation_counts")
+            if raw_assessment_counts is None:
+                initial_batch_size = len(observations) - len(assessments) + 1
+                assessment_limits = tuple(
+                    range(initial_batch_size, len(observations) + 1)
+                )
+            else:
+                if not isinstance(raw_assessment_counts, list):
+                    raise TypeError("comparison assessment counts are invalid")
+                assessment_limits = tuple(
+                    _strict_positive_int(value, "assessment_observation_count")
+                    for value in raw_assessment_counts
+                )
+                if (
+                    len(assessment_limits) != len(assessments)
+                    or tuple(sorted(set(assessment_limits))) != assessment_limits
+                    or assessment_limits[-1] != len(observations)
+                ):
+                    raise ValueError("comparison assessment counts do not match batches")
+        else:
+            assessment_limits = tuple(range(1, len(observations) + 1))
+        for limit, assessment in zip(assessment_limits, assessments, strict=True):
+            validate_evidence_assessment(plan, observations[:limit], assessment)
 
         raw_actions = state.get("action_history")
         if not isinstance(raw_actions, list):
@@ -383,8 +419,14 @@ class ResearchAgentRuntime:
             state.get("tool_call_count"),
             "tool_call_count",
         )
-        if tool_call_count > self._policy.max_tool_calls:
-            raise ValueError("research graph exceeded the runtime tool call budget")
+        tool_call_budget = _strict_positive_int(
+            state.get("tool_call_budget", self._policy.max_tool_calls),
+            "tool_call_budget",
+        )
+        if tool_call_budget > self._policy.max_tool_calls:
+            raise ValueError("research graph exceeded the absolute tool call budget")
+        if tool_call_count > tool_call_budget:
+            raise ValueError("research graph exceeded the frozen tool call budget")
         tool_actions = tuple(
             item for item in action_history if item.action in {"search_corpus", "get_evidence"}
         )
@@ -409,10 +451,13 @@ class ResearchAgentRuntime:
         assessment_actions = tuple(
             item for item in action_history if item.action == "assess_evidence"
         )
-        if tuple((item.step_id, item.outcome) for item in assessment_actions) != tuple(
-            (observation.step_id, assessment.status)
-            for observation, assessment in zip(observations, assessments, strict=True)
-        ):
+        expected_assessment_actions = tuple(
+            (observations[limit - 1].step_id, assessment.status)
+            for limit, assessment in zip(assessment_limits, assessments, strict=True)
+        )
+        if tuple(
+            (item.step_id, item.outcome) for item in assessment_actions
+        ) != expected_assessment_actions:
             raise ValueError("research assessment actions do not match assessments")
 
         replan_count = _strict_non_negative_int(state.get("replan_count"), "replan_count")
@@ -451,9 +496,11 @@ class ResearchAgentRuntime:
             raise ValueError("research termination is inconsistent with evidence sufficiency")
         if (
             termination_reason == "tool_budget"
-            and self._policy.max_tool_calls - tool_call_count >= 2
+            and tool_call_budget - tool_call_count >= 2
         ):
             raise ValueError("tool-budget termination does not match the runtime policy")
+        if termination_reason == "step_budget" and current_step != step_budget:
+            raise ValueError("step-budget termination is inconsistent with state")
         if termination_reason == "no_new_evidence" and consecutive_no_new_evidence < 2:
             raise ValueError("no-new-evidence termination is inconsistent with state")
         if termination_reason == "plan_exhausted" and (
@@ -484,7 +531,9 @@ class ResearchAgentRuntime:
             observations,
             assessments,
             action_history,
+            step_budget,
             tool_call_count,
+            tool_call_budget,
             replan_count,
             consecutive_no_new_evidence,
             raw_sufficient,
@@ -499,7 +548,9 @@ class ResearchAgentRuntime:
             assessments=assessments,
             action_history=action_history,
             evidence=evidence,
+            step_budget=step_budget,
             tool_call_count=tool_call_count,
+            tool_call_budget=tool_call_budget,
             replan_count=replan_count,
             evidence_sufficient=raw_sufficient,
             termination_reason=termination_reason,
@@ -563,6 +614,12 @@ def _strict_non_negative_int(value: object, field: str) -> int:
     return value
 
 
+def _strict_positive_int(value: object, field: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError(f"research graph {field} is invalid")
+    return value
+
+
 def _elapsed_ms(started: float) -> float:
     return max(0.0, (time.perf_counter() - started) * 1000)
 
@@ -572,7 +629,9 @@ def _task_state(
     observations: tuple[ResearchObservation, ...],
     assessments: tuple[EvidenceAssessment, ...],
     action_history: tuple[ResearchActionRecord, ...],
+    step_budget: int,
     tool_call_count: int,
+    tool_call_budget: int,
     replan_count: int,
     consecutive_no_new_evidence: int,
     evidence_sufficient: bool,
@@ -600,6 +659,7 @@ def _task_state(
             {
                 "evidence_sufficient": item.evidence_sufficient,
                 "coverage": [entry.model_dump(mode="json") for entry in item.coverage],
+                "ledger": [entry.model_dump(mode="json") for entry in item.ledger],
                 "next_objective": item.next_objective,
                 "next_query": item.next_query,
                 "next_requirement_ids": list(item.next_requirement_ids),
@@ -608,7 +668,9 @@ def _task_state(
             for item in assessments
         ],
         "action_history": [item.model_dump(mode="json") for item in action_history],
+        "step_budget": step_budget,
         "tool_call_count": tool_call_count,
+        "tool_call_budget": tool_call_budget,
         "replan_count": replan_count,
         "consecutive_no_new_evidence": consecutive_no_new_evidence,
         "evidence_sufficient": evidence_sufficient,

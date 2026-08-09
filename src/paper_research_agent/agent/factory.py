@@ -133,14 +133,14 @@ async def create_research_agent_runtime(
             dynamic_graph = build_dynamic_tool_graph(
                 router=LangChainToolRouter(model),
                 toolkit=extended_handle.toolkit,
-                max_steps=runtime_policy.max_steps,
+                max_steps=runtime_policy.max_dynamic_tool_steps,
                 checkpointer=checkpointer,
                 event_sink=resolved_event_sink,
                 memory_proposer=LangChainMemoryProposer(model),
             )
             dynamic_runtime = DynamicResearchRuntime(
                 graph=dynamic_graph,
-                max_steps=runtime_policy.max_steps,
+                max_steps=runtime_policy.max_dynamic_tool_steps,
                 timeout_seconds=runtime_policy.timeout_seconds,
             )
         graph = build_research_graph(

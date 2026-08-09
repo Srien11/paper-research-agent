@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict, cast
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
@@ -16,6 +16,7 @@ from paper_research_agent.agent.langchain_tools import build_langchain_tools
 from paper_research_agent.agent.models import (
     TERMINATION_REASONS,
     EvidenceAssessment,
+    EvidenceFollowup,
     GetEvidenceResult,
     ResearchActionRecord,
     ResearchObservation,
@@ -29,7 +30,12 @@ from paper_research_agent.agent.observability import (
     emit_agent_event,
     safe_fingerprint,
 )
-from paper_research_agent.agent.policy import ResearchRuntimePolicy, ResearchToolName
+from paper_research_agent.agent.policy import (
+    ABSOLUTE_MAX_RESEARCH_STEPS,
+    MAX_INITIAL_PLAN_STEPS,
+    ResearchRuntimePolicy,
+    ResearchToolName,
+)
 from paper_research_agent.agent.service import ResearchToolService
 
 if TYPE_CHECKING:
@@ -78,17 +84,23 @@ class ResearchGraphState(TypedDict, total=False):
     planning_required: bool
     plan: dict[str, Any]
     current_step: int
+    step_budget: int
     active_step: dict[str, Any] | None
     tool_call_count: int
+    tool_call_budget: int
     observations: list[dict[str, Any]]
     evidence_records: list[dict[str, Any]]
     assessments: list[dict[str, Any]]
+    assessment_observation_counts: list[int]
+    assessment_durations_ms: list[float]
+    pending_followups: list[dict[str, Any]]
     action_history: list[dict[str, Any]]
     replan_count: int
     consecutive_no_new_evidence: int
     next_action: str
     evidence_sufficient: bool
     termination_reason: str | None
+    started_at_epoch_seconds: float
 
 
 def build_research_graph(
@@ -96,7 +108,7 @@ def build_research_graph(
     planner: ResearchPlanner,
     reasoner: ResearchReasoner,
     service: ResearchToolService,
-    max_steps: int = 4,
+    max_steps: int = ABSOLUTE_MAX_RESEARCH_STEPS,
     evidence_per_step: int = 4,
     policy: ResearchRuntimePolicy | None = None,
     checkpointer: Any | None = None,
@@ -104,21 +116,35 @@ def build_research_graph(
     extended_toolkit: ExtendedResearchToolkit | None = None,
 ) -> CompiledStateGraph[Any, Any, Any, Any]:
     """Compile a fail-closed reason-act-observe-assess loop over two local tools."""
-    if max_steps <= 0 or max_steps > 6:
-        raise ValueError("max_steps must be between 1 and 6")
+    if max_steps <= 0 or max_steps > ABSOLUTE_MAX_RESEARCH_STEPS:
+        raise ValueError(
+            f"max_steps must be between 1 and {ABSOLUTE_MAX_RESEARCH_STEPS}"
+        )
     if evidence_per_step <= 0 or evidence_per_step > 20:
         raise ValueError("evidence_per_step must be between 1 and 20")
     runtime_policy = policy or ResearchRuntimePolicy(
         max_steps=max_steps,
         evidence_per_step=evidence_per_step,
     )
-    initial_plan_steps = runtime_policy.max_steps
+    initial_plan_steps = max(
+        1,
+        min(
+            MAX_INITIAL_PLAN_STEPS,
+            runtime_policy.max_steps,
+            runtime_policy.max_tool_calls // 2,
+        ),
+    )
     evidence_per_step = runtime_policy.evidence_per_step
     tools = {tool.name: tool for tool in build_langchain_tools(service, extended_toolkit)}
     search_tool = tools["search_corpus"]
     evidence_tool = tools["get_evidence"]
 
     async def create_plan(state: ResearchGraphState) -> ResearchGraphState:
+        started_at_epoch_seconds = state.get("started_at_epoch_seconds")
+        if not isinstance(started_at_epoch_seconds, (int, float)) or isinstance(
+            started_at_epoch_seconds, bool
+        ):
+            started_at_epoch_seconds = time.time()
         graph_input = ResearchGraphInput(
             question=state["question"],
             planning_required=state.get("planning_required", False),
@@ -138,31 +164,59 @@ def build_research_graph(
                     )
                 }
             )
+        step_budget, tool_call_budget = runtime_policy.freeze_invocation_budget(
+            len(plan.steps)
+        )
         return {
             "run_id": state.get("run_id", ""),
             "question": graph_input.question,
             "planning_required": graph_input.planning_required,
             "plan": plan.model_dump(mode="json"),
             "current_step": 0,
+            "step_budget": step_budget,
             "active_step": None,
             "tool_call_count": 0,
+            "tool_call_budget": tool_call_budget,
             "observations": [],
             "evidence_records": [],
             "assessments": [],
+            "assessment_observation_counts": [],
+            "assessment_durations_ms": [],
+            "pending_followups": [],
             "action_history": [],
             "replan_count": 0,
             "consecutive_no_new_evidence": 0,
             "next_action": "reason",
             "evidence_sufficient": False,
             "termination_reason": None,
+            "started_at_epoch_seconds": float(started_at_epoch_seconds),
         }
 
     async def reason(state: ResearchGraphState) -> ResearchGraphState:
         plan = ResearchPlan.model_validate(state["plan"])
+        is_comparison = plan.task_type == "comparison"
         current_step = state["current_step"]
         observations = tuple(
             ResearchObservation.model_validate(value) for value in state["observations"]
         )
+
+        def finish_or_assess(
+            termination_reason: str,
+            *,
+            pending_followups: list[EvidenceFollowup] | None = None,
+        ) -> ResearchGraphState:
+            if _has_unassessed_comparison_evidence(state, plan, observations):
+                update: ResearchGraphState = {
+                    "active_step": None,
+                    "next_action": "assess_evidence",
+                    "termination_reason": None,
+                }
+                if pending_followups is not None:
+                    update["pending_followups"] = [
+                        item.model_dump(mode="json") for item in pending_followups
+                    ]
+                return update
+            return _finish_update(termination_reason)
 
         if not observations:
             return {
@@ -171,27 +225,102 @@ def build_research_graph(
                 "termination_reason": None,
             }
 
+        if (
+            is_comparison
+            and not state["assessments"]
+            and current_step < len(plan.steps)
+        ):
+            initial_planned_next = plan.steps[current_step]
+            executed_queries = {
+                _query_scope_key(item.search.query, item.search.corpus_id)
+                for item in observations
+            }
+            if _step_query_key(initial_planned_next) in executed_queries:
+                return finish_or_assess("repeated_query")
+            return {
+                "active_step": initial_planned_next.model_dump(mode="json"),
+                "next_action": "execute_tools",
+                "termination_reason": None,
+            }
+
         assessments = tuple(
             EvidenceAssessment.model_validate(value) for value in state["assessments"]
         )
-        if len(assessments) != len(observations):
+        if not is_comparison and len(assessments) != len(observations):
             raise ValueError("research assessments do not match observations")
+        if is_comparison and (
+            not assessments or len(assessments) > len(observations)
+        ):
+            raise ValueError("comparison assessments do not match observation batches")
         latest = assessments[-1]
         if latest.evidence_sufficient:
-            return _finish_update("evidence_sufficient")
+            return finish_or_assess("evidence_sufficient")
+        if _remaining_runtime_seconds(
+            state, runtime_policy
+        ) < _supplemental_completion_reserve_seconds(state, runtime_policy):
+            return finish_or_assess("time_budget")
         if state["consecutive_no_new_evidence"] >= 2:
-            return _finish_update("no_new_evidence")
-        if runtime_policy.max_tool_calls - state["tool_call_count"] < 2:
-            return _finish_update("tool_budget")
+            return finish_or_assess("no_new_evidence")
+        if current_step >= _state_step_budget(state, runtime_policy):
+            return finish_or_assess("step_budget")
+        if _state_tool_call_budget(state, runtime_policy) - state["tool_call_count"] < 2:
+            return finish_or_assess("tool_budget")
 
         executed_queries = {
             _query_scope_key(item.search.query, item.search.corpus_id)
             for item in observations
         }
+        pending_followups = [
+            EvidenceFollowup.model_validate(item)
+            for item in state.get("pending_followups", [])
+        ]
+        if is_comparison and pending_followups:
+            requirement_by_id = {
+                item.requirement_id: item for item in plan.requirements
+            }
+            while pending_followups:
+                followup = pending_followups.pop(0)
+                requested = requirement_by_id[followup.requirement_id]
+                corpus_id = _comparison_corpus_id(plan, (requested.target_id,))
+                if _query_scope_key(followup.query, corpus_id) in executed_queries:
+                    continue
+                replan_count = state["replan_count"] + 1
+                replacement = ResearchStep(
+                    step_id=f"replan-{replan_count}",
+                    objective=followup.objective,
+                    query=followup.query,
+                    top_k=min(20, max(10, evidence_per_step)),
+                    corpus_id=corpus_id,
+                    target_ids=(requested.target_id,),
+                    dimension_ids=(requested.dimension_id,),
+                )
+                updated_plan = plan.model_copy(
+                    update={"steps": (*plan.steps, replacement)}
+                )
+                action_history = _append_action(
+                    state,
+                    action="replan",
+                    step_id=replacement.step_id,
+                    query=replacement.query,
+                )
+                return {
+                    "plan": updated_plan.model_dump(mode="json"),
+                    "active_step": replacement.model_dump(mode="json"),
+                    "pending_followups": [
+                        item.model_dump(mode="json") for item in pending_followups
+                    ],
+                    "action_history": action_history,
+                    "replan_count": replan_count,
+                    "next_action": "execute_tools",
+                    "termination_reason": None,
+                }
+            return finish_or_assess(
+                "repeated_query", pending_followups=pending_followups
+            )
         planned_next = plan.steps[current_step] if current_step < len(plan.steps) else None
-        if plan.task_type == "comparison" and planned_next is not None:
+        if is_comparison and planned_next is not None:
             if _step_query_key(planned_next) in executed_queries:
-                return _finish_update("repeated_query")
+                return finish_or_assess("repeated_query")
             return {
                 "active_step": planned_next.model_dump(mode="json"),
                 "next_action": "execute_tools",
@@ -200,24 +329,22 @@ def build_research_graph(
         if latest.next_query is not None:
             replan_target_ids: tuple[str, ...] = ()
             replan_dimension_ids: tuple[str, ...] = ()
-            if plan.task_type == "comparison":
+            if is_comparison:
+                if len(latest.next_requirement_ids) != 1:
+                    raise ValueError(
+                        "comparison follow-up requires exactly one requirement cell"
+                    )
                 requirement_by_id = {
                     item.requirement_id: item for item in plan.requirements
                 }
-                requested = [
-                    requirement_by_id[item] for item in latest.next_requirement_ids
-                ]
-                replan_target_ids = tuple(
-                    dict.fromkeys(item.target_id for item in requested)
-                )
-                replan_dimension_ids = tuple(
-                    dict.fromkeys(item.dimension_id for item in requested)
-                )
+                requested = requirement_by_id[latest.next_requirement_ids[0]]
+                replan_target_ids = (requested.target_id,)
+                replan_dimension_ids = (requested.dimension_id,)
             replan_corpus_id = _comparison_corpus_id(plan, replan_target_ids)
             next_query_key = _query_scope_key(latest.next_query, replan_corpus_id)
             if next_query_key in executed_queries:
                 if planned_next is None or _step_query_key(planned_next) in executed_queries:
-                    return _finish_update("repeated_query")
+                    return finish_or_assess("repeated_query")
             else:
                 replan_count = state["replan_count"] + 1
                 replacement = ResearchStep(
@@ -260,9 +387,9 @@ def build_research_graph(
                 }
 
         if planned_next is None:
-            return _finish_update("plan_exhausted")
+            return finish_or_assess("plan_exhausted")
         if _step_query_key(planned_next) in executed_queries:
-            return _finish_update("repeated_query")
+            return finish_or_assess("repeated_query")
         return {
             "active_step": planned_next.model_dump(mode="json"),
             "next_action": "execute_tools",
@@ -447,19 +574,38 @@ def build_research_graph(
         observations = tuple(
             ResearchObservation.model_validate(value) for value in state["observations"]
         )
+        assessment_started = time.perf_counter()
         assessment = await reasoner.assess(
             state["question"],
             plan=plan,
             observations=observations,
             remaining_steps=min(
-                6,
+                max(0, _state_step_budget(state, runtime_policy) - state["current_step"]),
                 max(
                     0,
-                    (runtime_policy.max_tool_calls - state["tool_call_count"]) // 2,
+                    (
+                        _state_tool_call_budget(state, runtime_policy)
+                        - state["tool_call_count"]
+                    )
+                    // 2,
                 ),
             ),
         )
+        assessment_duration_ms = _elapsed_ms(assessment_started)
         assessment = validate_evidence_assessment(plan, observations, assessment)
+        followups = assessment.followups
+        if (
+            plan.task_type == "comparison"
+            and not followups
+            and assessment.next_query is not None
+        ):
+            followups = (
+                EvidenceFollowup(
+                    requirement_id=assessment.next_requirement_ids[0],
+                    query=assessment.next_query,
+                    objective=assessment.next_objective or "Refine the evidence search",
+                ),
+            )
         action_history = _append_action(
             state,
             action="assess_evidence",
@@ -470,6 +616,17 @@ def build_research_graph(
             "assessments": [
                 *state["assessments"],
                 assessment.model_dump(mode="json"),
+            ],
+            "assessment_observation_counts": [
+                *state.get("assessment_observation_counts", []),
+                len(observations),
+            ],
+            "assessment_durations_ms": [
+                *state.get("assessment_durations_ms", []),
+                assessment_duration_ms,
+            ],
+            "pending_followups": [
+                item.model_dump(mode="json") for item in followups
             ],
             "action_history": action_history,
             "evidence_sufficient": assessment.evidence_sufficient,
@@ -491,34 +648,125 @@ def build_research_graph(
         }
 
     def route_after_reason(state: ResearchGraphState) -> str:
-        return "execute_tools" if state["next_action"] == "execute_tools" else "finalize"
+        return state["next_action"]
+
+    def route_after_execute_tools(state: ResearchGraphState) -> str:
+        plan = ResearchPlan.model_validate(state["plan"])
+        if (
+            plan.task_type == "comparison"
+            and (
+                bool(state.get("pending_followups"))
+                or (
+                    not state["assessments"]
+                    and state["current_step"] < len(plan.steps)
+                )
+            )
+        ):
+            return "reason"
+        return "assess_evidence"
 
     builder = StateGraph(ResearchGraphState)
-    builder.add_node("plan", _instrument_node("plan", create_plan, event_sink))
-    builder.add_node("reason", _instrument_node("reason", reason, event_sink))
+    builder.add_node(
+        "plan", cast(Any, _instrument_node("plan", create_plan, event_sink))
+    )
+    builder.add_node(
+        "reason", cast(Any, _instrument_node("reason", reason, event_sink))
+    )
     builder.add_node(
         "execute_tools",
-        _instrument_node("execute_tools", execute_tools, event_sink),
+        cast(Any, _instrument_node("execute_tools", execute_tools, event_sink)),
     )
     builder.add_node(
         "assess_evidence",
-        _instrument_node("assess_evidence", assess_evidence, event_sink),
+        cast(Any, _instrument_node("assess_evidence", assess_evidence, event_sink)),
     )
-    builder.add_node("finalize", _instrument_node("finalize", finalize, event_sink))
+    builder.add_node(
+        "finalize", cast(Any, _instrument_node("finalize", finalize, event_sink))
+    )
     builder.add_edge(START, "plan")
     builder.add_edge("plan", "reason")
     builder.add_conditional_edges(
         "reason",
         route_after_reason,
-        {"execute_tools": "execute_tools", "finalize": "finalize"},
+        {
+            "execute_tools": "execute_tools",
+            "assess_evidence": "assess_evidence",
+            "finalize": "finalize",
+        },
     )
-    builder.add_edge("execute_tools", "assess_evidence")
+    builder.add_conditional_edges(
+        "execute_tools",
+        route_after_execute_tools,
+        {"reason": "reason", "assess_evidence": "assess_evidence"},
+    )
     builder.add_edge("assess_evidence", "reason")
     builder.add_edge("finalize", END)
     return builder.compile(checkpointer=checkpointer, name="paper_research_react_v2")
 
 
 ResearchNode = Callable[[ResearchGraphState], Awaitable[ResearchGraphState]]
+
+
+def _state_step_budget(
+    state: ResearchGraphState,
+    policy: ResearchRuntimePolicy,
+) -> int:
+    value = state.get("step_budget", policy.max_steps)
+    return value if isinstance(value, int) and value > 0 else policy.max_steps
+
+
+def _state_tool_call_budget(
+    state: ResearchGraphState,
+    policy: ResearchRuntimePolicy,
+) -> int:
+    value = state.get("tool_call_budget", policy.max_tool_calls)
+    return value if isinstance(value, int) and value > 0 else policy.max_tool_calls
+
+
+def _remaining_runtime_seconds(
+    state: ResearchGraphState,
+    policy: ResearchRuntimePolicy,
+) -> float:
+    started = state.get("started_at_epoch_seconds")
+    if not isinstance(started, (int, float)) or isinstance(started, bool):
+        return policy.timeout_seconds
+    return max(0.0, policy.timeout_seconds - (time.time() - float(started)))
+
+
+def _supplemental_completion_reserve_seconds(
+    state: ResearchGraphState,
+    policy: ResearchRuntimePolicy,
+) -> float:
+    """Reserve enough time for follow-up tools and one more evidence compilation."""
+    durations = state.get("assessment_durations_ms", [])
+    valid_durations = [
+        float(value)
+        for value in durations
+        if isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and value >= 0
+    ]
+    latest_assessment_seconds = valid_durations[-1] / 1000 if valid_durations else 20.0
+    remaining_step_slots = max(
+        0, _state_step_budget(state, policy) - state.get("current_step", 0)
+    )
+    remaining_tool_slots = max(
+        0,
+        (_state_tool_call_budget(state, policy) - state.get("tool_call_count", 0)) // 2,
+    )
+    pending_count = len(state.get("pending_followups", []))
+    expected_followups = min(pending_count, remaining_step_slots, remaining_tool_slots)
+
+    # Compilation dominates the observed tail latency. Use the latest measured
+    # duration with headroom, plus a bounded allowance for local retrieval and
+    # final graph/answer serialization. The 45-second floor protects runs that
+    # have no trustworthy duration history yet.
+    predicted_seconds = (
+        latest_assessment_seconds * 1.25
+        + expected_followups * 6.0
+        + 10.0
+    )
+    return min(float(policy.timeout_seconds), max(45.0, predicted_seconds))
 
 
 def _instrument_node(
@@ -572,7 +820,10 @@ def _consume_tool(
     tool_name: ResearchToolName,
     current_calls: int,
 ) -> int:
+    invocation_budget = _state_tool_call_budget(state, policy)
     try:
+        if current_calls + 1 > invocation_budget:
+            raise RuntimeError("research invocation tool call budget exceeded")
         return policy.consume(tool_name, current_calls)
     except PermissionError as exc:
         _emit_graph_event(
@@ -585,7 +836,7 @@ def _consume_tool(
             error_type=type(exc).__name__,
             reason_code="tool_not_allowed",
             tool_call_count=current_calls,
-            max_tool_calls=policy.max_tool_calls,
+            max_tool_calls=invocation_budget,
         )
         raise
     except RuntimeError as exc:
@@ -599,7 +850,7 @@ def _consume_tool(
             error_type=type(exc).__name__,
             reason_code="tool_budget_exceeded",
             tool_call_count=current_calls,
-            max_tool_calls=policy.max_tool_calls,
+            max_tool_calls=invocation_budget,
         )
         raise
 
@@ -696,6 +947,18 @@ def _finish_update(reason: str) -> ResearchGraphState:
         "next_action": "finalize",
         "termination_reason": reason,
     }
+
+
+def _has_unassessed_comparison_evidence(
+    state: ResearchGraphState,
+    plan: ResearchPlan,
+    observations: tuple[ResearchObservation, ...],
+) -> bool:
+    if plan.task_type != "comparison" or not observations:
+        return False
+    counts = state.get("assessment_observation_counts", [])
+    last_assessed_count = counts[-1] if counts else 0
+    return last_assessed_count < len(observations)
 
 
 def _append_action(

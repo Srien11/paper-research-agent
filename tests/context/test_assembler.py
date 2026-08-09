@@ -9,7 +9,21 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from paper_research_agent.context.assembler import assemble_context
+from paper_research_agent.agent.models import (
+    CompiledEvidenceFact,
+    EvidenceAssessment,
+    EvidenceCoverage,
+    EvidenceLedgerCell,
+    EvidenceRequirement,
+    ResearchDimension,
+    ResearchPlan,
+    ResearchStep,
+    ResearchTarget,
+)
+from paper_research_agent.context.assembler import (
+    assemble_comparison_context,
+    assemble_context,
+)
 from paper_research_agent.context.budget import (
     ContextBudgetExceeded,
     conservative_token_count,
@@ -43,6 +57,81 @@ def evidence(
 
 
 class ContextAssemblerTests(unittest.TestCase):
+    def test_compiled_comparison_context_excludes_raw_evidence_bodies(self) -> None:
+        plan = ResearchPlan(
+            task_type="comparison",
+            targets=(
+                ResearchTarget(target_id="a", label="Paper A", corpus_id="C001"),
+                ResearchTarget(target_id="b", label="Paper B", corpus_id="C002"),
+            ),
+            dimensions=(ResearchDimension(dimension_id="method", label="Method"),),
+            requirements=tuple(
+                EvidenceRequirement(
+                    requirement_id=f"{target}-method",
+                    target_id=target,
+                    dimension_id="method",
+                    description=f"{target} method",
+                )
+                for target in ("a", "b")
+            ),
+            steps=tuple(
+                ResearchStep(
+                    step_id=f"{target}-method",
+                    objective=f"Find {target} method",
+                    query=f"{target} method",
+                    corpus_id=corpus_id,
+                    target_ids=(target,),
+                    dimension_ids=("method",),
+                )
+                for target, corpus_id in (("a", "C001"), ("b", "C002"))
+            ),
+        )
+        assessment = EvidenceAssessment(
+            evidence_sufficient=True,
+            status="sufficient",
+            coverage=tuple(
+                EvidenceCoverage(
+                    requirement_id=f"{target}-method",
+                    covered=True,
+                    chunk_ids=(chunk_id,),
+                )
+                for target, chunk_id in (("a", "a-1"), ("b", "b-1"))
+            ),
+            ledger=tuple(
+                EvidenceLedgerCell(
+                    requirement_id=f"{target}-method",
+                    status="sufficient",
+                    facts=(
+                        CompiledEvidenceFact(
+                            fact_id=f"{target}-method-f1",
+                            statement=f"{target} uses a verified method.",
+                            chunk_ids=(chunk_id,),
+                        ),
+                    ),
+                )
+                for target, chunk_id in (("a", "a-1"), ("b", "b-1"))
+            ),
+        )
+        context = assemble_comparison_context(
+            ContextRequest(
+                system_rules="Use citations.",
+                user_question="Compare A and B",
+                evidence=(
+                    evidence("a-1", "RAW_SECRET_A", 1, corpus_id="C001"),
+                    evidence("b-1", "RAW_SECRET_B", 2, corpus_id="C002"),
+                ),
+                token_budget=4000,
+            ),
+            plan=plan,
+            assessment=assessment,
+        )
+
+        prompt = "\n".join(item.content for item in context.messages)
+        self.assertNotIn("RAW_SECRET_A", prompt)
+        self.assertNotIn("RAW_SECRET_B", prompt)
+        self.assertIn("a uses a verified method", prompt)
+        self.assertEqual({item.citation_id for item in context.citations}, {"E1", "E2"})
+
     def test_comparison_task_state_has_a_trusted_synthesis_policy(self) -> None:
         context = assemble_context(
             ContextRequest(

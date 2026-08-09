@@ -6,6 +6,7 @@ import json
 from collections import deque
 from collections.abc import Sequence
 
+from paper_research_agent.agent.models import EvidenceAssessment, ResearchPlan
 from paper_research_agent.context.budget import (
     ContextBudgetExceeded,
     TokenEstimator,
@@ -44,6 +45,13 @@ COMPARISON SYNTHESIS POLICY:
 - Cite the evidence for each target separately; evidence for one target cannot support another.
 - Do not infer an uncovered cell, and explicitly omit or qualify dimensions without coverage.
 - Do not claim an overall winner unless evidence supports the same decision criteria."""
+
+COMPILED_LEDGER_POLICY = """\
+COMPILED EVIDENCE LEDGER POLICY:
+- The comparison ledger is the complete factual boundary for this answer.
+- Use every supplied fact exactly once and cite only the citation IDs attached to that fact.
+- Never add, infer, strengthen, or combine a fact beyond its statement and qualifiers.
+- Raw evidence text is intentionally unavailable at this generation stage."""
 
 
 def _canonical_json(value: object) -> str:
@@ -393,4 +401,100 @@ def assemble_context(
         included_memory_turn_ids=tuple(turn.turn_id for turn in memory),
         omitted_memory_turn_count=len(request.short_term_memory) - len(memory),
         evidence_insufficient=not selected,
+    )
+
+
+def assemble_comparison_context(
+    request: ContextRequest,
+    *,
+    plan: ResearchPlan,
+    assessment: EvidenceAssessment,
+    estimator: TokenEstimator = conservative_token_count,
+) -> AssembledContext:
+    """Assemble a raw-body-free context from the final validated comparison ledger."""
+    if plan.task_type != "comparison":
+        raise ValueError("comparison context requires a comparison plan")
+    if not assessment.ledger:
+        raise ValueError("comparison context requires a compiled evidence ledger")
+    requirement_by_id = {item.requirement_id: item for item in plan.requirements}
+    evidence_by_chunk = {item.chunk_id: item for item in request.evidence}
+    ordered_chunk_ids = tuple(
+        dict.fromkeys(
+            chunk_id
+            for requirement in plan.requirements
+            for cell in assessment.ledger
+            if cell.requirement_id == requirement.requirement_id
+            for fact in cell.facts
+            for chunk_id in fact.chunk_ids
+        )
+    )
+    missing = set(ordered_chunk_ids) - set(evidence_by_chunk)
+    if missing:
+        raise ValueError("comparison ledger references evidence absent from generation input")
+    selected = [evidence_by_chunk[chunk_id] for chunk_id in ordered_chunk_ids]
+    citations = tuple(_citation(item, index) for index, item in enumerate(selected, 1))
+    citation_by_chunk = {
+        item.chunk_id: citation.citation_id
+        for item, citation in zip(selected, citations, strict=True)
+    }
+    targets = {item.target_id: item for item in plan.targets}
+    dimensions = {item.dimension_id: item for item in plan.dimensions}
+    ledger_items: list[dict[str, object]] = []
+    for cell in assessment.ledger:
+        requirement = requirement_by_id[cell.requirement_id]
+        for fact in cell.facts:
+            ledger_items.append(
+                {
+                    "fact_id": fact.fact_id,
+                    "fact_requirement_ids": list(fact.fact_requirement_ids),
+                    "requirement_id": cell.requirement_id,
+                    "target_id": requirement.target_id,
+                    "target_label": targets[requirement.target_id].label,
+                    "dimension_id": requirement.dimension_id,
+                    "dimension_label": dimensions[requirement.dimension_id].label,
+                    "statement": fact.statement,
+                    "qualifiers": [item.model_dump(mode="json") for item in fact.qualifiers],
+                    "citation_ids": [citation_by_chunk[item] for item in fact.chunk_ids],
+                }
+            )
+    if not ledger_items:
+        raise ValueError("comparison ledger contains no answerable facts")
+    system = PromptMessage(
+        role="system",
+        content=(
+            f"{request.system_rules.rstrip()}\n\n{CONTEXT_POLICY}\n\n"
+            f"{COMPARISON_SYNTHESIS_POLICY}\n\n{COMPILED_LEDGER_POLICY}"
+        ),
+    )
+    user = PromptMessage(
+        role="user",
+        content=(
+            "Generate the comparison only from this canonical compiled ledger JSON:\n"
+            + _canonical_json(
+                {
+                    "kind": "trusted_compiled_evidence_ledger",
+                    "question": request.standalone_question or request.user_question,
+                    "targets": [item.model_dump(mode="json") for item in plan.targets],
+                    "dimensions": [item.model_dump(mode="json") for item in plan.dimensions],
+                    "facts": ledger_items,
+                }
+            )
+        ),
+    )
+    messages = (system, *request.conversation_history, user)
+    estimated = estimate_messages(messages, estimator)
+    usable_budget = request.token_budget - request.output_reserve_tokens
+    if estimated > usable_budget:
+        raise ContextBudgetExceeded(
+            f"compiled comparison ledger needs {estimated} tokens but only {usable_budget} are available"
+        )
+    return AssembledContext(
+        messages=messages,
+        citations=citations,
+        estimated_tokens=estimated,
+        token_budget=request.token_budget,
+        output_reserve_tokens=request.output_reserve_tokens,
+        omitted_evidence_count=len(request.evidence) - len(selected),
+        omitted_memory_turn_count=len(request.short_term_memory),
+        evidence_insufficient=False,
     )
