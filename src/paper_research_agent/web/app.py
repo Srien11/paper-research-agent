@@ -7,7 +7,6 @@ import inspect
 import json
 import os
 import re
-import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -44,6 +43,10 @@ from paper_research_agent.web.bootstrap import (
     main_agent_mode_from_environment,
 )
 from paper_research_agent.web.chat_runtime import RouteOutputError
+from paper_research_agent.web.compat import (
+    CompatibilityAdapter,
+    CompatibilityProjectionError,
+)
 from paper_research_agent.web.config import WebConfig
 from paper_research_agent.web.events import AgentEventProjector
 from paper_research_agent.web.files import AttachmentStore
@@ -228,40 +231,6 @@ def _capability_plan(interpretation: TurnInterpretation) -> CapabilityPlan:
         research_mode=interpretation.research_mode,
         reason=interpretation.reason,
     )
-
-
-async def _main_agent_ask(
-    app: FastAPI, session: OwnerSession, payload: QuestionRequest
-) -> StreamingResponse:
-    """Route the whole ask through the main Agent and project safe NDJSON events."""
-    runtime = cast(MainAgentRuntime | None, app.state.main_agent_runtime)
-    if runtime is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="主 Agent 运行时未启用",
-        )
-    request_id = payload.request_id or uuid.uuid4().hex
-    result = await runtime.run(
-        MainAgentRequest(
-            request_id=request_id,
-            conversation_id=session.conversation_id,
-            message=payload.question,
-            rag_mode=payload.rag_mode,
-            attachment_ids=payload.attachment_ids,
-        )
-    )
-    events = [
-        {"type": "run_started", "request_id": request_id, "run_id": result.run_id},
-        {"type": "delta", "text": result.answer},
-        {
-            "type": "done",
-            "request_id": request_id,
-            "status": result.status,
-            "workspace_version": result.workspace_version,
-        },
-    ]
-    body = "\n".join(json.dumps(event, ensure_ascii=False) for event in events) + "\n"
-    return StreamingResponse(iter([body]), media_type="application/x-ndjson")
 
 
 async def _prepare_turn(
@@ -637,6 +606,7 @@ def create_app(
     app.state.main_agent_runtime = main_agent_runtime
     app.state.main_agent_mode = main_agent_mode_from_environment()
     app.state.services = None
+    app.state.compatibility = CompatibilityAdapter()
     app.state.config = settings
     app.state.sessions = sessions
     app.state.attachments = shared_attachments
@@ -711,6 +681,54 @@ def create_app(
 
     async def stored_agent_result(request_id: str) -> MainAgentResult | None:
         return await asyncio.to_thread(conversation.store.load_agent_run, request_id)
+
+    async def run_compat_main_agent(
+        payload: QuestionRequest,
+        session: OwnerSession,
+        *,
+        endpoint: str,
+    ) -> MainAgentResult:
+        compatibility = cast(CompatibilityAdapter, app.state.compatibility)
+        compatibility.mark(endpoint)
+        try:
+            app.state.attachments.validate_ownership(
+                session.conversation_id, payload.attachment_ids
+            )
+        except (FileNotFoundError, ValueError):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="附件不存在或不属于当前会话",
+            ) from None
+        main_runtime = cast(MainAgentRuntime | None, app.state.main_agent_runtime)
+        if main_runtime is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="主 Agent 运行时未就绪",
+            )
+        try:
+            result = await main_runtime.run(
+                compatibility.main_request(
+                    payload,
+                    conversation_id=session.conversation_id,
+                )
+            )
+        except Exception as error:  # noqa: BLE001 - sanitize runtime boundary
+            raise _main_agent_runtime_error(error) from None
+        if result.conversation_id != session.conversation_id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="主 Agent 结果与当前会话不匹配",
+            )
+        compatibility.remember_pending(result)
+        return result
+
+    def compat_stream_response(result: MainAgentResult) -> StreamingResponse:
+        compatibility = cast(CompatibilityAdapter, app.state.compatibility)
+        return StreamingResponse(
+            iter(event.to_ndjson() for event in compatibility.stream_events(result)),
+            media_type="application/x-ndjson",
+            headers={"X-Accel-Buffering": "no"},
+        )
 
     @app.post(f"{API_PREFIX}/agent/runs")
     async def run_main_agent(
@@ -937,8 +955,16 @@ def create_app(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="问题长度超过限制",
             )
-        if app.state.main_agent_mode == "primary" and app.state.main_agent_runtime is not None:
-            return await _main_agent_ask(app, session, payload)
+        if app.state.main_agent_mode == "primary":
+            await run_compat_main_agent(payload, session, endpoint="ask")
+            try:
+                cast(CompatibilityAdapter, app.state.compatibility).reject_ask_projection()
+            except CompatibilityProjectionError as error:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=str(error),
+                ) from None
+            raise AssertionError("unreachable")
         turn = None
         resolution = None
         try:
@@ -1002,6 +1028,19 @@ def create_app(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="问题长度超过限制",
             )
+        if app.state.main_agent_mode == "primary":
+            result = await run_compat_main_agent(
+                payload, session, endpoint="tools_run"
+            )
+            try:
+                return cast(
+                    CompatibilityAdapter, app.state.compatibility
+                ).tool_response(result)
+            except CompatibilityProjectionError as error:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=str(error),
+                ) from None
         turn = None
         resolution = None
         try:
@@ -1062,6 +1101,11 @@ def create_app(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="问题长度超过限制",
             )
+        if app.state.main_agent_mode == "primary":
+            result = await run_compat_main_agent(
+                payload, session, endpoint="chat_stream"
+            )
+            return compat_stream_response(result)
         stream_method = getattr(chat_runtime, "stream_chat", None)
         if stream_method is None:
             raise HTTPException(
@@ -1425,6 +1469,42 @@ def create_app(
         session: OwnerSession = Depends(current_session),  # noqa: B008
         rag_runtime: WebRuntime = Depends(active_runtime),  # noqa: B008
     ) -> ToolResearchResponse:
+        if app.state.main_agent_mode == "primary":
+            compatibility = cast(CompatibilityAdapter, app.state.compatibility)
+            compatibility.mark("tools_approval")
+            request_id = compatibility.pending_request_id(session.conversation_id)
+            if request_id is None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="旧审批接口没有可恢复的主 Agent 请求；请改用统一审批接口",
+                )
+            main_runtime = cast(MainAgentRuntime | None, app.state.main_agent_runtime)
+            if main_runtime is None:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="主 Agent 运行时未就绪",
+                )
+            try:
+                result = await main_runtime.resume_approval(
+                    request_id=request_id,
+                    approved=payload.approved,
+                )
+                if result.conversation_id != session.conversation_id:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="主 Agent 结果与当前会话不匹配",
+                    )
+                compatibility.remember_pending(result)
+                return compatibility.tool_response(result)
+            except HTTPException:
+                raise
+            except CompatibilityProjectionError as error:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=str(error),
+                ) from None
+            except Exception as error:  # noqa: BLE001 - sanitize runtime boundary
+                raise _main_agent_runtime_error(error, approval=True) from None
         try:
             result = await rag_runtime.resume_tool_research(
                 session_id=session.conversation_id,

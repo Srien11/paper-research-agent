@@ -352,9 +352,13 @@ class CrossRouteConversationTests(unittest.TestCase):
         self.assertEqual(latest.status, "clarification_required")
         self.assertEqual(latest.user_question, "回到之前的测评方法")
 
-    def test_main_agent_flag_routes_ask_with_request_id(self) -> None:
+    def test_primary_mode_ask_uses_main_agent_without_legacy_rag(self) -> None:
         class FakeMainAgent:
+            def __init__(self) -> None:
+                self.requests: list[object] = []
+
             async def run(self, request: object) -> MainAgentResult:
+                self.requests.append(request)
                 return MainAgentResult(
                     run_id="r" * 32,
                     request_id=request.request_id,  # type: ignore[attr-defined]
@@ -371,7 +375,7 @@ class CrossRouteConversationTests(unittest.TestCase):
             allowed_origins=frozenset({ORIGIN}),
             max_question_chars=2_000,
         )
-        with patch.dict(os.environ, {"PRA_MAIN_AGENT_ENABLED": "true"}), TestClient(
+        with patch.dict(os.environ, {"PRA_MAIN_AGENT_MODE": "primary"}), TestClient(
             create_app(
                 config=config,
                 runtime=self.rag,
@@ -397,11 +401,12 @@ class CrossRouteConversationTests(unittest.TestCase):
                     "request_id": "req-integration-1",
                 },
             )
-        self.assertEqual(response.status_code, 200, response.text)
-        events = [json.loads(line) for line in response.text.strip().split("\n")]
-        self.assertEqual(events[0]["request_id"], "req-integration-1")
-        self.assertEqual(events[-1]["status"], "completed")
-        self.assertIn("主 Agent 集成回答", response.text)
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertIn("统一接口", response.json()["detail"])
+        self.assertEqual(
+            main_agent.requests[0].request_id,  # type: ignore[attr-defined]
+            "req-integration-1",
+        )
         self.assertEqual(self.rag.contexts, [])
 
     def test_attachment_and_web_routes_store_original_user_questions(self) -> None:

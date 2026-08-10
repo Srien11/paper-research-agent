@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import unittest
 from types import SimpleNamespace
@@ -379,7 +378,7 @@ class AppTests(unittest.TestCase):
             {"authenticated": False},
         )
 
-    def test_main_agent_flag_routes_ask_and_preserves_request_id(self) -> None:
+    def test_primary_mode_runs_main_agent_but_rejects_legacy_ask_projection(self) -> None:
         class FakeMainAgent:
             def __init__(self) -> None:
                 self.requests: list[object] = []
@@ -402,7 +401,7 @@ class AppTests(unittest.TestCase):
             allowed_origins=frozenset({ORIGIN}),
             max_question_chars=100,
         )
-        with patch.dict(os.environ, {"PRA_MAIN_AGENT_ENABLED": "true"}):
+        with patch.dict(os.environ, {"PRA_MAIN_AGENT_MODE": "primary"}):
             app = create_app(
                 config=config,
                 runtime=self.runtime,
@@ -421,16 +420,15 @@ class AppTests(unittest.TestCase):
                     json={
                         "question": "比较 RAG 与 GraphRAG",
                         "rag_mode": "preferred",
-                        "request_id": "req-123",
+                        "request_id": "req_1234567890123456",
                     },
                 )
-        self.assertEqual(response.status_code, 200, response.text)
-        events = [json.loads(line) for line in response.text.strip().split("\n")]
-        self.assertEqual(events[0]["type"], "run_started")
-        self.assertEqual(events[0]["request_id"], "req-123")
-        self.assertEqual(events[-1]["type"], "done")
-        self.assertEqual(events[-1]["status"], "completed")
-        self.assertEqual(main_agent.requests[0].request_id, "req-123")
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertIn("统一接口", response.json()["detail"])
+        self.assertEqual(
+            main_agent.requests[0].request_id,  # type: ignore[attr-defined]
+            "req_1234567890123456",
+        )
 
     def test_main_agent_flag_off_keeps_legacy_ask(self) -> None:
         self.login()
