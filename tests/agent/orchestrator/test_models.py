@@ -5,6 +5,14 @@ from datetime import UTC, datetime
 
 from pydantic import ValidationError
 
+from paper_research_agent.agent.orchestrator.artifacts import (
+    AttachmentArtifact,
+    ChatArtifact,
+    DynamicToolArtifact,
+    FileArtifact,
+    LocalRAGArtifact,
+    LocalRAGTrace,
+)
 from paper_research_agent.agent.orchestrator.models import (
     AcceptanceCriterion,
     AgentContextEnvelope,
@@ -19,6 +27,7 @@ from paper_research_agent.agent.orchestrator.models import (
     TaskPlanDecision,
     TurnInterpretationV2,
 )
+from paper_research_agent.answering.models import RAGAnswer
 
 
 def _utc() -> datetime:
@@ -88,6 +97,49 @@ def _workspace(**overrides: object) -> ConversationWorkspace:
 
 
 class MainAgentModelTests(unittest.TestCase):
+    def test_child_artifacts_are_strict_discriminated_contracts(self) -> None:
+        chat = ChatArtifact(text="普通回答")
+        attachment = AttachmentArtifact(text="附件摘要", source_attachment_ids=("a" * 32,))
+        edited = FileArtifact(text="已完成修改", output_attachment_ids=("b" * 32,))
+        dynamic = DynamicToolArtifact(
+            text="已核验论文状态",
+            tool_names=("check_paper_status",),
+        )
+
+        self.assertEqual(chat.kind, "chat")
+        self.assertEqual(attachment.kind, "attachment_qa")
+        self.assertEqual(edited.kind, "file_edit")
+        self.assertEqual(dynamic.kind, "dynamic_tools")
+        with self.assertRaises(ValidationError):
+            ChatArtifact(text="回答", unknown="value")
+        with self.assertRaises(ValidationError):
+            FileArtifact(text="未产生文件", output_attachment_ids=())
+
+    def test_local_rag_artifact_preserves_validated_answer(self) -> None:
+        answer = RAGAnswer(
+            status="insufficient_evidence",
+            answer_markdown="当前证据不足。",
+            claims=(),
+            citations=(),
+            requested_model="test-model",
+            prompt_version="test-prompt",
+            latency_ms=0,
+            attempts=0,
+        )
+        artifact = LocalRAGArtifact(
+            text=answer.answer_markdown,
+            answer=answer,
+            retrieval=LocalRAGTrace(
+                index_id="index-v1",
+                resolved_question_sha256="a" * 64,
+                hit_count=0,
+            ),
+        )
+
+        self.assertEqual(artifact.kind, "local_rag")
+        self.assertIs(artifact.answer, answer)
+        self.assertEqual(artifact.retrieval.index_id, "index-v1")
+
     def test_goal_state_enforces_id_pattern_and_criteria_limit(self) -> None:
         with self.assertRaises(ValidationError):
             _goal(goal_id="short")

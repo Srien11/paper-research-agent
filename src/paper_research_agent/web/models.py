@@ -35,6 +35,25 @@ class QuestionRequest(WebModel):
         return normalized
 
 
+class AgentRunRequest(WebModel):
+    request_id: str = Field(pattern=r"^[A-Za-z0-9_-]{16,128}$")
+    message: str = Field(min_length=1, max_length=10_000)
+    rag_mode: RAGMode = "disabled"
+    attachment_ids: tuple[str, ...] = Field(default=(), max_length=5)
+
+    @field_validator("message")
+    @classmethod
+    def normalize_message(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("message cannot be blank")
+        return normalized
+
+
+class AgentApprovalRequest(WebModel):
+    approved: bool
+
+
 class ToolApprovalRequest(WebModel):
     approved: bool
 
@@ -163,6 +182,23 @@ class SafePendingToolApproval(WebModel):
     purpose: str = Field(min_length=1, max_length=500)
     arguments_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     expires_at_epoch: float = Field(gt=0)
+
+
+class AgentRunStatusResponse(WebModel):
+    request_id: str = Field(pattern=r"^[A-Za-z0-9_-]{16,128}$")
+    run_id: str = Field(min_length=1, max_length=256)
+    status: Literal[
+        "running",
+        "waiting_user",
+        "waiting_approval",
+        "completed",
+        "failed",
+        "cancelled",
+        "conflict",
+    ]
+    answer: str = Field(default="", max_length=20_000)
+    workspace_version: int = Field(ge=0)
+    pending_approval: SafePendingToolApproval | None = None
 
 
 class ToolResearchResponse(WebModel):

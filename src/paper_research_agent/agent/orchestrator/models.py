@@ -7,6 +7,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from paper_research_agent.agent.orchestrator.artifacts import ChildArtifact
+
 GoalStatus = Literal["active", "satisfied", "blocked", "abandoned"]
 TaskStatus = Literal[
     "pending",
@@ -334,6 +336,7 @@ class ChildTaskResult(FrozenModel):
     citation_kind: Literal["none", "local_paper", "external"] = "none"
     pending_approval: dict[str, object] | None = None
     error_code: str | None = None
+    artifact: ChildArtifact | None = None
 
     @model_validator(mode="after")
     def validate_result_consistency(self) -> ChildTaskResult:
