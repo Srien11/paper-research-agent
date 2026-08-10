@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from typing import Any, Literal, cast
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
+from paper_research_agent.agent.dynamic.models import PendingApproval
 from paper_research_agent.agent.orchestrator.children import ChildGraphDispatcher
 from paper_research_agent.agent.orchestrator.evaluator import (
     MAX_CHILD_CALLS_PER_RUN,
@@ -19,7 +21,9 @@ from paper_research_agent.agent.orchestrator.evaluator import (
 from paper_research_agent.agent.orchestrator.hydrator import ContextHydrator
 from paper_research_agent.agent.orchestrator.interpreter import TurnInterpreter
 from paper_research_agent.agent.orchestrator.models import (
+    AgentApprovalClaim,
     AgentContextEnvelope,
+    AgentRunStart,
     AgentTask,
     Capability,
     ChildTaskRequest,
@@ -28,6 +32,7 @@ from paper_research_agent.agent.orchestrator.models import (
     GoalDecision,
     MainAgentRequest,
     MainAgentResult,
+    MainAgentResumeRequest,
     TurnInterpretationV2,
 )
 from paper_research_agent.agent.orchestrator.planner import GoalReconciler, TaskPlanner
@@ -64,11 +69,16 @@ def build_main_agent_graph(
 
     async def initialize_turn(state: MainAgentGraphState) -> MainAgentGraphState:
         request = MainAgentRequest.model_validate(state["request"])
-        start = await asyncio.to_thread(
-            repository.begin_agent_run,
-            request_id=request.request_id,
-            conversation_id=request.conversation_id,
-            user_question=request.message,
+        raw_start = state.get("run_start")
+        start = (
+            AgentRunStart.model_validate(raw_start)
+            if raw_start is not None
+            else await asyncio.to_thread(
+                repository.begin_agent_run,
+                request_id=request.request_id,
+                conversation_id=request.conversation_id,
+                user_question=request.message,
+            )
         )
         if start.outcome == "completed_cached":
             return {
@@ -93,6 +103,19 @@ def build_main_agent_graph(
                 "final_answer": "该请求此前未通过提交校验。",
                 "termination_reason": "failed",
             }
+        if start.outcome == "waiting_approval_cached":
+            cached = start.result
+            update: MainAgentGraphState = {
+                "run_id": start.run_id,
+                "turn_id": start.turn_id,
+                "base_workspace_version": start.workspace.version,
+                "final_answer": cached.answer if cached is not None else "等待敏感工具审批。",
+                "child_results": list(cached.child_results) if cached is not None else [],
+                "termination_reason": "waiting_approval_cached",
+            }
+            if cached is not None and cached.pending_approval is not None:
+                update["pending_approval"] = cached.pending_approval
+            return update
         return {
             "run_id": start.run_id,
             "turn_id": start.turn_id,
@@ -335,7 +358,13 @@ def build_main_agent_graph(
         }
 
     def after_initialize(state: MainAgentGraphState) -> str:
-        if state.get("termination_reason") in {"cached", "running_reused", "failed"}:
+        if state.get("termination_reason") in {
+            "cached",
+            "running_reused",
+            "waiting_approval",
+            "waiting_approval_cached",
+            "failed",
+        }:
             return END
         return "hydrate_context"
 
@@ -439,6 +468,211 @@ def build_main_agent_graph(
     builder.add_edge("abort_turn", END)
     builder.add_edge("commit_turn", END)
     return builder.compile(checkpointer=checkpointer, name="paper_research_main_v1")
+
+
+class MainAgentApprovalResumer:
+    """Atomically claim and resume exactly one waiting dynamic child task."""
+
+    def __init__(
+        self,
+        *,
+        repository: ConversationStore,
+        dispatcher: ChildGraphDispatcher,
+        synthesizer: AnswerSynthesizer | None = None,
+    ) -> None:
+        self._repository = repository
+        self._dispatcher = dispatcher
+        self._synthesizer = synthesizer or AnswerSynthesizer()
+
+    async def resume(self, request_id: str, approved: bool) -> MainAgentResult:
+        request = MainAgentResumeRequest(request_id=request_id, approved=approved)
+        stored = await asyncio.to_thread(
+            self._repository.load_agent_run, request.request_id
+        )
+        if stored is None or stored.status != "waiting_approval":
+            raise RuntimeError("approval request is not waiting")
+        pending_payload = stored.pending_approval
+        if pending_payload is None:
+            raise RuntimeError("waiting run has no pending approval")
+        approval_id = str(pending_payload.get("approval_request_id", ""))
+        claim = await asyncio.to_thread(
+            self._repository.claim_agent_approval,
+            request_id=request.request_id,
+            approval_request_id=approval_id,
+        )
+        if claim is None:
+            raise RuntimeError("approval request was already consumed or does not match")
+        try:
+            task, _pending = _validate_approval_claim(claim.workspace, claim.result)
+            child_request = _resume_child_request(claim.result, claim.workspace, task)
+            resumed = await self._dispatcher.resume_dynamic_tools(
+                child_request,
+                approved=request.approved,
+            )
+            return await self._finish_resume(claim, task, resumed)
+        except Exception:
+            await asyncio.to_thread(
+                self._repository.fail_agent_run,
+                run_id=claim.result.run_id,
+                turn_id=claim.turn_id,
+                reason_code="approval_resume_failed",
+            )
+            raise
+
+    async def _finish_resume(
+        self,
+        claim: AgentApprovalClaim,
+        task: AgentTask,
+        resumed: ChildTaskResult,
+    ) -> MainAgentResult:
+        if resumed.status == "failed":
+            evaluation = TaskEvaluation(
+                task_id=task.task_id,
+                outcome="fail",
+                missing_criteria=task.success_criteria,
+                summary=resumed.summary,
+                reason="审批未执行或已失效",
+            )
+        else:
+            evaluation = evaluate_task(
+                task,
+                resumed,
+                child_calls_used=MAX_CHILD_CALLS_PER_RUN,
+                replans_used=MAX_REPLANS_PER_RUN,
+            )
+        workspace = reduce_workspace(
+            claim.workspace,
+            task_id=task.task_id,
+            evaluation=evaluation,
+            result=resumed,
+        )
+        child_results = tuple(
+            resumed if item.task_id == task.task_id else item
+            for item in claim.result.child_results
+        )
+        pending = resumed.pending_approval if resumed.status == "waiting_approval" else None
+        if pending is None:
+            context = AgentContextEnvelope(
+                conversation_id=claim.result.conversation_id,
+                request_id=claim.result.request_id,
+                turn_id=claim.turn_id,
+                current_message=task.objective,
+                rag_mode="preferred",
+                workspace=workspace,
+                prepared_at=datetime.now(UTC),
+            )
+            synthesized = await self._synthesizer.synthesize(context, child_results)
+            answer = synthesized.text[:20_000]
+            status: Literal["completed", "waiting_approval"] = "completed"
+        else:
+            answer = "等待敏感工具审批。"
+            status = "waiting_approval"
+        workspace = workspace.model_copy(update={"summary": _build_summary(workspace)[:3_000]})
+        validation_state: MainAgentGraphState = {
+            "child_results": list(child_results),
+        }
+        if pending is not None:
+            validation_state["pending_approval"] = pending
+        errors = _validate_commit_state(workspace, validation_state)
+        if errors:
+            raise ValueError(f"resumed state failed commit validation: {errors}")
+        result = MainAgentResult(
+            run_id=claim.result.run_id,
+            request_id=claim.result.request_id,
+            conversation_id=claim.result.conversation_id,
+            status=status,
+            answer=answer,
+            route_trace=claim.result.route_trace,
+            child_results=child_results,
+            pending_approval=pending,
+            workspace_version=workspace.version + 1,
+        )
+        resolution = ConversationResolution(
+            original_question=task.objective,
+            standalone_question=task.objective,
+            chinese_query=task.objective,
+            confidence=1,
+        )
+        outcome = await asyncio.to_thread(
+            self._repository.commit_agent_run,
+            run_id=result.run_id,
+            turn_id=claim.turn_id,
+            expected_workspace_version=workspace.version,
+            workspace=workspace,
+            route="main_agent",
+            status="pending" if status == "waiting_approval" else "completed",
+            resolution=resolution,
+            assistant_summary=workspace.summary,
+            source_ids=_source_ids(child_results),
+            result=result,
+        )
+        if not outcome.committed:
+            raise RuntimeError(f"approval resume commit failed: {outcome.reason}")
+        return result
+
+
+def _validate_approval_claim(
+    workspace: ConversationWorkspace,
+    result: MainAgentResult,
+) -> tuple[AgentTask, PendingApproval]:
+    plan = workspace.task_plan
+    if plan is None:
+        raise ValueError("waiting approval has no task plan")
+    waiting = tuple(task for task in plan.tasks if task.status == "waiting_approval")
+    if len(waiting) != 1:
+        raise ValueError("waiting approval requires exactly one waiting task")
+    task = waiting[0]
+    pending_payload = result.pending_approval
+    if pending_payload is None:
+        raise ValueError("waiting approval result has no pending payload")
+    task_id = str(pending_payload.get("task_id", ""))
+    if task_id != task.task_id:
+        raise ValueError("pending approval task ID does not match waiting task")
+    pending_values = dict(pending_payload)
+    pending_values.pop("task_id", None)
+    pending = PendingApproval.model_validate(pending_values)
+    waiting_children = tuple(
+        child
+        for child in result.child_results
+        if child.status == "waiting_approval" and child.task_id == task.task_id
+    )
+    if len(waiting_children) != 1 or waiting_children[0].pending_approval is None:
+        raise ValueError("waiting approval child result is missing or ambiguous")
+    child_payload = waiting_children[0].pending_approval
+    for key in (
+        "task_id",
+        "tool_name",
+        "approval_request_id",
+        "arguments_sha256",
+        "expires_at_epoch",
+    ):
+        if child_payload.get(key) != pending_payload.get(key):
+            raise ValueError(f"pending approval {key} does not match child result")
+    return task, pending
+
+
+def _resume_child_request(
+    result: MainAgentResult,
+    workspace: ConversationWorkspace,
+    task: AgentTask,
+) -> ChildTaskRequest:
+    goal = workspace.active_goal
+    if goal is None or goal.goal_id != task.goal_id:
+        raise ValueError("waiting approval task has no matching active goal")
+    return ChildTaskRequest(
+        run_id=result.run_id,
+        conversation_id=result.conversation_id,
+        goal_id=task.goal_id,
+        goal_objective=goal.objective,
+        task_id=task.task_id,
+        objective=task.objective,
+        success_criteria=task.success_criteria,
+        capability="dynamic_tools",
+        current_message=task.objective,
+        conversation_summary=workspace.summary,
+        constraints=goal.constraints,
+        rag_mode="preferred",
+    )
 
 
 def _task_by_id(workspace: ConversationWorkspace, task_id: str) -> AgentTask:

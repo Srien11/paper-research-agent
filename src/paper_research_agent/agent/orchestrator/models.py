@@ -367,6 +367,11 @@ class MainAgentRequest(FrozenModel):
         return normalized
 
 
+class MainAgentResumeRequest(FrozenModel):
+    request_id: str = Field(min_length=1, max_length=256)
+    approved: bool
+
+
 class MainAgentResult(FrozenModel):
     run_id: str = Field(min_length=1, max_length=256)
     request_id: str = Field(min_length=1, max_length=256)
@@ -396,7 +401,11 @@ class AgentRunStart(FrozenModel):
     turn_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     workspace: ConversationWorkspace
     outcome: Literal[
-        "created", "running_reused", "completed_cached", "failed_cached"
+        "created",
+        "running_reused",
+        "completed_cached",
+        "waiting_approval_cached",
+        "failed_cached",
     ]
     result: MainAgentResult | None = None
 
@@ -415,3 +424,9 @@ class CommitOutcome(FrozenModel):
         "turn_conflict",
     ] = "committed"
     workspace_version: int = Field(default=0, ge=0)
+
+
+class AgentApprovalClaim(FrozenModel):
+    result: MainAgentResult
+    turn_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    workspace: ConversationWorkspace

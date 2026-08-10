@@ -82,6 +82,17 @@ class ChildGraphDispatcher:
             return await self._dispatch_file_edit(request)
         raise ValueError(f"child dispatch does not support {request.capability}")
 
+    async def resume_dynamic_tools(
+        self, request: ChildTaskRequest, *, approved: bool
+    ) -> ChildTaskResult:
+        if request.capability != "dynamic_tools" or self.dynamic_tools is None:
+            return _failed(request, "dynamic_tools_unavailable")
+        result = await self.dynamic_tools.resume(
+            thread_id=_dynamic_thread_id(request),
+            approved=approved,
+        )
+        return _dynamic_result(request, result)
+
     async def _dispatch_direct_chat(self, request: ChildTaskRequest) -> ChildTaskResult:
         if self.direct_chat is None:
             return _failed(request, "direct_chat_unavailable")
@@ -125,7 +136,7 @@ class ChildGraphDispatcher:
         question = request.objective or request.current_message
         result = await self.dynamic_tools.run(
             question,
-            thread_id=_child_thread_id("dynamic", request),
+            thread_id=_dynamic_thread_id(request),
             memory_context=_memory_context_from_request(request),
             child_context=_child_context_from_request(request),
         )
@@ -173,14 +184,27 @@ def _dynamic_result(
 ) -> ChildTaskResult:
     if result.status == "approval_required":
         pending = result.pending_approval
+        pending_payload = pending.model_dump(mode="json") if pending is not None else None
+        if pending_payload is not None:
+            pending_payload["task_id"] = request.task_id
         return ChildTaskResult(
             child_run_id=result.run_id,
             task_id=request.task_id,
             capability="dynamic_tools",
             status="waiting_approval",
             summary="等待敏感工具审批",
-            pending_approval=pending.model_dump(mode="json") if pending is not None else None,
+            pending_approval=pending_payload,
             citation_kind="none",
+        )
+    if result.termination_reason in {"approval_denied", "approval_expired"}:
+        return ChildTaskResult(
+            child_run_id=result.run_id,
+            task_id=request.task_id,
+            capability="dynamic_tools",
+            status="failed",
+            summary=result.final_summary or "审批未执行",
+            citation_kind="none",
+            error_code=result.termination_reason,
         )
     return ChildTaskResult(
         child_run_id=result.run_id,
@@ -228,3 +252,7 @@ def _failed(request: ChildTaskRequest, error_code: str) -> ChildTaskResult:
 
 def _child_thread_id(kind: str, request: ChildTaskRequest) -> str:
     return f"{kind}::{request.conversation_id}::{request.run_id}::{request.task_id}"
+
+
+def _dynamic_thread_id(request: ChildTaskRequest) -> str:
+    return f"{request.conversation_id}::{request.run_id}::{request.task_id}"

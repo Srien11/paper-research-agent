@@ -146,6 +146,7 @@ class _FakeDynamicExecutor:
                 dict[str, object] | None,
             ]
         ] = []
+        self.resume_calls: list[tuple[str, bool]] = []
 
     async def run(
         self,
@@ -156,6 +157,10 @@ class _FakeDynamicExecutor:
         child_context: dict[str, object] | None = None,
     ) -> DynamicResearchResult:
         self.calls.append((question, thread_id, memory_context, child_context))
+        return self.result
+
+    async def resume(self, *, thread_id: str, approved: bool) -> DynamicResearchResult:
+        self.resume_calls.append((thread_id, approved))
         return self.result
 
 
@@ -241,7 +246,7 @@ class ChildGraphDispatcherTests(unittest.TestCase):
         self.assertEqual(child_context["goal_id"], "a" * 32)
         self.assertEqual(child_context["constraints"], ["只依据本地论文"])
         self.assertEqual(child_context["success_criteria"], ["找到至少两篇论文证据"])
-        self.assertIn("dynamic::", fake.calls[0][1])
+        self.assertEqual(fake.calls[0][1], "conversation-1::run-1::task-2")
         self.assertEqual(child.status, "completed")
         self.assertEqual(child.citation_kind, "external")
         self.assertEqual(child.artifact.kind, "dynamic_tools")
@@ -323,7 +328,51 @@ class ChildGraphDispatcherTests(unittest.TestCase):
         )
         self.assertEqual(child.status, "waiting_approval")
         self.assertIsNotNone(child.pending_approval)
+        self.assertEqual(child.pending_approval["task_id"], "task-3")
         self.assertEqual(child.citation_kind, "none")
+
+    def test_dynamic_resume_uses_same_checkpoint_namespace(self) -> None:
+        result = DynamicResearchResult(
+            run_id="a" * 32,
+            thread_id="t",
+            status="completed",
+            final_summary="恢复完成",
+        )
+        fake = _FakeDynamicExecutor(result)
+        dispatcher = ChildGraphDispatcher(dynamic_tools=fake)
+        child = asyncio.run(
+            dispatcher.resume_dynamic_tools(
+                _request(capability="dynamic_tools", task_id="task-resume"),
+                approved=True,
+            )
+        )
+
+        self.assertEqual(
+            fake.resume_calls,
+            [("conversation-1::run-1::task-resume", True)],
+        )
+        self.assertEqual(child.status, "completed")
+
+    def test_denied_dynamic_resume_is_not_reported_as_completed(self) -> None:
+        result = DynamicResearchResult(
+            run_id="a" * 32,
+            thread_id="t",
+            status="completed",
+            final_summary="敏感工具请求已拒绝。",
+            termination_reason="approval_denied",
+        )
+        fake = _FakeDynamicExecutor(result)
+        dispatcher = ChildGraphDispatcher(dynamic_tools=fake)
+
+        child = asyncio.run(
+            dispatcher.resume_dynamic_tools(
+                _request(capability="dynamic_tools", task_id="task-denied"),
+                approved=False,
+            )
+        )
+
+        self.assertEqual(child.status, "failed")
+        self.assertEqual(child.error_code, "approval_denied")
 
     def test_local_and_external_citations_never_confuse(self) -> None:
         local_fake = _FakeLocalRuntime(_FakeLocalResult(sufficient=True))

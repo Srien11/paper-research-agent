@@ -31,9 +31,11 @@ class _FakeGraph:
         self.termination_reason = termination_reason
         self.base_workspace_version = base_workspace_version
         self.calls = 0
+        self.configs: list[object] = []
 
     async def ainvoke(self, value: object, config: object = None) -> dict[str, object]:
-        del value, config
+        del value
+        self.configs.append(config)
         self.calls += 1
         if self.delay:
             await asyncio.sleep(self.delay)
@@ -56,6 +58,9 @@ class MainAgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
         result = await runtime.run(_request())
         self.assertEqual(result.status, "completed")
         self.assertEqual(result.answer, "完成")
+        thread_id = runtime._graph.configs[0]["configurable"]["thread_id"]
+        self.assertTrue(thread_id.startswith("main::conversation-1::"))
+        self.assertEqual(len(thread_id.rsplit("::", maxsplit=1)[-1]), 32)
 
     async def test_failed_graph_returns_failed_without_incrementing_workspace(self) -> None:
         runtime = MainAgentRuntime(
@@ -89,8 +94,12 @@ class MainAgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             timeout_seconds=5,
         )
         started = asyncio.get_running_loop().time()
-        first = asyncio.create_task(runtime.run(_request(conversation_id="a")))
-        second = asyncio.create_task(runtime.run(_request(conversation_id="b")))
+        first = asyncio.create_task(
+            runtime.run(_request(conversation_id="a", request_id="request-a"))
+        )
+        second = asyncio.create_task(
+            runtime.run(_request(conversation_id="b", request_id="request-b"))
+        )
         results = await asyncio.gather(first, second)
         elapsed = asyncio.get_running_loop().time() - started
         self.assertTrue(all(item.status == "completed" for item in results))

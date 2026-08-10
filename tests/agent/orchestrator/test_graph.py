@@ -482,6 +482,8 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
         cached = store.load_agent_run("request-1")
         self.assertEqual(cached.status, "waiting_approval")
         self.assertIsNotNone(cached.pending_approval)
+        repeated = await self._run(graph, request)
+        self.assertEqual(repeated["termination_reason"], "waiting_approval_cached")
 
     async def test_budget_exhaustion_marks_task_failed(self) -> None:
         plan = _plan_decision(

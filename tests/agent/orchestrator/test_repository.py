@@ -342,6 +342,50 @@ class AgentRunRepositoryTests(unittest.TestCase):
         self.assertEqual(turn_status, "pending")
         self.assertEqual(run_status, "running")
 
+    def test_claim_agent_approval_matches_request_and_consumes_once(self) -> None:
+        for label, store in self._stores():
+            with self.subTest(store=label):
+                start = store.begin_agent_run(  # type: ignore[attr-defined]
+                    request_id="request-approval",
+                    conversation_id="conversation-approval",
+                    user_question="保存结论",
+                )
+                pending = {
+                    "approval_request_id": "f" * 32,
+                    "task_id": "save",
+                }
+                result = MainAgentResult(
+                    run_id=start.run_id,
+                    request_id=start.request_id,
+                    conversation_id=start.conversation_id,
+                    status="waiting_approval",
+                    answer="等待审批",
+                    pending_approval=pending,
+                    workspace_version=1,
+                )
+                args = self._commit_args(start)
+                args["status"] = "pending"
+                args["result"] = result
+                store.commit_agent_run(**args)  # type: ignore[attr-defined]
+
+                wrong = store.claim_agent_approval(  # type: ignore[attr-defined]
+                    request_id="request-approval",
+                    approval_request_id="e" * 32,
+                )
+                claimed = store.claim_agent_approval(  # type: ignore[attr-defined]
+                    request_id="request-approval",
+                    approval_request_id="f" * 32,
+                )
+                repeated = store.claim_agent_approval(  # type: ignore[attr-defined]
+                    request_id="request-approval",
+                    approval_request_id="f" * 32,
+                )
+
+                self.assertIsNone(wrong)
+                self.assertIsNotNone(claimed)
+                self.assertEqual(claimed.turn_id, start.turn_id)
+                self.assertIsNone(repeated)
+
 
 if __name__ == "__main__":
     unittest.main()

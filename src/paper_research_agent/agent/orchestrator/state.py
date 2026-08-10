@@ -7,6 +7,7 @@ from typing import TypedDict
 from paper_research_agent.agent.orchestrator.evaluator import TaskEvaluation
 from paper_research_agent.agent.orchestrator.models import (
     AgentContextEnvelope,
+    AgentRunStart,
     ChildTaskResult,
     CommitOutcome,
     ConversationWorkspace,
@@ -21,6 +22,7 @@ class MainAgentGraphState(TypedDict, total=False):
     """Temporary graph container; every node boundary uses strict Pydantic models."""
 
     run_id: str
+    run_start: AgentRunStart
     turn_id: str
     request: MainAgentRequest
     base_workspace_version: int

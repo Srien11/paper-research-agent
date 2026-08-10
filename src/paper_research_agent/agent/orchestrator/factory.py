@@ -9,7 +9,10 @@ from paper_research_agent.agent.orchestrator.evaluator import (
     MAX_CHILD_CALLS_PER_RUN,
     MAX_REPLANS_PER_RUN,
 )
-from paper_research_agent.agent.orchestrator.graph import build_main_agent_graph
+from paper_research_agent.agent.orchestrator.graph import (
+    MainAgentApprovalResumer,
+    build_main_agent_graph,
+)
 from paper_research_agent.agent.orchestrator.hydrator import ContextHydrator
 from paper_research_agent.agent.orchestrator.interpreter import TurnInterpreter
 from paper_research_agent.agent.orchestrator.models import MainAgentResult
@@ -42,6 +45,7 @@ def build_main_agent_runtime(
     clear: ConversationClearer | None = None,
 ) -> MainAgentRuntime:
     """Assemble one closable main Agent runtime with a strict Pydantic graph."""
+    resolved_synthesizer = synthesizer or AnswerSynthesizer()
     graph = build_main_agent_graph(
         repository=store,
         hydrator=hydrator,
@@ -49,15 +53,20 @@ def build_main_agent_runtime(
         goal_reconciler=goal_reconciler,
         task_planner=task_planner,
         dispatcher=dispatcher,
-        synthesizer=synthesizer,
+        synthesizer=resolved_synthesizer,
         max_child_calls=max_child_calls,
         max_replans=max_replans,
         checkpointer=checkpointer,
     )
+    resolved_resumer = approval_resumer or MainAgentApprovalResumer(
+        repository=store,
+        dispatcher=dispatcher,
+        synthesizer=resolved_synthesizer,
+    ).resume
     return MainAgentRuntime(
         graph=graph,
         repository=store,
-        approval_resumer=approval_resumer,
+        approval_resumer=resolved_resumer,
         timeout_seconds=timeout_seconds,
         close=close,
         clear=clear,

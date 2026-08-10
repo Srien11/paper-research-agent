@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Protocol, cast
 
 from paper_research_agent.agent.orchestrator.models import (
+    AgentApprovalClaim,
     AgentRunStart,
     CommitOutcome,
     ConversationWorkspace,
@@ -78,6 +79,10 @@ class ConversationStore(Protocol):
     def fail_agent_run(
         self, *, run_id: str, turn_id: str, reason_code: str
     ) -> CommitOutcome: ...
+
+    def claim_agent_approval(
+        self, *, request_id: str, approval_request_id: str
+    ) -> AgentApprovalClaim | None: ...
 
     def clear(self, conversation_id: str) -> int: ...
 
@@ -165,6 +170,22 @@ class SQLiteConversationStore:
                         turn_id=turn_id,
                         workspace=workspace,
                         outcome="failed_cached",
+                    )
+                if existing_status == "waiting_approval":
+                    result = (
+                        MainAgentResult.model_validate_json(str(existing[3]))
+                        if existing[3] is not None
+                        else None
+                    )
+                    connection.commit()
+                    return AgentRunStart(
+                        run_id=run_id,
+                        request_id=normalized_request,
+                        conversation_id=normalized_id,
+                        turn_id=turn_id,
+                        workspace=workspace,
+                        outcome="waiting_approval_cached",
+                        result=result,
                     )
                 connection.commit()
                 return AgentRunStart(
@@ -261,7 +282,7 @@ class SQLiteConversationStore:
                 "SELECT status, result_json FROM main_agent_runs WHERE request_id = ?",
                 (normalized,),
             ).fetchone()
-        if row is None or str(row[0]) != "completed" or row[1] is None:
+        if row is None or str(row[0]) not in {"completed", "waiting_approval"} or row[1] is None:
             return None
         return MainAgentResult.model_validate_json(str(row[1]))
 
@@ -365,10 +386,16 @@ class SQLiteConversationStore:
             )
             connection.execute(
                 """UPDATE main_agent_runs
-                   SET status = 'completed', committed_workspace_version = ?, result_json = ?,
+                   SET status = ?, committed_workspace_version = ?, result_json = ?,
                        updated_at = ?
                    WHERE run_id = ?""",
-                (next_version, result.model_dump_json(), completed.isoformat(), run_id),
+                (
+                    result.status,
+                    next_version,
+                    result.model_dump_json(),
+                    completed.isoformat(),
+                    run_id,
+                ),
             )
             if resolution.episode_id is not None and turn_row is not None:
                 connection.execute(
@@ -457,6 +484,41 @@ class SQLiteConversationStore:
             committed=True,
             reason="failed",
             workspace_version=workspace.version,
+        )
+
+    def claim_agent_approval(
+        self, *, request_id: str, approval_request_id: str
+    ) -> AgentApprovalClaim | None:
+        normalized_request = _request_id(request_id)
+        normalized_approval = _approval_id(approval_request_id)
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT turn_id, conversation_id, result_json FROM main_agent_runs "
+                "WHERE request_id = ? AND status = 'waiting_approval'",
+                (normalized_request,),
+            ).fetchone()
+            if row is None or row[2] is None:
+                connection.commit()
+                return None
+            result = MainAgentResult.model_validate_json(str(row[2]))
+            if _result_approval_id(result) != normalized_approval:
+                connection.commit()
+                return None
+            cursor = connection.execute(
+                "UPDATE main_agent_runs SET status = 'resuming', updated_at = ? "
+                "WHERE request_id = ? AND status = 'waiting_approval'",
+                (datetime.now(UTC).isoformat(), normalized_request),
+            )
+            if cursor.rowcount != 1:
+                connection.commit()
+                return None
+            workspace = self._workspace_row(connection, str(row[1]))
+            connection.commit()
+        return AgentApprovalClaim(
+            result=result,
+            turn_id=str(row[0]),
+            workspace=workspace,
         )
 
     def complete_turn(
@@ -781,6 +843,16 @@ class InMemoryConversationStore:
                         workspace=workspace,
                         outcome="failed_cached",
                     )
+                if existing.status == "waiting_approval":
+                    return AgentRunStart(
+                        run_id=existing.run_id,
+                        request_id=normalized_request,
+                        conversation_id=normalized_id,
+                        turn_id=existing.turn_id,
+                        workspace=workspace,
+                        outcome="waiting_approval_cached",
+                        result=existing.result,
+                    )
                 return AgentRunStart(
                     run_id=existing.run_id,
                     request_id=normalized_request,
@@ -846,7 +918,7 @@ class InMemoryConversationStore:
         normalized = _request_id(request_id)
         with self._lock:
             record = self._runs.get(normalized)
-        if record is None or record.status != "completed":
+        if record is None or record.status not in {"completed", "waiting_approval"}:
             return None
         return record.result
 
@@ -921,7 +993,7 @@ class InMemoryConversationStore:
                     "completed_at": created,
                 }
             )
-            record.status = "completed"
+            record.status = result.status
             record.result = result
             record.committed_workspace_version = next_version
         return CommitOutcome(committed=True, reason="committed", workspace_version=next_version)
@@ -983,6 +1055,30 @@ class InMemoryConversationStore:
             reason="failed",
             workspace_version=workspace_version,
         )
+
+    def claim_agent_approval(
+        self, *, request_id: str, approval_request_id: str
+    ) -> AgentApprovalClaim | None:
+        normalized_request = _request_id(request_id)
+        normalized_approval = _approval_id(approval_request_id)
+        with self._lock:
+            record = self._runs.get(normalized_request)
+            if (
+                record is None
+                or record.status != "waiting_approval"
+                or record.result is None
+                or _result_approval_id(record.result) != normalized_approval
+            ):
+                return None
+            workspace = self._workspaces.get(record.conversation_id)
+            if workspace is None:
+                return None
+            record.status = "resuming"
+            return AgentApprovalClaim(
+                result=record.result,
+                turn_id=record.turn_id,
+                workspace=workspace,
+            )
 
     def complete_turn(
         self,
@@ -1096,6 +1192,21 @@ def _failure_code(value: str) -> str:
     if re.fullmatch(r"[a-z][a-z0-9_]{1,63}", normalized) is None:
         raise ValueError("failure reason code is invalid")
     return normalized
+
+
+def _approval_id(value: str) -> str:
+    normalized = value.strip()
+    if re.fullmatch(r"[0-9a-f]{32}", normalized) is None:
+        raise ValueError("approval request ID is invalid")
+    return normalized
+
+
+def _result_approval_id(result: MainAgentResult) -> str | None:
+    pending = result.pending_approval
+    if pending is None:
+        return None
+    value = pending.get("approval_request_id")
+    return str(value) if value is not None else None
 
 
 def _summary(value: str | None) -> str | None:

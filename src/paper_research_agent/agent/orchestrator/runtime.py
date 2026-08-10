@@ -10,6 +10,7 @@ from paper_research_agent.agent.orchestrator.models import (
     ChildTaskResult,
     MainAgentRequest,
     MainAgentResult,
+    MainAgentResumeRequest,
     RunStatus,
 )
 from paper_research_agent.conversation.store import ConversationStore
@@ -49,10 +50,26 @@ class MainAgentRuntime:
             raise RuntimeError("main agent runtime is closed")
         lock = await self._lock_for(request.conversation_id)
         async with lock:
+            start = await asyncio.to_thread(
+                self._repository.begin_agent_run,
+                request_id=request.request_id,
+                conversation_id=request.conversation_id,
+                user_question=request.message,
+            )
             try:
                 async with asyncio.timeout(self._timeout_seconds):
                     state = await self._graph.ainvoke(
-                        {"request": request.model_dump(mode="json")}
+                        {
+                            "request": request.model_dump(mode="json"),
+                            "run_start": start.model_dump(mode="json"),
+                        },
+                        config={
+                            "configurable": {
+                                "thread_id": (
+                                    f"main::{request.conversation_id}::{start.run_id}"
+                                )
+                            }
+                        },
                     )
             except TimeoutError:
                 raise TimeoutError("main agent run exceeded its total deadline") from None
@@ -66,7 +83,8 @@ class MainAgentRuntime:
         resumer = self._approval_resumer
         if resumer is None:
             raise RuntimeError("approval resume is unavailable")
-        return await resumer(request_id, approved)
+        request = MainAgentResumeRequest(request_id=request_id, approved=approved)
+        return await resumer(request.request_id, request.approved)
 
     async def clear(self, conversation_id: str) -> None:
         if self._closed:
@@ -101,6 +119,7 @@ def _result_from_state(
         "completed": "completed",
         "cached": "completed",
         "waiting_approval": "waiting_approval",
+        "waiting_approval_cached": "waiting_approval",
         "running_reused": "running",
         "failed": "failed",
     }
@@ -108,7 +127,8 @@ def _result_from_state(
     base_workspace_version = int(state.get("base_workspace_version", 0))
     workspace_version = (
         base_workspace_version + 1
-        if status in {"completed", "waiting_approval"} and reason != "cached"
+        if status in {"completed", "waiting_approval"}
+        and reason not in {"cached", "waiting_approval_cached"}
         else base_workspace_version
     )
     return MainAgentResult(
