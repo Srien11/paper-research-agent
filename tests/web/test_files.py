@@ -13,6 +13,17 @@ async def chunks(*values: bytes):
 
 
 class AttachmentStoreTests(unittest.IsolatedAsyncioTestCase):
+    async def test_generated_text_creates_a_new_attachment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = AttachmentStore(Path(directory))
+            item = await store.save_generated_text(
+                session_id="session-a",
+                filename="edited-notes.md",
+                text="新内容",
+            )
+
+            self.assertIn("新内容", store.extract("session-a", (item.attachment_id,))[0])
+
     async def test_save_extract_and_delete_are_session_scoped(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = AttachmentStore(Path(directory))

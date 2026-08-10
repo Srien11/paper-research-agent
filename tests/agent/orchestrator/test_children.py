@@ -9,12 +9,23 @@ from paper_research_agent.agent.dynamic.models import (
     PendingApproval,
 )
 from paper_research_agent.agent.dynamic.runtime import DynamicResearchRuntime
+from paper_research_agent.agent.orchestrator.artifacts import (
+    AttachmentArtifact,
+    ChatArtifact,
+    FileArtifact,
+)
 from paper_research_agent.agent.orchestrator.children import ChildGraphDispatcher
 from paper_research_agent.agent.orchestrator.models import (
     ChildTaskRequest,
     ContextMessage,
     RecalledContext,
 )
+from paper_research_agent.answering.models import (
+    AnswerCitation,
+    AnswerClaim,
+    RAGAnswer,
+)
+from paper_research_agent.web.child_executors import RAGRuntimeChildExecutor
 
 
 def _request(**overrides: object) -> ChildTaskRequest:
@@ -35,29 +46,93 @@ def _request(**overrides: object) -> ChildTaskRequest:
     return ChildTaskRequest(**values)
 
 
+def _rag_answer(*, sufficient: bool) -> RAGAnswer:
+    if not sufficient:
+        return RAGAnswer(
+            status="insufficient_evidence",
+            answer_markdown="当前证据不足。",
+            claims=(),
+            citations=(),
+            requested_model="test-model",
+            prompt_version="test-prompt",
+            latency_ms=0,
+            attempts=0,
+        )
+    claim = AnswerClaim(text="RAG 改善了事实性回答。", citation_ids=("E1",))
+    citation = AnswerCitation(
+        citation_id="E1",
+        chunk_id="chunk-1",
+        corpus_id="C001",
+        asset_id="asset-1",
+        page_start=1,
+        page_end=1,
+        text_sha256="a" * 64,
+        storage_class="internal_research_only",
+    )
+    return RAGAnswer(
+        status="answered",
+        answer_markdown="RAG 改善了事实性回答。[E1]",
+        claims=(claim,),
+        citations=(citation,),
+        requested_model="test-model",
+        actual_model="test-model",
+        prompt_version="test-prompt",
+        latency_ms=1,
+        attempts=1,
+    )
+
+
 class _FakeLocalResult:
     def __init__(self, *, sufficient: bool = True) -> None:
-        self.run_id = "r" * 32
-        self.evidence_sufficient = sufficient
-        self.observations = (SimpleNamespace(objective="检索 RAG 评测指标"),)
-        self.evidence = (SimpleNamespace(chunk_id="chunk-1"),) if sufficient else ()
-        self.question = "检索 RAG 评测指标"
+        self.answer = _rag_answer(sufficient=sufficient)
+        self.retrieval = SimpleNamespace(
+            index_id="index-v1",
+            resolved_question="比较 RAG 与 GraphRAG 的评测指标",
+            degraded=False,
+            hits=(SimpleNamespace(chunk_id="chunk-1"),) if sufficient else (),
+        )
 
 
-class _FakeLocalExecutor:
+class _FakeLocalRuntime:
     def __init__(self, result: object) -> None:
         self.result = result
         self.calls: list[tuple[str, str, bool]] = []
 
-    async def run(
+    async def ask(
         self,
         question: str,
         *,
-        thread_id: str,
-        planning_required: bool = False,
+        session_id: str,
+        research_mode: str = "single",
     ) -> object:
-        self.calls.append((question, thread_id, planning_required))
+        self.calls.append((question, session_id, research_mode == "planned"))
         return self.result
+
+
+class _FakeDirectExecutor:
+    def __init__(self) -> None:
+        self.requests: list[ChildTaskRequest] = []
+
+    async def answer(self, request: ChildTaskRequest) -> ChatArtifact:
+        self.requests.append(request)
+        return ChatArtifact(text="generated answer")
+
+
+class _FakeAttachmentExecutor:
+    async def answer_attachment(self, request: ChildTaskRequest) -> AttachmentArtifact:
+        return AttachmentArtifact(
+            text="附件结论",
+            source_attachment_ids=request.attachment_ids,
+        )
+
+
+class _FakeFileExecutor:
+    async def edit(self, request: ChildTaskRequest) -> FileArtifact:
+        del request
+        return FileArtifact(
+            text="已生成修改文件",
+            output_attachment_ids=("f" * 32,),
+        )
 
 
 class _FakeDynamicExecutor:
@@ -115,8 +190,8 @@ def _pending() -> PendingApproval:
 
 class ChildGraphDispatcherTests(unittest.TestCase):
     def test_local_uses_task_objective_as_question(self) -> None:
-        fake = _FakeLocalExecutor(_FakeLocalResult(sufficient=True))
-        dispatcher = ChildGraphDispatcher(local_rag=fake)
+        fake = _FakeLocalRuntime(_FakeLocalResult(sufficient=True))
+        dispatcher = ChildGraphDispatcher(local_rag=RAGRuntimeChildExecutor(fake))
         result = asyncio.run(dispatcher.dispatch(_request(capability="local_rag")))
         self.assertEqual(fake.calls[0][0], "比较 RAG 与 GraphRAG 的评测指标")
         self.assertTrue(fake.calls[0][2])
@@ -124,18 +199,20 @@ class ChildGraphDispatcherTests(unittest.TestCase):
         self.assertEqual(result.status, "completed")
         self.assertEqual(result.citation_kind, "local_paper")
         self.assertEqual(result.source_ids, ("chunk-1",))
+        self.assertEqual(result.artifact.kind, "local_rag")
+        self.assertEqual(result.artifact.answer.status, "answered")
 
     def test_local_insufficient_evidence_is_not_success(self) -> None:
-        fake = _FakeLocalExecutor(_FakeLocalResult(sufficient=False))
-        dispatcher = ChildGraphDispatcher(local_rag=fake)
+        fake = _FakeLocalRuntime(_FakeLocalResult(sufficient=False))
+        dispatcher = ChildGraphDispatcher(local_rag=RAGRuntimeChildExecutor(fake))
         result = asyncio.run(dispatcher.dispatch(_request(capability="local_rag")))
         self.assertEqual(result.status, "insufficient_evidence")
         self.assertEqual(result.citation_kind, "local_paper")
         self.assertEqual(result.source_ids, ())
 
     def test_single_paper_local_question_does_not_force_comparison_plan(self) -> None:
-        fake = _FakeLocalExecutor(_FakeLocalResult(sufficient=True))
-        dispatcher = ChildGraphDispatcher(local_rag=fake)
+        fake = _FakeLocalRuntime(_FakeLocalResult(sufficient=True))
+        dispatcher = ChildGraphDispatcher(local_rag=RAGRuntimeChildExecutor(fake))
 
         asyncio.run(
             dispatcher.dispatch(
@@ -167,6 +244,7 @@ class ChildGraphDispatcherTests(unittest.TestCase):
         self.assertIn("dynamic::", fake.calls[0][1])
         self.assertEqual(child.status, "completed")
         self.assertEqual(child.citation_kind, "external")
+        self.assertEqual(child.artifact.kind, "dynamic_tools")
 
     def test_dynamic_memory_context_projected_from_selected_context(self) -> None:
         request = _request(
@@ -248,7 +326,7 @@ class ChildGraphDispatcherTests(unittest.TestCase):
         self.assertEqual(child.citation_kind, "none")
 
     def test_local_and_external_citations_never_confuse(self) -> None:
-        local_fake = _FakeLocalExecutor(_FakeLocalResult(sufficient=True))
+        local_fake = _FakeLocalRuntime(_FakeLocalResult(sufficient=True))
         dynamic_fake = _FakeDynamicExecutor(
             DynamicResearchResult(
                 run_id="a" * 32,
@@ -257,7 +335,10 @@ class ChildGraphDispatcherTests(unittest.TestCase):
                 final_summary="外部信息",
             )
         )
-        dispatcher = ChildGraphDispatcher(local_rag=local_fake, dynamic_tools=dynamic_fake)
+        dispatcher = ChildGraphDispatcher(
+            local_rag=RAGRuntimeChildExecutor(local_fake),
+            dynamic_tools=dynamic_fake,
+        )
         local = asyncio.run(dispatcher.dispatch(_request(capability="local_rag")))
         dynamic = asyncio.run(
             dispatcher.dispatch(_request(capability="dynamic_tools", task_id="task-4"))
@@ -271,12 +352,36 @@ class ChildGraphDispatcherTests(unittest.TestCase):
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.error_code, "local_rag_unavailable")
 
-    def test_unsupported_capability_raises(self) -> None:
-        dispatcher = ChildGraphDispatcher()
-        with self.assertRaises(ValueError):
-            asyncio.run(
-                dispatcher.dispatch(_request(capability="direct_chat"))
+    def test_direct_chat_calls_explicit_executor(self) -> None:
+        fake = _FakeDirectExecutor()
+        dispatcher = ChildGraphDispatcher(direct_chat=fake)
+        result = asyncio.run(dispatcher.dispatch(_request(capability="direct_chat")))
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.artifact.kind, "chat")
+        self.assertEqual(result.artifact.text, "generated answer")
+        self.assertEqual(fake.requests[0].objective, _request().objective)
+
+    def test_attachment_qa_returns_typed_artifact(self) -> None:
+        dispatcher = ChildGraphDispatcher(attachment_qa=_FakeAttachmentExecutor())
+        result = asyncio.run(
+            dispatcher.dispatch(
+                _request(capability="attachment_qa", attachment_ids=("a" * 32,))
             )
+        )
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.artifact.kind, "attachment_qa")
+        self.assertEqual(result.artifact.source_attachment_ids, ("a" * 32,))
+
+    def test_file_edit_returns_output_attachment_reference(self) -> None:
+        dispatcher = ChildGraphDispatcher(file_edit=_FakeFileExecutor())
+        result = asyncio.run(
+            dispatcher.dispatch(
+                _request(capability="file_edit", attachment_ids=("a" * 32,))
+            )
+        )
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.artifact.kind, "file_edit")
+        self.assertEqual(result.artifact.output_attachment_ids, ("f" * 32,))
 
     def test_direct_response_request_consumes_orchestrator_context(self) -> None:
         from paper_research_agent.web.chat_runtime import DirectResponseRequest

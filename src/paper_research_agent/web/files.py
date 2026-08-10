@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import uuid
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -67,7 +68,44 @@ class AttachmentStore:
         (directory / f"{attachment_id}.json").write_text(
             json.dumps(metadata, ensure_ascii=False), encoding="utf-8"
         )
-        return Attachment(**{key: metadata[key] for key in Attachment.__dataclass_fields__})
+        return Attachment(
+            attachment_id=attachment_id,
+            filename=safe_name,
+            content_type=str(metadata["content_type"]),
+            size_bytes=size,
+        )
+
+    async def save_generated_text(
+        self,
+        *,
+        session_id: str,
+        filename: str,
+        text: str,
+    ) -> Attachment:
+        """Persist a generated text artifact as a new, session-scoped attachment."""
+        normalized = text.strip()
+        if not normalized:
+            raise ValueError("generated attachment cannot be empty")
+        suffix = Path(filename).suffix.casefold()
+        content_types = {
+            ".txt": "text/plain",
+            ".md": "text/markdown",
+            ".csv": "text/csv",
+            ".json": "application/json",
+        }
+        content_type = content_types.get(suffix)
+        if content_type is None:
+            raise ValueError("generated attachment type must be textual")
+
+        async def chunks() -> AsyncIterator[bytes]:
+            yield normalized.encode("utf-8")
+
+        return await self.save(
+            session_id=session_id,
+            filename=filename,
+            content_type=content_type,
+            chunks=chunks(),
+        )
 
     def extract(self, session_id: str, attachment_ids: tuple[str, ...]) -> tuple[str, ...]:
         texts: list[str] = []

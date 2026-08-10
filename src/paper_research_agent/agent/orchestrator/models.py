@@ -309,6 +309,7 @@ class ChildTaskRequest(FrozenModel):
     run_id: str
     conversation_id: str
     goal_id: str
+    goal_objective: str = Field(default="", max_length=2000)
     task_id: str
     objective: str = Field(min_length=1, max_length=1000)
     success_criteria: tuple[str, ...] = Field(min_length=1, max_length=8)
@@ -316,6 +317,7 @@ class ChildTaskRequest(FrozenModel):
     current_message: str = Field(min_length=1, max_length=10_000)
     conversation_summary: str = Field(default="", max_length=3000)
     constraints: tuple[str, ...] = Field(default=(), max_length=20)
+    recent_messages: tuple[ContextMessage, ...] = Field(default=(), max_length=12)
     selected_context: tuple[RecalledContext, ...] = Field(default=(), max_length=10)
     rag_mode: Literal["disabled", "preferred", "required"]
     attachment_ids: tuple[str, ...] = Field(default=(), max_length=20)

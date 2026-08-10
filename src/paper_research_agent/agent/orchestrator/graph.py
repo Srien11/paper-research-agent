@@ -437,6 +437,11 @@ def _child_request(state: MainAgentGraphState) -> ChildTaskRequest:
         run_id=str(state.get("run_id", "")),
         conversation_id=request.conversation_id,
         goal_id=task.goal_id,
+        goal_objective=(
+            workspace.active_goal.objective
+            if workspace.active_goal is not None
+            else ""
+        ),
         task_id=task.task_id,
         objective=task.objective,
         success_criteria=task.success_criteria,
@@ -446,6 +451,7 @@ def _child_request(state: MainAgentGraphState) -> ChildTaskRequest:
         constraints=task.constraints
         if hasattr(task, "constraints")
         else goal_constraints,
+        recent_messages=envelope.recent_messages,
         selected_context=envelope.recalled_context,
         rag_mode=request.rag_mode,
         attachment_ids=request.attachment_ids,
