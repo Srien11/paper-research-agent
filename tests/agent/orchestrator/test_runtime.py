@@ -20,8 +20,16 @@ def _request(
 
 
 class _FakeGraph:
-    def __init__(self, delay: float = 0) -> None:
+    def __init__(
+        self,
+        delay: float = 0,
+        *,
+        termination_reason: str = "completed",
+        base_workspace_version: int = 0,
+    ) -> None:
         self.delay = delay
+        self.termination_reason = termination_reason
+        self.base_workspace_version = base_workspace_version
         self.calls = 0
 
     async def ainvoke(self, value: object, config: object = None) -> dict[str, object]:
@@ -31,9 +39,9 @@ class _FakeGraph:
             await asyncio.sleep(self.delay)
         return {
             "run_id": "r" * 32,
-            "base_workspace_version": 0,
+            "base_workspace_version": self.base_workspace_version,
             "final_answer": "完成",
-            "termination_reason": "completed",
+            "termination_reason": self.termination_reason,
             "child_results": [],
         }
 
@@ -48,6 +56,21 @@ class MainAgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
         result = await runtime.run(_request())
         self.assertEqual(result.status, "completed")
         self.assertEqual(result.answer, "完成")
+
+    async def test_failed_graph_returns_failed_without_incrementing_workspace(self) -> None:
+        runtime = MainAgentRuntime(
+            graph=_FakeGraph(
+                termination_reason="failed",
+                base_workspace_version=3,
+            ),
+            repository=InMemoryConversationStore(),
+            timeout_seconds=5,
+        )
+
+        result = await runtime.run(_request())
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.workspace_version, 3)
 
     async def test_run_times_out_when_graph_is_slow(self) -> None:
         runtime = MainAgentRuntime(

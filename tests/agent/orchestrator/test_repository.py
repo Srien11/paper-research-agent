@@ -251,6 +251,97 @@ class AgentRunRepositoryTests(unittest.TestCase):
                 self.assertEqual(len(store.episodes("conversation-1")), 1)
                 self.assertEqual(store.load_workspace("conversation-1").version, 1)  # type: ignore[attr-defined]
 
+    def test_fail_agent_run_atomically_closes_run_and_turn(self) -> None:
+        for label, store in self._stores():
+            with self.subTest(store=label):
+                start = store.begin_agent_run(  # type: ignore[attr-defined]
+                    request_id="request-failed",
+                    conversation_id="conversation-failed",
+                    user_question="触发提交校验失败",
+                )
+
+                outcome = store.fail_agent_run(  # type: ignore[attr-defined]
+                    run_id=start.run_id,
+                    turn_id=start.turn_id,
+                    reason_code="commit_validation_failed",
+                )
+
+                self.assertTrue(outcome.committed)
+                self.assertEqual(outcome.reason, "failed")
+                self.assertEqual(store.load_workspace("conversation-failed").version, 0)  # type: ignore[attr-defined]
+                history = store.history("conversation-failed")  # type: ignore[attr-defined]
+                self.assertEqual(history[0].status, "failed")
+                self.assertIsNone(store.load_agent_run("request-failed"))  # type: ignore[attr-defined]
+                if isinstance(store, SQLiteConversationStore):
+                    with closing(sqlite3.connect(store.path)) as connection:
+                        failure_code = connection.execute(
+                            "SELECT failure_code FROM main_agent_runs WHERE run_id = ?",
+                            (start.run_id,),
+                        ).fetchone()[0]
+                else:
+                    failure_code = store._runs["request-failed"].failure_code
+                self.assertEqual(failure_code, "commit_validation_failed")
+                repeated = store.fail_agent_run(  # type: ignore[attr-defined]
+                    run_id=start.run_id,
+                    turn_id=start.turn_id,
+                    reason_code="commit_validation_failed",
+                )
+                self.assertFalse(repeated.committed)
+                self.assertEqual(repeated.reason, "already_failed")
+                reused = store.begin_agent_run(  # type: ignore[attr-defined]
+                    request_id="request-failed",
+                    conversation_id="conversation-failed",
+                    user_question="触发提交校验失败",
+                )
+                self.assertEqual(reused.outcome, "failed_cached")
+
+    def test_fail_agent_run_rejects_unbounded_provider_text(self) -> None:
+        for label, store in self._stores():
+            with self.subTest(store=label):
+                start = store.begin_agent_run(  # type: ignore[attr-defined]
+                    request_id="request-secret",
+                    conversation_id="conversation-secret",
+                    user_question="测试失败原因",
+                )
+                with self.assertRaises(ValueError):
+                    store.fail_agent_run(  # type: ignore[attr-defined]
+                        run_id=start.run_id,
+                        turn_id=start.turn_id,
+                        reason_code="provider said: secret payload",
+                    )
+
+    def test_sqlite_fail_agent_run_rolls_back_both_updates(self) -> None:
+        start = self.sqlite.begin_agent_run(
+            request_id="request-rollback",
+            conversation_id="conversation-rollback",
+            user_question="测试回滚",
+        )
+        with closing(sqlite3.connect(self.sqlite.path)) as connection:
+            connection.execute(
+                "CREATE TRIGGER fail_run_update BEFORE UPDATE ON main_agent_runs "
+                "BEGIN SELECT RAISE(ABORT, 'boom'); END;"
+            )
+            connection.commit()
+
+        with self.assertRaises(sqlite3.Error):
+            self.sqlite.fail_agent_run(
+                run_id=start.run_id,
+                turn_id=start.turn_id,
+                reason_code="commit_validation_failed",
+            )
+
+        with closing(sqlite3.connect(self.sqlite.path)) as connection:
+            turn_status = connection.execute(
+                "SELECT status FROM conversation_turns WHERE turn_id = ?",
+                (start.turn_id,),
+            ).fetchone()[0]
+            run_status = connection.execute(
+                "SELECT status FROM main_agent_runs WHERE run_id = ?",
+                (start.run_id,),
+            ).fetchone()[0]
+        self.assertEqual(turn_status, "pending")
+        self.assertEqual(run_status, "running")
+
 
 if __name__ == "__main__":
     unittest.main()

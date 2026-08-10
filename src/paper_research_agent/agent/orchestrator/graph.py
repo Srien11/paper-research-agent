@@ -55,7 +55,7 @@ def build_main_agent_graph(
     max_replans: int = MAX_REPLANS_PER_RUN,
     checkpointer: Any | None = None,
 ) -> CompiledStateGraph[Any, Any, Any, Any]:
-    """Assemble the cross-turn main Agent graph; only commit_turn writes storage."""
+    """Assemble the graph; only commit_turn and abort_turn write storage."""
     if max_child_calls <= 0 or max_child_calls > 12:
         raise ValueError("max_child_calls must be between 1 and 12")
     if max_replans <= 0 or max_replans > 3:
@@ -72,11 +72,27 @@ def build_main_agent_graph(
         )
         if start.outcome == "completed_cached":
             return {
+                "run_id": start.run_id,
+                "turn_id": start.turn_id,
+                "base_workspace_version": start.workspace.version,
                 "final_answer": start.result.answer if start.result is not None else "",
                 "termination_reason": "cached",
             }
         if start.outcome == "running_reused":
-            return {"termination_reason": "running_reused"}
+            return {
+                "run_id": start.run_id,
+                "turn_id": start.turn_id,
+                "base_workspace_version": start.workspace.version,
+                "termination_reason": "running_reused",
+            }
+        if start.outcome == "failed_cached":
+            return {
+                "run_id": start.run_id,
+                "turn_id": start.turn_id,
+                "base_workspace_version": start.workspace.version,
+                "final_answer": "该请求此前未通过提交校验。",
+                "termination_reason": "failed",
+            }
         return {
             "run_id": start.run_id,
             "turn_id": start.turn_id,
@@ -251,6 +267,19 @@ def build_main_agent_graph(
         errors = _validate_commit_state(workspace, state)
         return {"validation_errors": errors}
 
+    async def abort_turn(state: MainAgentGraphState) -> MainAgentGraphState:
+        outcome = await asyncio.to_thread(
+            repository.fail_agent_run,
+            run_id=str(state.get("run_id", "")),
+            turn_id=str(state.get("turn_id", "")),
+            reason_code="commit_validation_failed",
+        )
+        return {
+            "commit_outcome": outcome,
+            "final_answer": "主 Agent 状态未通过提交校验，本次运行已安全终止。",
+            "termination_reason": "failed",
+        }
+
     async def commit_turn(state: MainAgentGraphState) -> MainAgentGraphState:
         request = MainAgentRequest.model_validate(state["request"])
         workspace = ConversationWorkspace.model_validate(state["workspace_draft"])
@@ -306,7 +335,7 @@ def build_main_agent_graph(
         }
 
     def after_initialize(state: MainAgentGraphState) -> str:
-        if state.get("termination_reason") in {"cached", "running_reused"}:
+        if state.get("termination_reason") in {"cached", "running_reused", "failed"}:
             return END
         return "hydrate_context"
 
@@ -340,6 +369,9 @@ def build_main_agent_graph(
             return "synthesize_response"
         return "select_next_task"
 
+    def after_validate(state: MainAgentGraphState) -> str:
+        return "abort_turn" if state.get("validation_errors") else "commit_turn"
+
     builder = StateGraph(MainAgentGraphState)
     builder.add_node("initialize_turn", initialize_turn)
     builder.add_node("hydrate_context", hydrate_context)
@@ -355,6 +387,7 @@ def build_main_agent_graph(
     builder.add_node("synthesize_response", synthesize_response)
     builder.add_node("update_workspace_summary", update_workspace_summary)
     builder.add_node("validate_commit", validate_commit)
+    builder.add_node("abort_turn", abort_turn)
     builder.add_node("commit_turn", commit_turn)
     builder.add_edge(START, "initialize_turn")
     builder.add_conditional_edges("initialize_turn", after_initialize, {END: END, "hydrate_context": "hydrate_context"})
@@ -398,7 +431,12 @@ def build_main_agent_graph(
     builder.add_edge("clarify_response", "update_workspace_summary")
     builder.add_edge("synthesize_response", "update_workspace_summary")
     builder.add_edge("update_workspace_summary", "validate_commit")
-    builder.add_edge("validate_commit", "commit_turn")
+    builder.add_conditional_edges(
+        "validate_commit",
+        after_validate,
+        {"abort_turn": "abort_turn", "commit_turn": "commit_turn"},
+    )
+    builder.add_edge("abort_turn", END)
     builder.add_edge("commit_turn", END)
     return builder.compile(checkpointer=checkpointer, name="paper_research_main_v1")
 
@@ -498,11 +536,10 @@ def _validate_commit_state(
         ]
         if pending_approval is not None and not approval_task:
             errors.append("pending approval without a waiting task")
-    source_ids = _source_ids(
-        tuple(
-            ChildTaskResult.model_validate(item)
-            for item in state.get("child_results", [])
-        )
+    source_ids = tuple(
+        source_id
+        for item in state.get("child_results", [])
+        for source_id in ChildTaskResult.model_validate(item).source_ids
     )
     if len(source_ids) != len(set(source_ids)):
         errors.append("child source IDs must be unique")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import uuid
@@ -74,6 +75,10 @@ class ConversationStore(Protocol):
         result: MainAgentResult,
     ) -> CommitOutcome: ...
 
+    def fail_agent_run(
+        self, *, run_id: str, turn_id: str, reason_code: str
+    ) -> CommitOutcome: ...
+
     def clear(self, conversation_id: str) -> int: ...
 
 
@@ -134,7 +139,8 @@ class SQLiteConversationStore:
                 run_id = str(existing[0])
                 turn_id = str(existing[1])
                 workspace = self._workspace_row(connection, normalized_id)
-                if str(existing[2]) == "completed":
+                existing_status = str(existing[2])
+                if existing_status == "completed":
                     result = (
                         MainAgentResult.model_validate_json(str(existing[3]))
                         if existing[3] is not None
@@ -149,6 +155,16 @@ class SQLiteConversationStore:
                         workspace=workspace,
                         outcome="completed_cached",
                         result=result,
+                    )
+                if existing_status == "failed":
+                    connection.commit()
+                    return AgentRunStart(
+                        run_id=run_id,
+                        request_id=normalized_request,
+                        conversation_id=normalized_id,
+                        turn_id=turn_id,
+                        workspace=workspace,
+                        outcome="failed_cached",
                     )
                 connection.commit()
                 return AgentRunStart(
@@ -283,6 +299,13 @@ class SQLiteConversationStore:
                     reason="already_completed",
                     workspace_version=expected_workspace_version,
                 )
+            if str(run[0]) == "failed":
+                connection.commit()
+                return CommitOutcome(
+                    committed=False,
+                    reason="already_failed",
+                    workspace_version=expected_workspace_version,
+                )
             current = self._workspace_row(connection, workspace.conversation_id)
             if current.version != expected_workspace_version:
                 connection.commit()
@@ -366,6 +389,75 @@ class SQLiteConversationStore:
                 )
             connection.commit()
         return CommitOutcome(committed=True, reason="committed", workspace_version=next_version)
+
+    def fail_agent_run(
+        self, *, run_id: str, turn_id: str, reason_code: str
+    ) -> CommitOutcome:
+        failure_code = _failure_code(reason_code)
+        completed = datetime.now(UTC)
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            run = connection.execute(
+                "SELECT status, turn_id, conversation_id FROM main_agent_runs "
+                "WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if run is None:
+                connection.commit()
+                return CommitOutcome(
+                    committed=False,
+                    reason="run_not_found",
+                    workspace_version=0,
+                )
+            workspace = self._workspace_row(connection, str(run[2]))
+            status = str(run[0])
+            if status == "completed":
+                connection.commit()
+                return CommitOutcome(
+                    committed=False,
+                    reason="already_completed",
+                    workspace_version=workspace.version,
+                )
+            if status == "failed":
+                connection.commit()
+                return CommitOutcome(
+                    committed=False,
+                    reason="already_failed",
+                    workspace_version=workspace.version,
+                )
+            if str(run[1]) != turn_id:
+                connection.commit()
+                return CommitOutcome(
+                    committed=False,
+                    reason="turn_conflict",
+                    workspace_version=workspace.version,
+                )
+            cursor = connection.execute(
+                """UPDATE conversation_turns
+                   SET route = 'main_agent', status = 'failed',
+                       assistant_summary = '主 Agent 运行失败。', completed_at = ?
+                   WHERE turn_id = ? AND status = 'pending'""",
+                (completed.isoformat(), turn_id),
+            )
+            if cursor.rowcount != 1:
+                connection.commit()
+                return CommitOutcome(
+                    committed=False,
+                    reason="turn_conflict",
+                    workspace_version=workspace.version,
+                )
+            connection.execute(
+                """UPDATE main_agent_runs
+                   SET status = 'failed', failure_code = ?, updated_at = ?
+                   WHERE run_id = ?""",
+                (failure_code, completed.isoformat(), run_id),
+            )
+            connection.commit()
+        return CommitOutcome(
+            committed=True,
+            reason="failed",
+            workspace_version=workspace.version,
+        )
 
     def complete_turn(
         self,
@@ -544,6 +636,7 @@ class SQLiteConversationStore:
                     base_workspace_version INTEGER NOT NULL,
                     committed_workspace_version INTEGER,
                     status TEXT NOT NULL,
+                    failure_code TEXT,
                     result_json TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
@@ -561,6 +654,14 @@ class SQLiteConversationStore:
                 connection.execute(
                     "ALTER TABLE conversation_turns ADD COLUMN "
                     "selected_history_relevances_json TEXT NOT NULL DEFAULT '[]'"
+                )
+            run_columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(main_agent_runs)")
+            }
+            if "failure_code" not in run_columns:
+                connection.execute(
+                    "ALTER TABLE main_agent_runs ADD COLUMN failure_code TEXT"
                 )
 
     def _connect(self) -> sqlite3.Connection:
@@ -613,6 +714,7 @@ class _AgentRunRecord:
     base_workspace_version: int
     result: MainAgentResult | None = None
     committed_workspace_version: int | None = None
+    failure_code: str | None = None
 
 
 class InMemoryConversationStore:
@@ -669,6 +771,15 @@ class InMemoryConversationStore:
                         workspace=workspace,
                         outcome="completed_cached",
                         result=existing.result,
+                    )
+                if existing.status == "failed":
+                    return AgentRunStart(
+                        run_id=existing.run_id,
+                        request_id=normalized_request,
+                        conversation_id=normalized_id,
+                        turn_id=existing.turn_id,
+                        workspace=workspace,
+                        outcome="failed_cached",
                     )
                 return AgentRunStart(
                     run_id=existing.run_id,
@@ -770,6 +881,12 @@ class InMemoryConversationStore:
                     reason="already_completed",
                     workspace_version=expected_workspace_version,
                 )
+            if record.status == "failed":
+                return CommitOutcome(
+                    committed=False,
+                    reason="already_failed",
+                    workspace_version=expected_workspace_version,
+                )
             current = self._workspaces.get(workspace.conversation_id)
             if current is None or current.version != expected_workspace_version:
                 return CommitOutcome(
@@ -808,6 +925,64 @@ class InMemoryConversationStore:
             record.result = result
             record.committed_workspace_version = next_version
         return CommitOutcome(committed=True, reason="committed", workspace_version=next_version)
+
+    def fail_agent_run(
+        self, *, run_id: str, turn_id: str, reason_code: str
+    ) -> CommitOutcome:
+        failure_code = _failure_code(reason_code)
+        completed = datetime.now(UTC)
+        with self._lock:
+            record = next(
+                (item for item in self._runs.values() if item.run_id == run_id), None
+            )
+            if record is None:
+                return CommitOutcome(
+                    committed=False,
+                    reason="run_not_found",
+                    workspace_version=0,
+                )
+            workspace = self._workspaces.get(record.conversation_id)
+            workspace_version = workspace.version if workspace is not None else 0
+            if record.status == "completed":
+                return CommitOutcome(
+                    committed=False,
+                    reason="already_completed",
+                    workspace_version=workspace_version,
+                )
+            if record.status == "failed":
+                return CommitOutcome(
+                    committed=False,
+                    reason="already_failed",
+                    workspace_version=workspace_version,
+                )
+            if record.turn_id != turn_id:
+                return CommitOutcome(
+                    committed=False,
+                    reason="turn_conflict",
+                    workspace_version=workspace_version,
+                )
+            turn = self._turns.get(turn_id)
+            if turn is None or turn.status != "pending":
+                return CommitOutcome(
+                    committed=False,
+                    reason="turn_conflict",
+                    workspace_version=workspace_version,
+                )
+            self._turns[turn_id] = turn.model_copy(
+                update={
+                    "route": "main_agent",
+                    "status": "failed",
+                    "assistant_summary": "主 Agent 运行失败。",
+                    "completed_at": completed,
+                }
+            )
+            record.status = "failed"
+            record.failure_code = failure_code
+        return CommitOutcome(
+            committed=True,
+            reason="failed",
+            workspace_version=workspace_version,
+        )
 
     def complete_turn(
         self,
@@ -913,6 +1088,13 @@ def _question(value: str) -> str:
     normalized = value.strip()
     if not normalized or len(normalized) > 10_000:
         raise ValueError("conversation question is invalid")
+    return normalized
+
+
+def _failure_code(value: str) -> str:
+    normalized = value.strip()
+    if re.fullmatch(r"[a-z][a-z0-9_]{1,63}", normalized) is None:
+        raise ValueError("failure reason code is invalid")
     return normalized
 
 

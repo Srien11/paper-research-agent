@@ -190,16 +190,17 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
     def _build(
         self,
         *,
+        store: InMemoryConversationStore | None = None,
         interpretation: TurnInterpretationV2 | None = None,
         plan_decisions: tuple[TaskPlanDecision, ...] = (),
         dispatch_results: tuple[ChildTaskResult, ...] = (),
         max_child_calls: int = 3,
     ) -> tuple[object, InMemoryConversationStore, FakeDispatcher, FakePlanner]:
-        store = InMemoryConversationStore()
+        resolved_store = store or InMemoryConversationStore()
         planner = FakePlanner(*plan_decisions)
         dispatcher = FakeDispatcher(*dispatch_results)
         graph = build_main_agent_graph(
-            repository=store,
+            repository=resolved_store,
             hydrator=FakeHydrator(),
             interpreter=FakeInterpreter(
                 interpretation or _interpretation()
@@ -209,7 +210,7 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
             dispatcher=dispatcher,
             max_child_calls=max_child_calls,
         )
-        return graph, store, dispatcher, planner
+        return graph, resolved_store, dispatcher, planner
 
     async def _run(
         self, graph: object, request: MainAgentRequest
@@ -525,6 +526,145 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first["termination_reason"], "completed")
         self.assertEqual(second["termination_reason"], "cached")
         self.assertEqual(second["final_answer"], first["final_answer"])
+
+    async def test_plan_goal_mismatch_aborts_instead_of_committing(self) -> None:
+        other_goal_id = "d" * 32
+        workspace = ConversationWorkspace(
+            conversation_id="conversation-1",
+            active_goal=_goal(),
+            task_plan=_plan(
+                (_task(task_id="other", goal_id=other_goal_id),),
+                goal_id=other_goal_id,
+            ),
+            updated_at=_utc(),
+        )
+        store = InMemoryConversationStore()
+        store._workspaces["conversation-1"] = workspace
+        graph, _store, _dispatcher, _planner = self._build(
+            store=store,
+            interpretation=_interpretation(
+                needs_clarification=True,
+                clarification_question="请确认目标。",
+                confidence=0.4,
+            ),
+        )
+        request = MainAgentRequest(
+            request_id="request-invalid-goal",
+            conversation_id="conversation-1",
+            message="继续",
+            rag_mode="preferred",
+        )
+
+        state = await self._run(graph, request)
+
+        self.assertEqual(state["termination_reason"], "failed")
+        self.assertTrue(
+            any("plan goal ID" in error for error in state["validation_errors"])
+        )
+        self.assertEqual(store.load_workspace("conversation-1").version, 0)
+        self.assertEqual(store.history("conversation-1")[0].status, "failed")
+
+    async def test_multiple_running_tasks_abort_commit(self) -> None:
+        workspace = ConversationWorkspace(
+            conversation_id="conversation-1",
+            active_goal=_goal(),
+            task_plan=_plan(
+                (
+                    _task(task_id="first", status="running"),
+                    _task(task_id="second", status="running"),
+                )
+            ),
+            updated_at=_utc(),
+        )
+        store = InMemoryConversationStore()
+        store._workspaces["conversation-1"] = workspace
+        graph, _store, _dispatcher, _planner = self._build(
+            store=store,
+            interpretation=_interpretation(
+                needs_clarification=True,
+                clarification_question="请确认。",
+                confidence=0.4,
+            ),
+        )
+        request = MainAgentRequest(
+            request_id="request-multiple-running",
+            conversation_id="conversation-1",
+            message="继续",
+            rag_mode="preferred",
+        )
+
+        state = await self._run(graph, request)
+
+        self.assertEqual(state["termination_reason"], "failed")
+        self.assertIn("more than one running task", state["validation_errors"])
+
+    async def test_pending_approval_without_waiting_task_aborts_commit(self) -> None:
+        workspace = ConversationWorkspace(
+            conversation_id="conversation-1",
+            active_goal=_goal(),
+            task_plan=_plan((_task(task_id="done", status="completed"),)),
+            updated_at=_utc(),
+        )
+        store = InMemoryConversationStore()
+        store._workspaces["conversation-1"] = workspace
+        graph, _store, _dispatcher, _planner = self._build(
+            store=store,
+            interpretation=_interpretation(
+                needs_clarification=True,
+                clarification_question="请确认。",
+                confidence=0.4,
+            ),
+        )
+        request = MainAgentRequest(
+            request_id="request-orphan-approval",
+            conversation_id="conversation-1",
+            message="继续",
+            rag_mode="preferred",
+        )
+
+        state = await graph.ainvoke(  # type: ignore[attr-defined]
+            {
+                "request": request.model_dump(mode="json"),
+                "pending_approval": {"approval_request_id": "a" * 32},
+            }
+        )
+
+        self.assertEqual(state["termination_reason"], "failed")
+        self.assertIn(
+            "pending approval without a waiting task", state["validation_errors"]
+        )
+
+    async def test_duplicate_child_source_ids_abort_commit(self) -> None:
+        plan = _plan_decision(
+            (
+                _task(task_id="local", capability="local_rag"),
+                _task(task_id="web", capability="dynamic_tools"),
+            )
+        )
+        graph, store, _dispatcher, _planner = self._build(
+            plan_decisions=(plan,),
+            dispatch_results=(
+                _result(task_id="local", source_id="shared-source"),
+                _result(
+                    task_id="web",
+                    capability="dynamic_tools",
+                    citation_kind="external",
+                    source_id="shared-source",
+                ),
+            ),
+        )
+        request = MainAgentRequest(
+            request_id="request-duplicate-source",
+            conversation_id="conversation-1",
+            message="综合本地与外部信息",
+            rag_mode="preferred",
+        )
+
+        state = await self._run(graph, request)
+
+        self.assertEqual(state["termination_reason"], "failed")
+        self.assertIn("child source IDs must be unique", state["validation_errors"])
+        self.assertEqual(store.load_workspace("conversation-1").version, 0)
 
 
 if __name__ == "__main__":

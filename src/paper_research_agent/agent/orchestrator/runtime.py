@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from typing import Any, Literal
+from typing import Any
 
 from paper_research_agent.agent.orchestrator.models import (
     ChildTaskResult,
     MainAgentRequest,
     MainAgentResult,
+    RunStatus,
 )
 from paper_research_agent.conversation.store import ConversationStore
 
@@ -96,8 +97,19 @@ def _result_from_state(
     state: dict[str, Any], request: MainAgentRequest
 ) -> MainAgentResult:
     reason = state.get("termination_reason")
-    status: Literal["completed", "waiting_approval"] = (
-        "completed" if reason in {"completed", "cached"} else "waiting_approval"
+    statuses: dict[object, RunStatus] = {
+        "completed": "completed",
+        "cached": "completed",
+        "waiting_approval": "waiting_approval",
+        "running_reused": "running",
+        "failed": "failed",
+    }
+    status = statuses.get(reason, "failed")
+    base_workspace_version = int(state.get("base_workspace_version", 0))
+    workspace_version = (
+        base_workspace_version + 1
+        if status in {"completed", "waiting_approval"} and reason != "cached"
+        else base_workspace_version
     )
     return MainAgentResult(
         run_id=str(state.get("run_id", "")),
@@ -111,5 +123,5 @@ def _result_from_state(
             for item in state.get("child_results", [])
         ),
         pending_approval=state.get("pending_approval"),
-        workspace_version=int(state.get("base_workspace_version", 0)) + 1,
+        workspace_version=workspace_version,
     )

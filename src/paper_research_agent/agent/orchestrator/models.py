@@ -395,7 +395,9 @@ class AgentRunStart(FrozenModel):
     conversation_id: str = Field(min_length=1, max_length=256)
     turn_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     workspace: ConversationWorkspace
-    outcome: Literal["created", "running_reused", "completed_cached"]
+    outcome: Literal[
+        "created", "running_reused", "completed_cached", "failed_cached"
+    ]
     result: MainAgentResult | None = None
 
 
@@ -405,7 +407,9 @@ class CommitOutcome(FrozenModel):
     committed: bool
     reason: Literal[
         "committed",
+        "failed",
         "already_completed",
+        "already_failed",
         "version_conflict",
         "run_not_found",
         "turn_conflict",
