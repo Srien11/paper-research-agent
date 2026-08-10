@@ -129,6 +129,13 @@ class AttachmentStore:
         (path.parent / f"{attachment_id}.json").unlink(missing_ok=True)
         return True
 
+    def validate_ownership(
+        self, session_id: str, attachment_ids: tuple[str, ...]
+    ) -> None:
+        """Validate session ownership without extracting or returning file contents."""
+        for attachment_id in attachment_ids:
+            self._resolve(session_id, attachment_id)
+
     def _resolve(self, session_id: str, attachment_id: str) -> tuple[dict[str, object], Path]:
         if not re.fullmatch(r"[0-9a-f]{32}", attachment_id):
             raise FileNotFoundError("attachment not found")

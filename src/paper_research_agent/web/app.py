@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import os
+import re
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -16,7 +18,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from paper_research_agent.agent.orchestrator.models import MainAgentRequest
+from paper_research_agent.agent.orchestrator.models import (
+    MainAgentRequest,
+    MainAgentResult,
+    MainAgentResumeRequest,
+)
 from paper_research_agent.agent.orchestrator.runtime import MainAgentRuntime
 from paper_research_agent.conversation.models import (
     ConversationResolution,
@@ -38,8 +44,12 @@ from paper_research_agent.web.bootstrap import (
 )
 from paper_research_agent.web.chat_runtime import RouteOutputError
 from paper_research_agent.web.config import WebConfig
+from paper_research_agent.web.events import AgentEventProjector
 from paper_research_agent.web.files import AttachmentStore
 from paper_research_agent.web.models import (
+    AgentApprovalRequest,
+    AgentRunRequest,
+    AgentRunStatusResponse,
     AnonymousSessionResponse,
     AskResponse,
     AttachmentResponse,
@@ -66,6 +76,7 @@ from paper_research_agent.web.routing import (
 
 APP_PREFIX = "/paper-research"
 API_PREFIX = f"{APP_PREFIX}/api"
+_REQUEST_ID = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
 
 
 class WebRuntime(Protocol):
@@ -444,6 +455,78 @@ def _safe_long_term_memory_response(result: object) -> LongTermMemoryListRespons
     return LongTermMemoryListResponse(memories=memories)
 
 
+def _agent_stream_response(
+    result: MainAgentResult,
+    *,
+    reused: bool,
+) -> StreamingResponse:
+    projector = AgentEventProjector(
+        request_id=result.request_id,
+        run_id=result.run_id,
+    )
+    events = projector.project_result(result, reused=reused)
+    return StreamingResponse(
+        iter(event.to_ndjson() for event in events),
+        media_type="application/x-ndjson",
+        headers={"X-Accel-Buffering": "no"},
+    )
+
+
+def _safe_agent_status(result: MainAgentResult) -> AgentRunStatusResponse:
+    pending = result.pending_approval
+    safe_pending = (
+        SafePendingToolApproval.model_validate(
+            {
+                "tool_name": pending.get("tool_name"),
+                "purpose": pending.get("purpose"),
+                "arguments_sha256": pending.get("arguments_sha256"),
+                "expires_at_epoch": pending.get("expires_at_epoch"),
+            }
+        )
+        if pending is not None
+        else None
+    )
+    return AgentRunStatusResponse(
+        request_id=result.request_id,
+        run_id=result.run_id,
+        status=result.status,
+        answer=result.answer,
+        workspace_version=result.workspace_version,
+        pending_approval=safe_pending,
+    )
+
+
+def _validated_request_id(value: str) -> str:
+    if _REQUEST_ID.fullmatch(value) is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="请求标识无效",
+        )
+    return value
+
+
+def _main_agent_runtime_error(error: Exception, *, approval: bool = False) -> HTTPException:
+    if isinstance(error, TimeoutError):
+        return HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="主 Agent 执行超时",
+        )
+    if approval and isinstance(error, RuntimeError):
+        return HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="审批请求已失效或已处理",
+        )
+    if isinstance(error, ValueError):
+        return HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="主 Agent 请求无效",
+        )
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="主 Agent 服务暂时不可用",
+    )
+
+
 def create_app(
     *,
     config: WebConfig | None = None,
@@ -615,6 +698,120 @@ def create_app(
                 detail="普通交流模型暂未就绪",
             )
         return active
+
+    def active_main_agent(request: Request) -> MainAgentRuntime:
+        active = cast(MainAgentRuntime | None, request.app.state.main_agent_runtime)
+        if active is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="主 Agent 运行时未就绪",
+            )
+        return active
+
+    async def stored_agent_result(request_id: str) -> MainAgentResult | None:
+        return await asyncio.to_thread(conversation.store.load_agent_run, request_id)
+
+    @app.post(f"{API_PREFIX}/agent/runs")
+    async def run_main_agent(
+        request: Request,
+        payload: AgentRunRequest,
+        _origin: None = Depends(require_origin),
+        session: OwnerSession = Depends(current_session),  # noqa: B008
+        main_runtime: MainAgentRuntime = Depends(active_main_agent),  # noqa: B008
+    ) -> StreamingResponse:
+        if len(payload.message) > settings.max_question_chars:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="问题长度超过限制",
+            )
+        try:
+            request.app.state.attachments.validate_ownership(
+                session.conversation_id, payload.attachment_ids
+            )
+        except (FileNotFoundError, ValueError):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="附件不存在或不属于当前会话",
+            ) from None
+        existing = await stored_agent_result(payload.request_id)
+        if existing is not None and existing.conversation_id != session.conversation_id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="请求标识已被其他会话使用",
+            )
+        try:
+            result = await main_runtime.run(
+                MainAgentRequest(
+                    request_id=payload.request_id,
+                    conversation_id=session.conversation_id,
+                    message=payload.message,
+                    rag_mode=payload.rag_mode,
+                    attachment_ids=payload.attachment_ids,
+                )
+            )
+        except HTTPException:
+            raise
+        except Exception as error:  # noqa: BLE001 - sanitize runtime boundary
+            raise _main_agent_runtime_error(error) from None
+        if result.conversation_id != session.conversation_id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="主 Agent 结果与当前会话不匹配",
+            )
+        return _agent_stream_response(result, reused=existing is not None)
+
+    @app.get(
+        f"{API_PREFIX}/agent/runs/{{request_id}}",
+        response_model=AgentRunStatusResponse,
+    )
+    async def get_main_agent_status(
+        request_id: str,
+        session: OwnerSession = Depends(current_session),  # noqa: B008
+    ) -> AgentRunStatusResponse:
+        normalized_id = _validated_request_id(request_id)
+        result = await stored_agent_result(normalized_id)
+        if result is None or result.conversation_id != session.conversation_id:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="主 Agent 运行记录不存在",
+            )
+        return _safe_agent_status(result)
+
+    @app.post(f"{API_PREFIX}/agent/runs/{{request_id}}/approval")
+    async def resume_main_agent_approval(
+        request_id: str,
+        payload: AgentApprovalRequest,
+        _origin: None = Depends(require_origin),
+        session: OwnerSession = Depends(current_session),  # noqa: B008
+        main_runtime: MainAgentRuntime = Depends(active_main_agent),  # noqa: B008
+    ) -> StreamingResponse:
+        resume_request = MainAgentResumeRequest(
+            request_id=_validated_request_id(request_id),
+            approved=payload.approved,
+        )
+        existing = await stored_agent_result(resume_request.request_id)
+        if (
+            existing is None
+            or existing.conversation_id != session.conversation_id
+            or existing.status != "waiting_approval"
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="审批请求已失效或已处理",
+            )
+        try:
+            result = await main_runtime.resume_approval(
+                request_id=resume_request.request_id,
+                approved=resume_request.approved,
+            )
+        except Exception as error:  # noqa: BLE001 - sanitize runtime boundary
+            raise _main_agent_runtime_error(error, approval=True) from None
+        if result.conversation_id != session.conversation_id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="主 Agent 结果与当前会话不匹配",
+            )
+        return _agent_stream_response(result, reused=False)
 
     @app.get(f"{APP_PREFIX}/healthz", response_model=HealthResponse)
     async def health() -> HealthResponse:
