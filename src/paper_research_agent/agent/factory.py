@@ -38,6 +38,34 @@ from paper_research_agent.retrieval.query_rewrite import (
 )
 
 
+def create_main_agent_model(
+    *,
+    model_id: str,
+    api_key: str,
+    base_url: str = DEFAULT_BASE_URL,
+    timeout_seconds: float = 180,
+) -> ChatOpenAI:
+    """Create the one structured-output model shared by main-Agent stages."""
+    normalized_model = model_id.strip()
+    if not normalized_model:
+        raise ValueError("main agent model cannot be blank")
+    normalized_key = api_key.strip()
+    if not normalized_key:
+        raise RuntimeError("main agent credentials are unavailable")
+    if timeout_seconds <= 0 or timeout_seconds > 3600:
+        raise ValueError("main agent timeout must be between 0 and 3600 seconds")
+    return ChatOpenAI(
+        model=normalized_model,
+        api_key=SecretStr(normalized_key),
+        base_url=base_url.rstrip("/"),
+        temperature=0,
+        top_p=0.7,
+        timeout=timeout_seconds,
+        max_retries=2,
+        extra_body={"enable_thinking": False},
+    )
+
+
 async def create_research_agent_runtime(
     *,
     retriever: AsyncResearchRetriever,
@@ -195,19 +223,19 @@ async def create_research_agent_runtime(
 
 async def create_main_agent_runtime(
     *,
-    store,
-    hydrator,
-    interpreter,
-    goal_reconciler,
-    task_planner,
-    dispatcher,
-    synthesizer=None,
+    store: Any,
+    hydrator: Any,
+    interpreter: Any,
+    goal_reconciler: Any,
+    task_planner: Any,
+    dispatcher: Any,
+    synthesizer: Any = None,
     timeout_seconds: float = 180,
-    checkpointer=None,
-    approval_resumer=None,
-    close=None,
-    clear=None,
-):
+    checkpointer: Any = None,
+    approval_resumer: Any = None,
+    close: Any = None,
+    clear: Any = None,
+) -> Any:
     """Assemble the cross-turn main Agent runtime from ready components."""
     from paper_research_agent.agent.orchestrator.factory import build_main_agent_runtime
 
@@ -222,6 +250,32 @@ async def create_main_agent_runtime(
         timeout_seconds=timeout_seconds,
         checkpointer=checkpointer,
         approval_resumer=approval_resumer,
+        close=close,
+        clear=clear,
+    )
+
+
+def create_main_agent_runtime_from_model(
+    *,
+    store: Any,
+    model: Any,
+    dispatcher: Any,
+    timeout_seconds: float = 180,
+    checkpointer: Any = None,
+    close: Any = None,
+    clear: Any = None,
+) -> Any:
+    """Assemble all model-backed main-Agent stages from one shared client."""
+    from paper_research_agent.agent.orchestrator.factory import (
+        build_main_agent_runtime_from_model,
+    )
+
+    return build_main_agent_runtime_from_model(
+        store=store,
+        model=model,
+        dispatcher=dispatcher,
+        timeout_seconds=timeout_seconds,
+        checkpointer=checkpointer,
         close=close,
         clear=clear,
     )

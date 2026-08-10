@@ -31,6 +31,11 @@ from paper_research_agent.conversation.resolver import (
 from paper_research_agent.conversation.service import ConversationCoordinator
 from paper_research_agent.conversation.store import ConversationStore, SQLiteConversationStore
 from paper_research_agent.web.auth import CredentialVerifier, OwnerSession, SessionManager
+from paper_research_agent.web.bootstrap import (
+    ApplicationServices,
+    create_application_services_from_environment,
+    main_agent_mode_from_environment,
+)
 from paper_research_agent.web.chat_runtime import RouteOutputError
 from paper_research_agent.web.config import WebConfig
 from paper_research_agent.web.files import AttachmentStore
@@ -95,6 +100,7 @@ class WebRuntime(Protocol):
 
 
 RuntimeFactory = Callable[[], WebRuntime | Awaitable[WebRuntime]]
+ServicesFactory = Callable[[], ApplicationServices | Awaitable[ApplicationServices]]
 
 
 def _load_recommended_questions() -> tuple[RecommendedQuestion, ...]:
@@ -210,10 +216,6 @@ def _capability_plan(interpretation: TurnInterpretation) -> CapabilityPlan:
         research_mode=interpretation.research_mode,
         reason=interpretation.reason,
     )
-
-
-def _main_agent_enabled() -> bool:
-    return os.getenv("PRA_MAIN_AGENT_ENABLED", "").strip().lower() == "true"
 
 
 async def _main_agent_ask(
@@ -452,6 +454,7 @@ def create_app(
     recommended_questions: tuple[RecommendedQuestion, ...] | None = None,
     conversation_store: ConversationStore | None = None,
     main_agent_runtime: MainAgentRuntime | None = None,
+    services_factory: ServicesFactory | None = None,
 ) -> FastAPI:
     """Create an isolated app; runtime injection keeps API tests free of local ML loading."""
     settings = config or WebConfig.from_env()
@@ -465,13 +468,48 @@ def create_app(
     shared_store = conversation_store or SQLiteConversationStore(
         Path(__file__).resolve().parents[3] / "data/runtime/conversation-v1.sqlite3"
     )
+    shared_attachments = AttachmentStore(
+        Path(__file__).resolve().parents[3] / "data/runtime/uploads"
+    )
     conversation = ConversationCoordinator(shared_store)
+    use_services = services_factory is not None or (
+        runtime is None
+        and chat_runtime is None
+        and runtime_factory is None
+        and conversation_store is None
+        and main_agent_runtime is None
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        nonlocal conversation
+        if use_services:
+            services_builder = services_factory
+            if services_builder is None:
+                async def services_builder() -> ApplicationServices:
+                    return await create_application_services_from_environment(
+                        conversation_store=shared_store,
+                        attachment_store=shared_attachments,
+                    )
+            services = cast(
+                ApplicationServices, await _maybe_await(services_builder())
+            )
+            app.state.services = services
+            app.state.runtime = services.runtime
+            app.state.chat_runtime = services.chat_runtime
+            app.state.main_agent_runtime = services.main_agent_runtime
+            app.state.main_agent_mode = services.mode
+            app.state.attachments = services.attachment_store
+            conversation = ConversationCoordinator(services.conversation_store)
+            app.state.conversation = conversation
+            try:
+                yield
+            finally:
+                await services.aclose()
+            return
         if app.state.runtime is None:
-            factory = runtime_factory or _default_runtime_factory
-            app.state.runtime = await _maybe_await(factory())
+            runtime_builder = runtime_factory or _default_runtime_factory
+            app.state.runtime = await _maybe_await(runtime_builder())
         active = cast(WebRuntime | None, app.state.runtime)
         if active is not None:
             setter = getattr(active, "set_conversation_store", None)
@@ -513,9 +551,11 @@ def create_app(
         runtime if runtime is not None and hasattr(runtime, "stream_chat") else None
     )
     app.state.main_agent_runtime = main_agent_runtime
+    app.state.main_agent_mode = main_agent_mode_from_environment()
+    app.state.services = None
     app.state.config = settings
     app.state.sessions = sessions
-    app.state.attachments = AttachmentStore(Path(__file__).resolve().parents[3] / "data/runtime/uploads")
+    app.state.attachments = shared_attachments
     app.state.conversation = conversation
 
     @app.middleware("http")
@@ -699,7 +739,7 @@ def create_app(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="问题长度超过限制",
             )
-        if _main_agent_enabled() and app.state.main_agent_runtime is not None:
+        if app.state.main_agent_mode == "primary" and app.state.main_agent_runtime is not None:
             return await _main_agent_ask(app, session, payload)
         turn = None
         resolution = None

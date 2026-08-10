@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from langchain_core.language_models import BaseChatModel
+
 from paper_research_agent.agent.orchestrator.children import ChildGraphDispatcher
 from paper_research_agent.agent.orchestrator.evaluator import (
     MAX_CHILD_CALLS_PER_RUN,
@@ -68,6 +70,36 @@ def build_main_agent_runtime(
         repository=store,
         approval_resumer=resolved_resumer,
         timeout_seconds=timeout_seconds,
+        close=close,
+        clear=clear,
+    )
+
+
+def build_main_agent_runtime_from_model(
+    *,
+    store: ConversationStore,
+    model: BaseChatModel,
+    dispatcher: ChildGraphDispatcher,
+    timeout_seconds: float = 180,
+    max_child_calls: int = MAX_CHILD_CALLS_PER_RUN,
+    max_replans: int = MAX_REPLANS_PER_RUN,
+    checkpointer: Any | None = None,
+    close: Closer | None = None,
+    clear: ConversationClearer | None = None,
+) -> MainAgentRuntime:
+    """Build production stages while sharing one lifecycle-managed model client."""
+    return build_main_agent_runtime(
+        store=store,
+        hydrator=ContextHydrator(store),
+        interpreter=TurnInterpreter(model),
+        goal_reconciler=GoalReconciler(model),
+        task_planner=TaskPlanner(model),
+        dispatcher=dispatcher,
+        synthesizer=AnswerSynthesizer(model),
+        timeout_seconds=timeout_seconds,
+        max_child_calls=max_child_calls,
+        max_replans=max_replans,
+        checkpointer=checkpointer,
         close=close,
         clear=clear,
     )

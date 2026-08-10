@@ -38,16 +38,16 @@ def main() -> None:
     except ImportError:
         parser.exit(1, 'web dependencies are missing; install ".[retrieval,web]"\n')
 
+    from paper_research_agent.web.bootstrap import main_agent_mode_from_environment
+
+    mode = main_agent_mode_from_environment()
+    print(f"主 Agent Web 启动模式：{mode}")
     # One worker is intentional: the local embedding and reranking models are shared
     # process state and must not be duplicated on the small personal server.
-    # One worker is intentional: the local embedding and reranking models are shared
-    # process state and must not be duplicated on the small personal server.
-    main_agent_enabled = os.getenv("PRA_MAIN_AGENT_ENABLED", "").strip().lower() == "true"
-    if main_agent_enabled:
-        print("主 Agent 统一入口已启用（PRA_MAIN_AGENT_ENABLED=true）")
     uvicorn.run(
         "paper_research_agent.web.app:create_app",
         factory=True,
+        env_file=None,
         host=args.host,
         port=args.port,
         workers=1,
