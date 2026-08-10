@@ -77,6 +77,7 @@ def _result(
     *,
     capability: str = "local_rag",
     task_id: str = "task-1",
+    summary: str = "任务完成",
     citation_kind: str | None = None,
     source_id: str | None = None,
 ) -> ChildTaskResult:
@@ -85,7 +86,7 @@ def _result(
         "task_id": task_id,
         "capability": capability,
         "status": status,
-        "summary": "任务完成",
+        "summary": summary,
         "citation_kind": citation_kind or ("local_paper" if status == "completed" else "none"),
         "source_ids": (source_id,) if source_id else (),
     }
@@ -216,7 +217,14 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
         plan = _plan_decision((_task(task_id="chat", capability="direct_chat"),))
         graph, store, dispatcher, _planner = self._build(
             plan_decisions=(plan,),
-            dispatch_results=(),
+            dispatch_results=(
+                _result(
+                    capability="direct_chat",
+                    task_id="chat",
+                    summary="你好，我能帮你研究论文。",
+                    citation_kind="none",
+                ),
+            ),
         )
         request = MainAgentRequest(
             request_id="request-1",
@@ -225,9 +233,105 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
             rag_mode="preferred",
         )
         state = await self._run(graph, request)
-        self.assertEqual(state["final_answer"], "你好")
-        self.assertEqual(dispatcher.calls, [])
+        self.assertEqual(state["final_answer"], "[direct_chat] 你好，我能帮你研究论文。")
+        self.assertEqual(len(dispatcher.calls), 1)
+        self.assertEqual(dispatcher.calls[0].capability, "direct_chat")
         self.assertEqual(store.load_agent_run("request-1").status, "completed")
+
+    async def test_attachment_qa_flow_uses_attachment_dispatch(self) -> None:
+        plan = _plan_decision((_task(task_id="attachment", capability="attachment_qa"),))
+        graph, _store, dispatcher, _planner = self._build(
+            plan_decisions=(plan,),
+            dispatch_results=(
+                _result(
+                    capability="attachment_qa",
+                    task_id="attachment",
+                    summary="附件结论",
+                    citation_kind="none",
+                ),
+            ),
+        )
+        request = MainAgentRequest(
+            request_id="request-attachment",
+            conversation_id="conversation-1",
+            message="总结这份附件",
+            rag_mode="preferred",
+            attachment_ids=("file-1",),
+        )
+
+        state = await self._run(graph, request)
+
+        self.assertEqual(dispatcher.calls[0].capability, "attachment_qa")
+        self.assertEqual(dispatcher.calls[0].attachment_ids, ("file-1",))
+        self.assertIn("附件结论", state["final_answer"])
+
+    async def test_file_edit_flow_uses_file_dispatch(self) -> None:
+        plan = _plan_decision((_task(task_id="edit", capability="file_edit"),))
+        graph, _store, dispatcher, _planner = self._build(
+            plan_decisions=(plan,),
+            dispatch_results=(
+                _result(
+                    capability="file_edit",
+                    task_id="edit",
+                    summary="已生成修改文件",
+                    citation_kind="none",
+                ),
+            ),
+        )
+        request = MainAgentRequest(
+            request_id="request-edit",
+            conversation_id="conversation-1",
+            message="修改并返回文件",
+            rag_mode="preferred",
+            attachment_ids=("file-1",),
+        )
+
+        state = await self._run(graph, request)
+
+        self.assertEqual(dispatcher.calls[0].capability, "file_edit")
+        self.assertIn("已生成修改文件", state["final_answer"])
+
+    async def test_required_mode_dispatches_dynamic_task_to_local_rag(self) -> None:
+        plan = _plan_decision((_task(task_id="web", capability="dynamic_tools"),))
+        graph, _store, dispatcher, _planner = self._build(
+            plan_decisions=(plan,),
+            dispatch_results=(_result(task_id="web", source_id="chunk-1"),),
+        )
+        request = MainAgentRequest(
+            request_id="request-required",
+            conversation_id="conversation-1",
+            message="查询资料",
+            rag_mode="required",
+        )
+
+        await self._run(graph, request)
+
+        self.assertEqual(dispatcher.calls[0].capability, "local_rag")
+
+    async def test_disabled_mode_never_dispatches_local_rag(self) -> None:
+        plan = _plan_decision((_task(task_id="local", capability="local_rag"),))
+        graph, store, dispatcher, _planner = self._build(
+            plan_decisions=(plan,),
+            dispatch_results=(
+                _result(
+                    capability="direct_chat",
+                    task_id="local",
+                    citation_kind="none",
+                ),
+            ),
+        )
+        request = MainAgentRequest(
+            request_id="request-disabled",
+            conversation_id="conversation-1",
+            message="解释这个概念",
+            rag_mode="disabled",
+        )
+
+        await self._run(graph, request)
+
+        self.assertEqual(dispatcher.calls[0].capability, "direct_chat")
+        task = store.load_workspace("conversation-1").task_plan.tasks[0]
+        self.assertEqual(task.status, "completed")
 
     async def test_local_rag_flow(self) -> None:
         plan = _plan_decision((_task(task_id="local", capability="local_rag"),))

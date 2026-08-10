@@ -143,10 +143,25 @@ class EvaluateTaskTests(unittest.TestCase):
         self.assertIn("本地论文引用", evaluation.reason)
 
     def test_external_dynamic_result_completes_without_local_citation(self) -> None:
-        result = _result(status="completed", citation_kind="external")
+        result = _result(
+            status="completed",
+            capability="dynamic_tools",
+            citation_kind="external",
+        )
         evaluation = self._evaluate(
             _task(task_id="web-task", capability="dynamic_tools"), result
         )
+        self.assertEqual(evaluation.outcome, "complete")
+
+    def test_routed_direct_result_is_not_held_to_original_local_policy(self) -> None:
+        result = _result(
+            status="completed",
+            capability="direct_chat",
+            citation_kind="none",
+        )
+
+        evaluation = self._evaluate(_task(capability="local_rag"), result)
+
         self.assertEqual(evaluation.outcome, "complete")
 
     def test_budget_exhausted_fails(self) -> None:

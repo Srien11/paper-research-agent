@@ -84,7 +84,7 @@ def evaluate_task(
             summary=result.summary,
             reason="证据不足且无重试与重规划预算",
         )
-    if task.capability == "local_rag" and result.citation_kind != "local_paper":
+    if result.capability == "local_rag" and result.citation_kind != "local_paper":
         return TaskEvaluation(
             task_id=task.task_id,
             outcome="fail",

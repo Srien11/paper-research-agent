@@ -29,6 +29,9 @@ class RouteDecision(FrozenModel):
 
 
 _LOCAL_CORPUS_ID = re.compile(r"\b[CT]\d{3}\b", re.IGNORECASE)
+CAPABILITIES: frozenset[str] = frozenset(
+    {"direct_chat", "local_rag", "dynamic_tools", "attachment_qa", "file_edit"}
+)
 
 
 def select_next_task(workspace: ConversationWorkspace) -> TaskSelection:

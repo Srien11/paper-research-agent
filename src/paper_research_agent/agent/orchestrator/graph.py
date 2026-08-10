@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
@@ -21,6 +21,7 @@ from paper_research_agent.agent.orchestrator.interpreter import TurnInterpreter
 from paper_research_agent.agent.orchestrator.models import (
     AgentContextEnvelope,
     AgentTask,
+    Capability,
     ChildTaskRequest,
     ChildTaskResult,
     ConversationWorkspace,
@@ -30,9 +31,8 @@ from paper_research_agent.agent.orchestrator.models import (
     TurnInterpretationV2,
 )
 from paper_research_agent.agent.orchestrator.planner import GoalReconciler, TaskPlanner
-from paper_research_agent.agent.orchestrator.router import (
-    route_task as route_task_pure,
-)
+from paper_research_agent.agent.orchestrator.router import CAPABILITIES
+from paper_research_agent.agent.orchestrator.router import route_task as route_task_pure
 from paper_research_agent.agent.orchestrator.router import (
     select_next_task as select_next_task_pure,
 )
@@ -145,18 +145,6 @@ def build_main_agent_graph(
         envelope = AgentContextEnvelope.model_validate(state["context"])
         decision = route_task_pure(task, envelope)
         return {"route": decision.capability}
-
-    async def direct_response(state: MainAgentGraphState) -> MainAgentGraphState:
-        request = MainAgentRequest.model_validate(state["request"])
-        result = ChildTaskResult(
-            child_run_id=str(state.get("run_id", "")),
-            task_id=str(state["active_task_id"]),
-            capability="direct_chat",
-            status="completed",
-            summary=request.message,
-            citation_kind="none",
-        )
-        return {"direct_answer": request.message, "child_result": result}
 
     async def dispatch_child(state: MainAgentGraphState) -> MainAgentGraphState:
         child_request = _child_request(state)
@@ -333,12 +321,10 @@ def build_main_agent_graph(
         return "synthesize_response"
 
     def after_route(state: MainAgentGraphState) -> str:
-        route = state.get("route")
-        if route in {"local_rag", "dynamic_tools"}:
+        route = str(state.get("route", ""))
+        if route in CAPABILITIES:
             return "dispatch_child"
-        if route == "direct_chat":
-            return "direct_response"
-        return "direct_response"
+        raise ValueError(f"unsupported main-agent route: {route}")
 
     def after_update(state: MainAgentGraphState) -> str:
         action = state.get("next_action")
@@ -358,7 +344,6 @@ def build_main_agent_graph(
     builder.add_node("plan_tasks", plan_tasks)
     builder.add_node("select_next_task", select_next_task)
     builder.add_node("route_task", route_task)
-    builder.add_node("direct_response", direct_response)
     builder.add_node("dispatch_child", dispatch_child)
     builder.add_node("evaluate_result", evaluate_result)
     builder.add_node("update_task_state", update_task_state)
@@ -392,9 +377,8 @@ def build_main_agent_graph(
     builder.add_conditional_edges(
         "route_task",
         after_route,
-        {"dispatch_child": "dispatch_child", "direct_response": "direct_response"},
+        {"dispatch_child": "dispatch_child"},
     )
-    builder.add_edge("direct_response", "evaluate_result")
     builder.add_edge("dispatch_child", "evaluate_result")
     builder.add_edge("evaluate_result", "update_task_state")
     builder.add_conditional_edges(
@@ -445,7 +429,7 @@ def _child_request(state: MainAgentGraphState) -> ChildTaskRequest:
         task_id=task.task_id,
         objective=task.objective,
         success_criteria=task.success_criteria,
-        capability=task.capability,
+        capability=_routed_capability(state),
         current_message=request.message,
         conversation_summary=workspace.summary,
         constraints=task.constraints
@@ -456,6 +440,13 @@ def _child_request(state: MainAgentGraphState) -> ChildTaskRequest:
         rag_mode=request.rag_mode,
         attachment_ids=request.attachment_ids,
     )
+
+
+def _routed_capability(state: MainAgentGraphState) -> Capability:
+    route = str(state.get("route", ""))
+    if route not in CAPABILITIES:
+        raise ValueError(f"unsupported main-agent route: {route}")
+    return cast(Capability, route)
 
 
 def _build_summary(workspace: ConversationWorkspace) -> str:

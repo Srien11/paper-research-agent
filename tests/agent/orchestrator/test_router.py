@@ -11,6 +11,7 @@ from paper_research_agent.agent.orchestrator.models import (
     TaskPlan,
 )
 from paper_research_agent.agent.orchestrator.router import (
+    CAPABILITIES,
     RouteDecision,
     route_task,
     select_next_task,
@@ -170,6 +171,18 @@ class SelectNextTaskTests(unittest.TestCase):
 
 
 class RouteTaskTests(unittest.TestCase):
+    def test_all_main_agent_capabilities_are_dispatchable(self) -> None:
+        self.assertEqual(
+            CAPABILITIES,
+            {
+                "direct_chat",
+                "local_rag",
+                "dynamic_tools",
+                "attachment_qa",
+                "file_edit",
+            },
+        )
+
     def test_attachment_qa_requires_attachment(self) -> None:
         task = _task(task_id="att", capability="attachment_qa")
         decision = route_task(task, _envelope(attachment_ids=("file-1",)))
