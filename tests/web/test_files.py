@@ -23,6 +23,12 @@ class AttachmentStoreTests(unittest.IsolatedAsyncioTestCase):
             )
 
             self.assertIn("新内容", store.extract("session-a", (item.attachment_id,))[0])
+            content = store.read("session-a", item.attachment_id)
+            self.assertEqual(content.filename, "edited-notes.md")
+            self.assertEqual(content.content_type, "text/markdown")
+            self.assertEqual(content.data.decode("utf-8"), "新内容")
+            with self.assertRaises(FileNotFoundError):
+                store.read("session-b", item.attachment_id)
 
     async def test_save_extract_and_delete_are_session_scoped(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -98,37 +98,53 @@ class StaticWebContractTests(unittest.TestCase):
             'login: "api/login"',
             'logout: "api/logout"',
             'conversation: "api/conversation"',
-            'ask: "api/ask"',
+            'agentRuns: "api/agent/runs"',
             'memories: "api/memories"',
         ):
             self.assertIn(path, self.javascript)
         self.assertNotIn("api/conversations", self.javascript)
+        self.assertNotIn('chatStream: "api/chat/stream"', self.javascript)
+        self.assertNotIn('toolApproval: "api/tools/approval"', self.javascript)
+        self.assertNotIn('ask: "api/ask"', self.javascript)
         self.assertIn('method: "DELETE"', self.javascript)
         self.assertIn("JSON.stringify({ username, password })", self.javascript)
 
     def test_frontend_submits_unified_request_and_displays_server_route(self) -> None:
         self.assertIn("使用本地论文知识库", self.html)
         self.assertIn("仅依据本地论文回答", self.html)
-        self.assertIn("await streamConversation(question)", self.javascript)
-        self.assertIn("rag_mode: selectedRagMode()", self.javascript)
-        self.assertIn('event.type === "route"', self.javascript)
-        self.assertIn("article.remove();", self.javascript)
+        self.assertIn("await streamConversation(pendingRequest)", self.javascript)
+        self.assertIn("function createRequestId()", self.javascript)
+        self.assertIn("request_id: pendingRequest.requestId", self.javascript)
+        self.assertIn("rag_mode: pendingRequest.ragMode", self.javascript)
+        self.assertIn('event.type === "route_selected"', self.javascript)
         self.assertIn('event.type === "rag_result"', self.javascript)
+        self.assertIn('event.type === "attachment_result"', self.javascript)
+        self.assertIn('event.type === "file_result"', self.javascript)
+        self.assertIn('event.type === "approval_required"', self.javascript)
         self.assertIn('id="conversation-history"', self.html)
         self.assertIn("archiveCurrentDialogue", self.javascript)
         self.assertNotIn("isFileEditInstruction", self.javascript)
         self.assertNotIn("file_action", self.javascript)
-        self.assertIn('chatStream: "api/chat/stream"', self.javascript)
         self.assertNotIn("isCasualGreeting", self.javascript)
 
-    def test_browser_storage_excludes_citation_and_evidence_objects(self) -> None:
+    def test_pending_request_persists_only_retry_contract(self) -> None:
         self.assertIn("sessionStorage", self.javascript)
         self.assertIn('saveHistoryItem({ role: "assistant", text', self.javascript)
-        self.assertNotIn("localStorage", self.javascript)
+        self.assertIn("localStorage.setItem(PENDING_REQUEST_KEY", self.javascript)
+        self.assertIn("localStorage.removeItem(PENDING_REQUEST_KEY)", self.javascript)
+        self.assertIn("loadPendingRequest()", self.javascript)
+        self.assertIn("pendingRequest.requestId", self.javascript)
         self.assertNotRegex(
             self.javascript,
-            r"sessionStorage\.setItem\([^\n]+(?:citation|evidence|payload)",
+            r"(?:sessionStorage|localStorage)\.setItem\([^\n]+(?:citation|evidence|payload)",
         )
+
+    def test_approval_and_file_outputs_use_unified_request_identity(self) -> None:
+        self.assertIn("API.agentApproval(state.pendingTool.requestId)", self.javascript)
+        self.assertIn("pending_approval", self.javascript)
+        self.assertIn("output_attachment_ids", self.javascript)
+        self.assertIn("createServerDownloadButton", self.javascript)
+        self.assertIn("clearPendingRequest()", self.javascript)
 
     def test_hybrid_answer_citation_markers_open_evidence_dialog(self) -> None:
         self.assertIn("function renderTextWithCitations", self.javascript)

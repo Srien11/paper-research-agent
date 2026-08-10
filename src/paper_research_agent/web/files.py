@@ -23,6 +23,13 @@ class Attachment:
     size_bytes: int
 
 
+@dataclass(frozen=True)
+class AttachmentContent:
+    filename: str
+    content_type: str
+    data: bytes
+
+
 class AttachmentStore:
     def __init__(self, root: Path, *, max_file_bytes: int = MAX_FILE_BYTES) -> None:
         self._root = root.resolve()
@@ -135,6 +142,14 @@ class AttachmentStore:
         """Validate session ownership without extracting or returning file contents."""
         for attachment_id in attachment_ids:
             self._resolve(session_id, attachment_id)
+
+    def read(self, session_id: str, attachment_id: str) -> AttachmentContent:
+        record, path = self._resolve(session_id, attachment_id)
+        return AttachmentContent(
+            filename=str(record["filename"]),
+            content_type=str(record["content_type"]),
+            data=path.read_bytes(),
+        )
 
     def _resolve(self, session_id: str, attachment_id: str) -> tuple[dict[str, object], Path]:
         if not re.fullmatch(r"[0-9a-f]{32}", attachment_id):

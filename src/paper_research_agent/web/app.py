@@ -12,6 +12,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Protocol, cast
+from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.exceptions import RequestValidationError
@@ -1392,6 +1393,30 @@ def create_app(
     ) -> OperationResponse:
         app.state.attachments.delete(session.conversation_id, attachment_id)
         return OperationResponse()
+
+    @app.get(f"{API_PREFIX}/files/{{attachment_id}}/download")
+    async def download_file(
+        attachment_id: str,
+        session: OwnerSession = Depends(current_session),  # noqa: B008
+    ) -> Response:
+        try:
+            attachment = app.state.attachments.read(
+                session.conversation_id, attachment_id
+            )
+        except (FileNotFoundError, ValueError):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="文件不存在或不属于当前会话",
+            ) from None
+        return Response(
+            content=attachment.data,
+            media_type=attachment.content_type,
+            headers={
+                "Content-Disposition": (
+                    "attachment; filename*=UTF-8''" + quote(attachment.filename)
+                )
+            },
+        )
 
     @app.post(f"{API_PREFIX}/tools/approval", response_model=ToolResearchResponse)
     async def resolve_tool_approval(

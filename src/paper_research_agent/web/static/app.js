@@ -5,22 +5,23 @@ const API = Object.freeze({
   login: "api/login",
   logout: "api/logout",
   conversation: "api/conversation",
-  ask: "api/ask",
-  chatStream: "api/chat/stream",
+  agentRuns: "api/agent/runs",
+  agentApproval: (requestId) => `api/agent/runs/${encodeURIComponent(requestId)}/approval`,
   files: "api/files",
-  toolRun: "api/tools/run",
-  toolApproval: "api/tools/approval",
+  fileDownload: (attachmentId) => `api/files/${encodeURIComponent(attachmentId)}/download`,
   memories: "api/memories",
 });
 
 const STORAGE_KEY = "paper-research.current-dialogue.v1";
 const HISTORY_KEY = "paper-research.dialogue-history.v1";
+const PENDING_REQUEST_KEY = "paper-research.pending-request.v1";
 const state = {
   busy: false,
   citations: new Map(),
   history: [],
   phaseTimer: null,
   pendingTool: null,
+  pendingRequest: null,
   viewingArchive: false,
   attachments: [],
 };
@@ -91,6 +92,57 @@ function syncRagControls() {
   if (!elements.toolMode.checked) elements.ragRequired.checked = false;
 }
 
+function createRequestId() {
+  return `web_${crypto.randomUUID().replaceAll("-", "")}`;
+}
+
+function createPendingRequest(question) {
+  return {
+    requestId: createRequestId(),
+    question,
+    ragMode: selectedRagMode(),
+    attachmentIds: state.attachments.map((item) => item.attachment_id),
+  };
+}
+
+function savePendingRequest(pendingRequest) {
+  state.pendingRequest = pendingRequest;
+  try {
+    localStorage.setItem(PENDING_REQUEST_KEY, JSON.stringify(pendingRequest));
+  } catch (_error) {
+    // In-memory idempotency remains available when persistent storage is denied.
+  }
+}
+
+function loadPendingRequest() {
+  if (state.pendingRequest) return state.pendingRequest;
+  try {
+    const value = JSON.parse(localStorage.getItem(PENDING_REQUEST_KEY) || "null");
+    const valid = value
+      && typeof value.question === "string"
+      && /^[A-Za-z0-9_-]{16,128}$/.test(value.requestId)
+      && ["disabled", "preferred", "required"].includes(value.ragMode)
+      && Array.isArray(value.attachmentIds)
+      && value.attachmentIds.length <= 5
+      && value.attachmentIds.every((item) => /^[0-9a-f]{32}$/.test(item));
+    if (!valid) return null;
+    state.pendingRequest = value;
+    return value;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function clearPendingRequest() {
+  state.pendingRequest = null;
+  state.pendingTool = null;
+  try {
+    localStorage.removeItem(PENDING_REQUEST_KEY);
+  } catch (_error) {
+    // In-memory state is already cleared.
+  }
+}
+
 async function request(path, options = {}) {
   const response = await fetch(path, {
     credentials: "same-origin",
@@ -124,6 +176,8 @@ function setAuthenticated(authenticated) {
   elements.appView.hidden = !authenticated;
   if (authenticated) {
     restoreHistory();
+    const pendingRequest = loadPendingRequest();
+    if (pendingRequest) showNotice("检测到一条未完成请求，可输入原问题重试。", "warning");
     window.requestAnimationFrame(() => elements.question.focus());
   } else {
     elements.username.value = "";
@@ -184,6 +238,7 @@ async function handleLogout() {
     showToast("退出请求未确认，本地会话已清理。");
   }
   clearLocalDialogue();
+  clearPendingRequest();
   setAuthenticated(false);
 }
 
@@ -230,6 +285,11 @@ async function handleAsk(event) {
     elements.question.focus();
     return;
   }
+  const existingRequest = loadPendingRequest();
+  if (existingRequest && existingRequest.question !== question) {
+    showNotice("上一条请求尚未确认完成，请先输入原问题重试。", "warning");
+    return;
+  }
   hideNotice();
   if (state.viewingArchive) {
     resetWorkspace();
@@ -239,20 +299,23 @@ async function handleAsk(event) {
     });
     state.viewingArchive = false;
   }
+  const pendingRequest = existingRequest || createPendingRequest(question);
+  savePendingRequest(pendingRequest);
   elements.emptyState.hidden = true;
-  appendUserMessage(question, true);
+  if (!existingRequest) appendUserMessage(question, true);
   elements.question.value = "";
   setBusy(true);
   scrollMessages();
   try {
-    await streamConversation(question);
+    await streamConversation(pendingRequest);
   } catch (error) {
     if (error.status === 401) {
       showToast("登录已过期，请重新登录。");
       setAuthenticated(false);
     } else if (error.status === 409) {
-      appendErrorMessage("上一项研究仍在处理中，请稍后再试。", true);
+      appendErrorMessage("上一项研究仍在处理中，请稍后重试。", true);
     } else {
+      if (error.status >= 400 && error.status < 500) clearPendingRequest();
       appendErrorMessage(error.message, true);
     }
   } finally {
@@ -262,18 +325,22 @@ async function handleAsk(event) {
   }
 }
 
-async function streamConversation(question, sourceNote = "") {
-  const activeFiles = [...state.attachments];
-  const response = await fetch(API.chatStream, {
+async function streamConversation(pendingRequest, sourceNote = "") {
+  const response = await fetch(API.agentRuns, {
     method: "POST",
     credentials: "same-origin",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      question,
-      attachment_ids: activeFiles.map((item) => item.attachment_id),
-      rag_mode: selectedRagMode(),
+      request_id: pendingRequest.requestId,
+      message: pendingRequest.question,
+      attachment_ids: pendingRequest.attachmentIds,
+      rag_mode: pendingRequest.ragMode,
     }),
   });
+  return consumeAgentStream(response, pendingRequest, sourceNote);
+}
+
+async function consumeAgentStream(response, pendingRequest, sourceNote = "") {
   if (!response.ok) {
     let message = "请求暂时未完成，请稍后重试。";
     try {
@@ -299,16 +366,20 @@ async function streamConversation(question, sourceNote = "") {
   copy.textContent = "正在判断最合适的处理方式…";
   article.append(meta, copy);
   elements.messages.append(article);
+  state.citations.clear();
+  elements.routeMetrics.replaceChildren();
+  elements.tokenMetrics.replaceChildren();
+  elements.generationMetrics.replaceChildren();
+  elements.citationMap.replaceChildren();
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
   let rawText = "";
-  let metrics = null;
-  let route = "normal_chat";
-  let capabilities = {};
-  let ragHandled = false;
-  let citationContextActive = false;
+  let route = "direct_chat";
+  let finalStatus = "running";
+  let waitingApproval = false;
+  const outputAttachmentIds = [];
   let lastPaint = 0;
   while (true) {
     const { value, done } = await reader.read();
@@ -318,35 +389,41 @@ async function streamConversation(question, sourceNote = "") {
     for (const line of lines) {
       if (!line.trim()) continue;
       const event = JSON.parse(line);
-      if (event.type === "route") {
-        route = event.route;
-        capabilities = event.capabilities && typeof event.capabilities === "object" ? event.capabilities : {};
-        meta.querySelector("strong").textContent = event.label || "研究助手";
-        meta.querySelector(".assistant-mark").textContent = route.startsWith("attachment") || route === "file_edit" ? "文" : "研";
+      if (event.type === "run_reused") {
+        meta.append(createElement("small", "source-note", "已复用原请求结果"));
+      } else if (event.type === "route_selected") {
+        route = event.capability || route;
+        const labels = {
+          direct_chat: "普通交流",
+          local_rag: "本地论文研究",
+          dynamic_tools: "动态工具研究",
+          attachment_qa: "附件问答",
+          file_edit: "文件编辑",
+        };
+        meta.querySelector("strong").textContent = labels[route] || "研究助手";
+        meta.querySelector(".assistant-mark").textContent = route === "attachment_qa" || route === "file_edit" ? "文" : "研";
         copy.textContent = route === "file_edit" ? "正在修改文件，完成后可下载新文件…" : "";
-        if (event.reason) meta.append(createElement("small", "source-note", event.reason));
-      } else if (event.type === "rag_context" && event.payload) {
-        const normalized = normalizePayload(event.payload);
-        citationContextActive = true;
-        state.citations.clear();
-        normalized.citations.forEach((citation) => {
-          if (citation && citation.citation_id) state.citations.set(citation.citation_id, citation);
+      } else if (event.type === "rag_result") {
+        const sourceCount = Array.isArray(event.source_ids) ? event.source_ids.length : 0;
+        meta.append(createElement("small", "source-note source-note-rag", `本地论文来源 ${sourceCount} 条`));
+        renderAgentInspectorEvent("本地论文检索", event);
+      } else if (event.type === "tool_result") {
+        const toolNames = Array.isArray(event.tool_names) ? event.tool_names : [];
+        meta.append(createElement("small", "source-note", toolNames.length ? `工具：${toolNames.join("、")}` : "动态工具已完成"));
+        renderAgentInspectorEvent("动态工具", event);
+      } else if (event.type === "attachment_result") {
+        meta.append(createElement("small", "source-note", "已读取当前会话附件"));
+        renderAgentInspectorEvent("附件问答", event);
+      } else if (event.type === "file_result") {
+        const ids = Array.isArray(event.output_attachment_ids) ? event.output_attachment_ids : [];
+        ids.forEach((id) => {
+          if (/^[0-9a-f]{32}$/.test(id) && !outputAttachmentIds.includes(id)) outputAttachmentIds.push(id);
         });
-        renderInspector(normalized);
-        const note = normalized.status === "answered" ? "已参考本地论文库" : "本地论文未命中，继续综合回答";
-        meta.append(createElement("small", "source-note source-note-rag", note));
-      } else if (event.type === "rag_result" && event.payload) {
-        article.remove();
-        const retrieval = event.payload.retrieval && typeof event.payload.retrieval === "object" ? event.payload.retrieval : {};
-        renderAnswer({ ...event.payload, retrieval: { ...retrieval, capability_plan: capabilities } }, true);
-        ragHandled = true;
-      } else if (event.type === "tool_result" && event.payload) {
-        renderToolResearch(event.payload, true);
-        ragHandled = true;
-      } else if (event.type === "approval_required" && event.payload) {
-        article.remove();
-        renderToolResearch(event.payload, true);
-        ragHandled = true;
+        renderAgentInspectorEvent("文件输出", event);
+      } else if (event.type === "approval_required" && event.pending_approval) {
+        waitingApproval = true;
+        openToolApproval(event.pending_approval, pendingRequest.requestId);
+        copy.textContent = "敏感工具已暂停，等待你的批准或拒绝。";
       } else if (event.type === "delta" && typeof event.text === "string") {
         rawText += event.text;
         const now = performance.now();
@@ -358,47 +435,46 @@ async function streamConversation(question, sourceNote = "") {
           lastPaint = now;
         }
       } else if (event.type === "done") {
-        metrics = event.metrics || null;
+        finalStatus = event.status || "failed";
       } else if (event.type === "error") {
-        article.remove();
-        throw new Error(event.message || "生成回答时发生错误。");
+        finalStatus = "failed";
       }
     }
     if (done) break;
   }
-  if (ragHandled) return;
+  if (["completed", "failed", "cancelled", "conflict"].includes(finalStatus)) {
+    clearPendingRequest();
+  }
+  if (finalStatus === "failed" || finalStatus === "cancelled" || finalStatus === "conflict") {
+    article.remove();
+    throw new Error("主 Agent 未能完成这次请求，请检查输入后重试。");
+  }
+  if (waitingApproval || finalStatus === "waiting_approval") {
+    showNotice("敏感工具等待审批；批准或拒绝后将使用同一请求继续。", "warning");
+    return;
+  }
   const editMode = route === "file_edit";
   const finalText = (editMode ? rawText : naturalText(rawText)).trim();
   if (editMode) {
     copy.textContent = "文件修改完成，可以下载新文件。";
-  } else if (citationContextActive) {
-    copy.replaceChildren(renderTextWithCitations(finalText));
-  } else {
-    copy.textContent = finalText;
-  }
-  if (editMode && activeFiles.length) {
-    article.append(createDownloadButton(finalText, activeFiles[0].filename));
-  }
-  if (metrics) article.append(renderStreamMetrics(metrics));
-  saveHistoryItem({ role: "assistant", text: finalText, metrics });
+  } else copy.replaceChildren(renderTextWithCitations(finalText));
+  outputAttachmentIds.forEach((attachmentId) => {
+    article.append(createServerDownloadButton(attachmentId));
+  });
+  saveHistoryItem({ role: "assistant", text: finalText, status: finalStatus });
 }
 
-function createDownloadButton(content, originalName) {
-  const button = createElement("button", "download-file", "下载修改后的文件");
-  button.type = "button";
-  button.addEventListener("click", () => {
-    const pdf = originalName.toLowerCase().endsWith(".pdf");
-    const name = pdf
-      ? `${originalName.replace(/\.pdf$/i, "")}_修改版.txt`
-      : originalName.replace(/(\.[^.]+)?$/, "_修改版$1");
-    const url = URL.createObjectURL(new Blob([content], { type: "text/plain;charset=utf-8" }));
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = name;
-    link.click();
-    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
-  });
-  return button;
+function renderAgentInspectorEvent(label, event) {
+  elements.inspectorEmpty.hidden = true;
+  elements.inspectorContent.hidden = false;
+  appendMetric(elements.routeMetrics, label, `${event.counts?.source_count || 0} 条来源`);
+}
+
+function createServerDownloadButton(attachmentId) {
+  const link = createElement("a", "download-file", "下载生成文件");
+  link.href = API.fileDownload(attachmentId);
+  link.setAttribute("download", "");
+  return link;
 }
 
 async function uploadSelectedFile(file) {
@@ -488,49 +564,8 @@ function renderTextWithCitations(value) {
   return fragment;
 }
 
-function renderStreamMetrics(metrics) {
-  const box = createElement("div", "stream-metrics");
-  const seconds = (Number(metrics.elapsed_ms || 0) / 1000).toFixed(1);
-  const first = (Number(metrics.first_token_ms || 0) / 1000).toFixed(1);
-  box.textContent = `总耗时 ${seconds} 秒 · 首字等待（近似思考）${first} 秒 · 输入 ${Number(metrics.input_tokens || 0)} Token · 输出 ${Number(metrics.output_tokens || 0)} Token`;
-  return box;
-}
-
-function renderToolResearch(payload, persist) {
-  const article = createElement("article", "message message-assistant");
-  const meta = createElement("div", "message-meta");
-  meta.append(createElement("span", "assistant-mark", "工"), createElement("strong", "", "动态工具 Agent"));
-  article.append(meta);
-  const observations = Array.isArray(payload.observations) ? payload.observations : [];
-  if (observations.length) {
-    const list = createElement("ol", "tool-observations");
-    observations.forEach((item) => {
-      const row = createElement("li");
-      row.append(
-        createElement("strong", "", item.tool_name || "unknown_tool"),
-        createElement("small", "", ` · ${item.status || "unknown"} · ${item.trust || "unclassified"}`),
-        createElement("p", "", item.purpose || ""),
-      );
-      list.append(row);
-    });
-    article.append(list);
-  }
-  const text = payload.status === "approval_required"
-    ? "敏感工具已暂停，等待你的批准或拒绝。"
-    : payload.final_summary || "工具研究已完成。";
-  article.append(createElement("p", payload.status === "approval_required" ? "insufficient" : "", text));
-  elements.messages.append(article);
-  if (persist) saveHistoryItem({ role: "assistant", text, status: payload.status });
-  if (payload.status === "approval_required" && payload.pending_approval) {
-    openToolApproval(payload.pending_approval);
-  } else {
-    state.pendingTool = null;
-    showNotice("动态工具研究已完成；只有 citation_evidence 可作为论文引用依据。", "success");
-  }
-}
-
-function openToolApproval(pending) {
-  state.pendingTool = pending;
+function openToolApproval(pending, requestId) {
+  state.pendingTool = { requestId, pending };
   elements.toolApprovalDetails.replaceChildren();
   appendDetail(elements.toolApprovalDetails, "工具", pending.tool_name);
   appendDetail(elements.toolApprovalDetails, "用途", pending.purpose);
@@ -541,16 +576,26 @@ function openToolApproval(pending) {
 
 async function resolveToolApproval(approved) {
   if (!state.pendingTool || state.busy) return;
+  const pendingTool = state.pendingTool;
+  const pendingRequest = loadPendingRequest();
+  if (!pendingRequest || pendingRequest.requestId !== pendingTool.requestId) {
+    clearPendingRequest();
+    elements.toolApprovalDialog.close();
+    showNotice("审批对应的请求已失效，请重新发起。", "error");
+    return;
+  }
   setBusy(true);
   elements.toolApprovalAccept.disabled = true;
   elements.toolApprovalReject.disabled = true;
   try {
-    const payload = await request(API.toolApproval, {
+    const response = await fetch(API.agentApproval(state.pendingTool.requestId), {
       method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ approved }),
     });
     elements.toolApprovalDialog.close();
-    renderToolResearch(payload, true);
+    await consumeAgentStream(response, pendingRequest, "审批恢复");
   } catch (error) {
     showNotice(error.message, "error");
   } finally {
@@ -621,6 +666,12 @@ function appendErrorMessage(text, persist) {
   meta.append(createElement("span", "assistant-mark", "!"), createElement("strong", "", "研究未完成"));
   const message = createElement("p", "insufficient", text);
   article.append(meta, message);
+  if (loadPendingRequest()) {
+    const retry = createElement("button", "download-file", "重试原请求");
+    retry.type = "button";
+    retry.addEventListener("click", retryPendingRequest);
+    article.append(retry);
+  }
   elements.messages.append(article);
   showNotice("本次请求没有生成可验证答案，你可以修改问题后重试。", "error");
   if (persist) saveHistoryItem({ role: "assistant", text, status: "error" });
@@ -907,6 +958,7 @@ async function startNewConversation() {
   try {
     archiveCurrentDialogue();
     await request(API.conversation, { method: "DELETE" });
+    clearPendingRequest();
     clearLocalDialogue();
     renderHistoryList();
     resetWorkspace();
@@ -1054,6 +1106,24 @@ function clearLocalDialogue() {
     sessionStorage.removeItem(STORAGE_KEY);
   } catch (_error) {
     // No local state remains in memory even when storage APIs are unavailable.
+  }
+}
+
+async function retryPendingRequest() {
+  const pendingRequest = loadPendingRequest();
+  if (!pendingRequest || state.busy) return;
+  hideNotice();
+  setBusy(true);
+  try {
+    await streamConversation(pendingRequest, "断线重试，复用原请求标识");
+  } catch (error) {
+    if (error.status >= 400 && error.status < 500 && error.status !== 409) {
+      clearPendingRequest();
+    }
+    appendErrorMessage(error.message, true);
+  } finally {
+    setBusy(false);
+    scrollMessages();
   }
 }
 

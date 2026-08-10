@@ -267,6 +267,27 @@ class MainAgentApiTests(unittest.TestCase):
         self.assertEqual(missing.status_code, 404)
         self.assertEqual(invalid_status.status_code, 422)
 
+    def test_session_owned_attachment_can_be_downloaded(self) -> None:
+        uploaded = self.client.post(
+            "/paper-research/api/files?filename=generated-note.md",
+            headers={"Origin": ORIGIN, "Content-Type": "text/markdown"},
+            content="生成内容".encode(),
+        )
+        self.assertEqual(uploaded.status_code, 200, uploaded.text)
+        attachment_id = uploaded.json()["attachment_id"]
+
+        downloaded = self.client.get(
+            f"/paper-research/api/files/{attachment_id}/download"
+        )
+
+        self.assertEqual(downloaded.status_code, 200)
+        self.assertEqual(downloaded.content.decode("utf-8"), "生成内容")
+        self.assertIn("generated-note.md", downloaded.headers["content-disposition"])
+        self.client.delete(
+            f"/paper-research/api/files/{attachment_id}",
+            headers={"Origin": ORIGIN},
+        )
+
     def test_auth_origin_request_id_and_runtime_errors_fail_closed(self) -> None:
         payload = {"request_id": REQUEST_ID, "message": "hello"}
         no_origin = self.client.post("/paper-research/api/agent/runs", json=payload)

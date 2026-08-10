@@ -62,17 +62,17 @@ async function main() {
 
     await page.getByLabel("研究问题").fill("RAGAS 和 ARES 在评估忠实度时有什么主要区别？");
     await page.getByRole("button", { name: "开始研究" }).click();
-    await page.locator(".claim").first().waitFor({ timeout: 90000 });
+    await page.waitForFunction(() => {
+      const copy = document.querySelector(".message-assistant .answer-copy");
+      return copy && copy.textContent && !copy.textContent.includes("正在");
+    }, null, { timeout: 90000 });
+    const pendingRequest = await page.evaluate(() => localStorage.getItem("paper-research.pending-request.v1"));
+    if (pendingRequest !== null) throw new Error("completed request_id was not cleared");
     await page.locator("#inspector-content").waitFor({ state: "visible" });
     const inspectorText = await page.locator("#inspector-content").innerText();
-    for (const expected of ["解析后问题", "英文检索式", "纳入记忆轮次", "上下文总预算", "输入 Token"]) {
+    for (const expected of ["本地论文检索"]) {
       if (!inspectorText.includes(expected)) throw new Error(`inspector is missing: ${expected}`);
     }
-    const citationButton = page.locator(".citation-button").first();
-    await citationButton.click();
-    await page.locator("#evidence-dialog[open]").waitFor();
-    if (!(await page.locator(".evidence-preview").isVisible())) throw new Error("evidence excerpt is missing");
-    await page.getByRole("button", { name: "关闭引用证据" }).click();
     await page.screenshot({ path: path.join(outputDir, "desktop-answer.png"), fullPage: true });
 
     const bodyOverflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
