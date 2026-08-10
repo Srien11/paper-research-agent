@@ -37,6 +37,7 @@ from paper_research_agent.agent.orchestrator.router import (
     select_next_task as select_next_task_pure,
 )
 from paper_research_agent.agent.orchestrator.state import MainAgentGraphState
+from paper_research_agent.agent.orchestrator.synthesizer import AnswerSynthesizer
 from paper_research_agent.conversation.models import ConversationResolution, ConversationStatus
 from paper_research_agent.conversation.store import ConversationStore
 
@@ -49,6 +50,7 @@ def build_main_agent_graph(
     goal_reconciler: GoalReconciler,
     task_planner: TaskPlanner,
     dispatcher: ChildGraphDispatcher,
+    synthesizer: AnswerSynthesizer | None = None,
     max_child_calls: int = MAX_CHILD_CALLS_PER_RUN,
     max_replans: int = MAX_REPLANS_PER_RUN,
     checkpointer: Any | None = None,
@@ -58,6 +60,7 @@ def build_main_agent_graph(
         raise ValueError("max_child_calls must be between 1 and 12")
     if max_replans <= 0 or max_replans > 3:
         raise ValueError("max_replans must be between 1 and 3")
+    answer_synthesizer = synthesizer or AnswerSynthesizer()
 
     async def initialize_turn(state: MainAgentGraphState) -> MainAgentGraphState:
         request = MainAgentRequest.model_validate(state["request"])
@@ -224,15 +227,16 @@ def build_main_agent_graph(
         return {"direct_answer": answer, "final_answer": answer}
 
     async def synthesize_response(state: MainAgentGraphState) -> MainAgentGraphState:
-        parts: list[str] = []
         direct = state.get("direct_answer")
         if isinstance(direct, str) and direct.strip():
-            parts.append(direct)
-        for raw in state.get("child_results", []):
-            result = ChildTaskResult.model_validate(raw)
-            parts.append(f"[{result.capability}] {result.summary}")
-        answer = "\n".join(parts) if parts else "已完成。"
-        return {"final_answer": answer[:20_000]}
+            return {"final_answer": direct[:20_000]}
+        context = AgentContextEnvelope.model_validate(state["context"])
+        child_results = tuple(
+            ChildTaskResult.model_validate(raw)
+            for raw in state.get("child_results", [])
+        )
+        answer = await answer_synthesizer.synthesize(context, child_results)
+        return {"final_answer": answer.text[:20_000]}
 
     async def update_workspace_summary(
         state: MainAgentGraphState,

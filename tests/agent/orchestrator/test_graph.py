@@ -4,6 +4,7 @@ import unittest
 from collections import deque
 from datetime import UTC, datetime
 
+from paper_research_agent.agent.orchestrator.artifacts import ChatArtifact
 from paper_research_agent.agent.orchestrator.graph import build_main_agent_graph
 from paper_research_agent.agent.orchestrator.models import (
     AgentContextEnvelope,
@@ -80,6 +81,7 @@ def _result(
     summary: str = "任务完成",
     citation_kind: str | None = None,
     source_id: str | None = None,
+    artifact: object | None = None,
 ) -> ChildTaskResult:
     values: dict[str, object] = {
         "child_run_id": "r" * 32,
@@ -89,6 +91,7 @@ def _result(
         "summary": summary,
         "citation_kind": citation_kind or ("local_paper" if status == "completed" else "none"),
         "source_ids": (source_id,) if source_id else (),
+        "artifact": artifact,
     }
     if status == "waiting_approval":
         values["pending_approval"] = {"approval_request_id": "a" * 32}
@@ -223,6 +226,7 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
                     task_id="chat",
                     summary="你好，我能帮你研究论文。",
                     citation_kind="none",
+                    artifact=ChatArtifact(text="你好，我能帮你研究论文。"),
                 ),
             ),
         )
@@ -233,7 +237,7 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
             rag_mode="preferred",
         )
         state = await self._run(graph, request)
-        self.assertEqual(state["final_answer"], "[direct_chat] 你好，我能帮你研究论文。")
+        self.assertEqual(state["final_answer"], "你好，我能帮你研究论文。")
         self.assertEqual(len(dispatcher.calls), 1)
         self.assertEqual(dispatcher.calls[0].capability, "direct_chat")
         self.assertEqual(store.load_agent_run("request-1").status, "completed")
@@ -347,7 +351,7 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
         )
         state = await self._run(graph, request)
         self.assertEqual(len(dispatcher.calls), 1)
-        self.assertIn("[local_rag]", state["final_answer"])
+        self.assertIn("[local_paper]", state["final_answer"])
         task = store.load_workspace("conversation-1").task_plan.tasks[0]
         self.assertEqual(task.status, "completed")
 
@@ -373,7 +377,7 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
         )
         state = await self._run(graph, request)
         self.assertEqual(len(dispatcher.calls), 1)
-        self.assertIn("[dynamic_tools]", state["final_answer"])
+        self.assertIn("[external]", state["final_answer"])
 
     async def test_hybrid_sequence_runs_local_then_dynamic(self) -> None:
         plan = _plan_decision(
@@ -451,7 +455,7 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
         state = await self._run(graph, request)
         self.assertEqual(planner.calls, 2)
         self.assertEqual(len(dispatcher.calls), 3)
-        self.assertIn("[local_rag]", state["final_answer"])
+        self.assertIn("[local_paper]", state["final_answer"])
 
     async def test_approval_pause_commits_waiting(self) -> None:
         plan = _plan_decision((_task(task_id="save", capability="dynamic_tools"),))

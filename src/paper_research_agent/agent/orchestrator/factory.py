@@ -20,6 +20,7 @@ from paper_research_agent.agent.orchestrator.runtime import (
     ConversationClearer,
     MainAgentRuntime,
 )
+from paper_research_agent.agent.orchestrator.synthesizer import AnswerSynthesizer
 from paper_research_agent.conversation.store import ConversationStore
 
 
@@ -31,6 +32,7 @@ def build_main_agent_runtime(
     goal_reconciler: GoalReconciler,
     task_planner: TaskPlanner,
     dispatcher: ChildGraphDispatcher,
+    synthesizer: AnswerSynthesizer | None = None,
     timeout_seconds: float = 180,
     max_child_calls: int = MAX_CHILD_CALLS_PER_RUN,
     max_replans: int = MAX_REPLANS_PER_RUN,
@@ -47,6 +49,7 @@ def build_main_agent_runtime(
         goal_reconciler=goal_reconciler,
         task_planner=task_planner,
         dispatcher=dispatcher,
+        synthesizer=synthesizer,
         max_child_calls=max_child_calls,
         max_replans=max_replans,
         checkpointer=checkpointer,
