@@ -4,14 +4,102 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from paper_research_agent.agent.orchestrator.artifacts import DynamicToolArtifact
+from paper_research_agent.agent.orchestrator.models import (
+    ChildTaskResult,
+    MainAgentResult,
+)
 from paper_research_agent.conversation.models import (
     ConversationCandidate,
     ConversationResolution,
 )
-from paper_research_agent.conversation.store import SQLiteConversationStore
+from paper_research_agent.conversation.store import (
+    InMemoryConversationStore,
+    SQLiteConversationStore,
+)
 
 
 class ConversationStoreTests(unittest.TestCase):
+    def test_agent_request_id_cannot_cross_conversations(self) -> None:
+        stores = [InMemoryConversationStore()]
+        with tempfile.TemporaryDirectory() as directory:
+            stores.append(SQLiteConversationStore(Path(directory) / "conversation.sqlite3"))
+            for store in stores:
+                store.begin_agent_run(
+                    request_id="request-shared",
+                    conversation_id="conversation-a",
+                    user_question="first",
+                )
+                with self.assertRaisesRegex(ValueError, "another conversation"):
+                    store.begin_agent_run(
+                        request_id="request-shared",
+                        conversation_id="conversation-b",
+                        user_question="second",
+                    )
+
+    def test_agent_checkpoint_threads_are_exact_and_removed_by_clear(self) -> None:
+        stores = [InMemoryConversationStore()]
+        with tempfile.TemporaryDirectory() as directory:
+            stores.append(SQLiteConversationStore(Path(directory) / "checkpoint.sqlite3"))
+            for store in stores:
+                started = store.begin_agent_run(
+                    request_id="request-checkpoint",
+                    conversation_id="conversation-a",
+                    user_question="first",
+                )
+                result = MainAgentResult(
+                    run_id=started.run_id,
+                    request_id=started.request_id,
+                    conversation_id=started.conversation_id,
+                    status="completed",
+                    answer="done",
+                    child_results=(
+                        ChildTaskResult(
+                            child_run_id="child-1",
+                            task_id="task-1",
+                            capability="dynamic_tools",
+                            status="completed",
+                            artifact=DynamicToolArtifact(text="done"),
+                        ),
+                    ),
+                    workspace_version=1,
+                )
+                resolution = ConversationResolution(
+                    original_question="first",
+                    standalone_question="first",
+                    chinese_query="first",
+                    confidence=1,
+                )
+                outcome = store.commit_agent_run(
+                    run_id=started.run_id,
+                    turn_id=started.turn_id,
+                    expected_workspace_version=0,
+                    workspace=started.workspace,
+                    route="dynamic_tools",
+                    status="completed",
+                    resolution=resolution,
+                    assistant_summary="done",
+                    source_ids=(),
+                    result=result,
+                )
+                self.assertTrue(outcome.committed)
+                threads = store.agent_checkpoint_threads("conversation-a")
+                self.assertEqual(
+                    threads.main,
+                    (f"main::conversation-a::{started.run_id}",),
+                )
+                self.assertEqual(
+                    threads.research,
+                    (f"conversation-a::{started.run_id}::task-1",),
+                )
+
+                store.clear("conversation-a")
+
+                self.assertEqual(
+                    store.agent_checkpoint_threads("conversation-a").main,
+                    (),
+                )
+
     def test_turn_lifecycle_is_isolated_and_clear_removes_every_turn(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = SQLiteConversationStore(Path(directory) / "conversation.sqlite3")

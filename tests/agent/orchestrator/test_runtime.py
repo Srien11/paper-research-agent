@@ -78,13 +78,55 @@ class MainAgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.workspace_version, 3)
 
     async def test_run_times_out_when_graph_is_slow(self) -> None:
+        store = InMemoryConversationStore()
         runtime = MainAgentRuntime(
             graph=_FakeGraph(delay=5),
-            repository=InMemoryConversationStore(),
+            repository=store,
             timeout_seconds=0.1,
         )
         with self.assertRaises(TimeoutError):
             await runtime.run(_request())
+        retry = store.begin_agent_run(
+            request_id="request-1",
+            conversation_id="conversation-1",
+            user_question="重试",
+        )
+        self.assertEqual(retry.outcome, "failed_cached")
+        self.assertEqual(store.history("conversation-1")[0].status, "failed")
+
+    async def test_same_request_concurrent_callers_share_one_graph_task(self) -> None:
+        graph = _FakeGraph(delay=0.1)
+        runtime = MainAgentRuntime(
+            graph=graph,
+            repository=InMemoryConversationStore(),
+            timeout_seconds=5,
+        )
+
+        first, second = await asyncio.gather(
+            runtime.run(_request()),
+            runtime.run(_request()),
+        )
+
+        self.assertEqual(graph.calls, 1)
+        self.assertEqual(first.run_id, second.run_id)
+
+    async def test_cancelled_caller_does_not_cancel_shared_business_run(self) -> None:
+        graph = _FakeGraph(delay=0.1)
+        runtime = MainAgentRuntime(
+            graph=graph,
+            repository=InMemoryConversationStore(),
+            timeout_seconds=5,
+        )
+        disconnected = asyncio.create_task(runtime.run(_request()))
+        await asyncio.sleep(0.02)
+        disconnected.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await disconnected
+
+        recovered = await runtime.run(_request())
+
+        self.assertEqual(recovered.status, "completed")
+        self.assertEqual(graph.calls, 1)
 
     async def test_different_conversations_run_in_parallel(self) -> None:
         graph = _FakeGraph(delay=0.2)
@@ -114,7 +156,9 @@ class MainAgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         started = asyncio.get_running_loop().time()
         first = asyncio.create_task(runtime.run(_request(conversation_id="a")))
-        second = asyncio.create_task(runtime.run(_request(conversation_id="a")))
+        second = asyncio.create_task(
+            runtime.run(_request(conversation_id="a", request_id="request-2"))
+        )
         await asyncio.gather(first, second)
         elapsed = asyncio.get_running_loop().time() - started
         self.assertGreaterEqual(elapsed, 0.19)

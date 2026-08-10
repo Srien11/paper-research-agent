@@ -29,6 +29,14 @@ from paper_research_agent.conversation.models import (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class AgentCheckpointThreads:
+    """Exact checkpoint IDs owned by one conversation."""
+
+    main: tuple[str, ...] = ()
+    research: tuple[str, ...] = ()
+
+
 class ConversationStore(Protocol):
     def begin_turn(self, conversation_id: str, user_question: str) -> ConversationTurn: ...
 
@@ -84,6 +92,10 @@ class ConversationStore(Protocol):
         self, *, request_id: str, approval_request_id: str
     ) -> AgentApprovalClaim | None: ...
 
+    def agent_checkpoint_threads(
+        self, conversation_id: str
+    ) -> AgentCheckpointThreads: ...
+
     def clear(self, conversation_id: str) -> int: ...
 
 
@@ -136,11 +148,15 @@ class SQLiteConversationStore:
         with self._lock, closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
-                "SELECT run_id, turn_id, status, result_json FROM main_agent_runs "
+                "SELECT run_id, turn_id, status, result_json, conversation_id "
+                "FROM main_agent_runs "
                 "WHERE request_id = ?",
                 (normalized_request,),
             ).fetchone()
             if existing is not None:
+                if str(existing[4]) != normalized_id:
+                    connection.rollback()
+                    raise ValueError("request_id belongs to another conversation")
                 run_id = str(existing[0])
                 turn_id = str(existing[1])
                 workspace = self._workspace_row(connection, normalized_id)
@@ -610,6 +626,29 @@ class SQLiteConversationStore:
             )
         return int(cursor.rowcount)
 
+    def agent_checkpoint_threads(
+        self, conversation_id: str
+    ) -> AgentCheckpointThreads:
+        normalized = _conversation_id(conversation_id)
+        with self._lock, closing(self._connect()) as connection:
+            rows = connection.execute(
+                "SELECT run_id, result_json FROM main_agent_runs "
+                "WHERE conversation_id = ? ORDER BY created_at, run_id",
+                (normalized,),
+            ).fetchall()
+        main = tuple(f"main::{normalized}::{row[0]!s}" for row in rows)
+        research: list[str] = []
+        for run_id, result_json in rows:
+            if result_json is None:
+                continue
+            result = MainAgentResult.model_validate_json(str(result_json))
+            research.extend(
+                f"{normalized}::{run_id!s}::{child.task_id}"
+                for child in result.child_results
+                if child.capability == "dynamic_tools"
+            )
+        return AgentCheckpointThreads(main=main, research=tuple(research))
+
     def episodes(
         self, conversation_id: str, *, limit: int = 100
     ) -> tuple[ConversationEpisode, ...]:
@@ -821,6 +860,8 @@ class InMemoryConversationStore:
         with self._lock:
             existing = self._runs.get(normalized_request)
             if existing is not None:
+                if existing.conversation_id != normalized_id:
+                    raise ValueError("request_id belongs to another conversation")
                 workspace = self._workspaces.get(normalized_id)
                 if workspace is None:
                     raise ValueError("conversation workspace not found")
@@ -895,7 +936,7 @@ class InMemoryConversationStore:
                 conversation_id=normalized_id,
                 turn_id=turn_id,
                 status="running",
-                base_workspace_version=0,
+                base_workspace_version=workspace.version,
             )
         return AgentRunStart(
             run_id=run_id,
@@ -1148,6 +1189,31 @@ class InMemoryConversationStore:
             ]:
                 self._runs.pop(request_id, None)
         return len(targets)
+
+    def agent_checkpoint_threads(
+        self, conversation_id: str
+    ) -> AgentCheckpointThreads:
+        normalized = _conversation_id(conversation_id)
+        with self._lock:
+            records = sorted(
+                (
+                    record
+                    for record in self._runs.values()
+                    if record.conversation_id == normalized
+                ),
+                key=lambda record: record.run_id,
+            )
+            main = tuple(
+                f"main::{normalized}::{record.run_id}" for record in records
+            )
+            research = tuple(
+                f"{normalized}::{record.run_id}::{child.task_id}"
+                for record in records
+                if record.result is not None
+                for child in record.result.child_results
+                if child.capability == "dynamic_tools"
+            )
+        return AgentCheckpointThreads(main=main, research=research)
 
     def episodes(
         self, conversation_id: str, *, limit: int = 100

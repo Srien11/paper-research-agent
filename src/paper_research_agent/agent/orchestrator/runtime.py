@@ -42,12 +42,39 @@ class MainAgentRuntime:
         self._close = close
         self._clear = clear
         self._locks: dict[str, asyncio.Lock] = {}
+        self._inflight: dict[str, asyncio.Task[MainAgentResult]] = {}
+        self._inflight_conversations: dict[str, str] = {}
         self._guard = asyncio.Lock()
         self._closed = False
 
     async def run(self, request: MainAgentRequest) -> MainAgentResult:
-        if self._closed:
-            raise RuntimeError("main agent runtime is closed")
+        async with self._guard:
+            if self._closed:
+                raise RuntimeError("main agent runtime is closed")
+            task = self._inflight.get(request.request_id)
+            if task is not None:
+                if (
+                    self._inflight_conversations[request.request_id]
+                    != request.conversation_id
+                ):
+                    raise ValueError("request_id belongs to another conversation")
+            else:
+                task = asyncio.create_task(
+                    self._run_serialized(request),
+                    name=f"main-agent::{request.request_id}",
+                )
+                self._inflight[request.request_id] = task
+                self._inflight_conversations[request.request_id] = (
+                    request.conversation_id
+                )
+                task.add_done_callback(
+                    lambda completed, request_id=request.request_id: self._task_done(
+                        request_id, completed
+                    )
+                )
+        return await asyncio.shield(task)
+
+    async def _run_serialized(self, request: MainAgentRequest) -> MainAgentResult:
         lock = await self._lock_for(request.conversation_id)
         async with lock:
             start = await asyncio.to_thread(
@@ -72,7 +99,29 @@ class MainAgentRuntime:
                         },
                     )
             except TimeoutError:
+                await asyncio.to_thread(
+                    self._repository.fail_agent_run,
+                    run_id=start.run_id,
+                    turn_id=start.turn_id,
+                    reason_code="runtime_timeout",
+                )
                 raise TimeoutError("main agent run exceeded its total deadline") from None
+            except asyncio.CancelledError:
+                await asyncio.to_thread(
+                    self._repository.fail_agent_run,
+                    run_id=start.run_id,
+                    turn_id=start.turn_id,
+                    reason_code="runtime_cancelled",
+                )
+                raise
+            except Exception:
+                await asyncio.to_thread(
+                    self._repository.fail_agent_run,
+                    run_id=start.run_id,
+                    turn_id=start.turn_id,
+                    reason_code="runtime_error",
+                )
+                raise
             return _result_from_state(state, request)
 
     async def resume_approval(
@@ -89,18 +138,45 @@ class MainAgentRuntime:
     async def clear(self, conversation_id: str) -> None:
         if self._closed:
             raise RuntimeError("main agent runtime is closed")
-        async with self._guard:
-            self._locks.pop(conversation_id, None)
-        if self._clear is not None:
-            await self._clear(conversation_id)
+        lock = await self._lock_for(conversation_id)
+        async with lock:
+            if self._clear is not None:
+                await self._clear(conversation_id)
+            async with self._guard:
+                if self._locks.get(conversation_id) is lock:
+                    self._locks.pop(conversation_id, None)
 
     async def aclose(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        self._locks.clear()
+        async with self._guard:
+            if self._closed:
+                return
+            self._closed = True
+            tasks = tuple(self._inflight.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        async with self._guard:
+            self._inflight.clear()
+            self._inflight_conversations.clear()
+            self._locks.clear()
         if self._close is not None:
             await self._close()
+
+    def _task_done(
+        self, request_id: str, task: asyncio.Task[MainAgentResult]
+    ) -> None:
+        if not task.cancelled():
+            task.exception()
+        asyncio.create_task(self._release_inflight(request_id, task))
+
+    async def _release_inflight(
+        self, request_id: str, task: asyncio.Task[MainAgentResult]
+    ) -> None:
+        async with self._guard:
+            if self._inflight.get(request_id) is task:
+                self._inflight.pop(request_id, None)
+                self._inflight_conversations.pop(request_id, None)
 
     async def _lock_for(self, conversation_id: str) -> asyncio.Lock:
         async with self._guard:

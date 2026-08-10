@@ -931,6 +931,11 @@ def create_app(
             chat_runtime = cast(WebRuntime | None, request.app.state.chat_runtime)
             if chat_runtime is not None and chat_runtime is not rag_runtime:
                 await chat_runtime.clear_conversation(session.conversation_id)
+            main_runtime = cast(
+                MainAgentRuntime | None, request.app.state.main_agent_runtime
+            )
+            if main_runtime is not None:
+                await main_runtime.clear(session.conversation_id)
             await conversation.clear(session.conversation_id)
         except Exception as error:  # noqa: BLE001 - runtime is an isolation boundary
             raise _runtime_error_response(error) from None

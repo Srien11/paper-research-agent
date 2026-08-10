@@ -30,9 +30,10 @@ class _Checkpoint:
     def __init__(self) -> None:
         self.checkpointer = object()
         self.close_count = 0
+        self.cleared_threads: list[tuple[str, ...]] = []
 
-    async def clear(self, conversation_id: str) -> None:
-        del conversation_id
+    async def clear_threads(self, thread_ids: tuple[str, ...]) -> None:
+        self.cleared_threads.append(thread_ids)
 
     async def aclose(self) -> None:
         self.close_count += 1
@@ -94,6 +95,16 @@ class ApplicationBootstrapTests(unittest.IsolatedAsyncioTestCase):
                 build_main.call_args.kwargs["store"], services.conversation_store
             )
             self.assertIs(build_main.call_args.kwargs["checkpointer"], checkpoint.checkpointer)
+            started = services.conversation_store.begin_agent_run(
+                request_id="request-checkpoint",
+                conversation_id="conversation-a",
+                user_question="first",
+            )
+            await build_main.call_args.kwargs["clear"]("conversation-a")
+            self.assertEqual(
+                checkpoint.cleared_threads,
+                [(f"main::conversation-a::{started.run_id}",)],
+            )
 
             await services.aclose()
             await services.aclose()

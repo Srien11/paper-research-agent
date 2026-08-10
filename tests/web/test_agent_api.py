@@ -21,6 +21,13 @@ class _LegacyRuntime:
     is_ready = True
     is_busy = False
 
+    def __init__(self) -> None:
+        self.clear_calls: list[str] = []
+
+    async def clear_conversation(self, conversation_id: str) -> int:
+        self.clear_calls.append(conversation_id)
+        return 0
+
     async def aclose(self) -> None:
         return None
 
@@ -40,6 +47,7 @@ class _MainRuntime:
         self.requests: list[object] = []
         self.resume_calls: list[tuple[str, bool]] = []
         self.error: Exception | None = None
+        self.clear_calls: list[str] = []
 
     async def run(self, request: object) -> MainAgentResult:
         self.requests.append(request)
@@ -94,6 +102,9 @@ class _MainRuntime:
         self.store.results[request_id] = result
         return result
 
+    async def clear(self, conversation_id: str) -> None:
+        self.clear_calls.append(conversation_id)
+
 
 def _events(response: object) -> list[dict[str, object]]:
     text = str(response.text)
@@ -104,6 +115,7 @@ class MainAgentApiTests(unittest.TestCase):
     def setUp(self) -> None:
         self.store = _RecordingStore()
         self.main = _MainRuntime(self.store)
+        self.legacy = _LegacyRuntime()
         config = WebConfig(
             credentials=OwnerCredentials(username="owner", password="correct-password"),
             session_secret=b"s" * 32,
@@ -115,7 +127,7 @@ class MainAgentApiTests(unittest.TestCase):
         self.client_context = TestClient(
             create_app(
                 config=config,
-                runtime=_LegacyRuntime(),  # type: ignore[arg-type]
+                runtime=self.legacy,  # type: ignore[arg-type]
                 serve_static=False,
                 conversation_store=self.store,
                 main_agent_runtime=self.main,  # type: ignore[arg-type]
@@ -287,6 +299,18 @@ class MainAgentApiTests(unittest.TestCase):
             f"/paper-research/api/files/{attachment_id}",
             headers={"Origin": ORIGIN},
         )
+
+    def test_new_conversation_clears_main_runtime_state(self) -> None:
+        previous = self._conversation_id()
+
+        response = self.client.delete(
+            "/paper-research/api/conversation",
+            headers={"Origin": ORIGIN},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.main.clear_calls, [previous])
+        self.assertEqual(self.legacy.clear_calls, [previous])
 
     def test_auth_origin_request_id_and_runtime_errors_fail_closed(self) -> None:
         payload = {"request_id": REQUEST_ID, "message": "hello"}

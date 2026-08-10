@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import warnings
 from collections.abc import Awaitable, Callable, Mapping
@@ -135,21 +136,9 @@ class _MainCheckpoint:
     connection: aiosqlite.Connection
     _closed: bool = False
 
-    async def clear(self, conversation_id: str) -> None:
-        escaped = (
-            conversation_id.replace("\\", "\\\\")
-            .replace("%", "\\%")
-            .replace("_", "\\_")
-        )
-        cursor = await self.connection.execute(
-            "SELECT DISTINCT thread_id FROM checkpoints "
-            "WHERE thread_id LIKE ? ESCAPE '\\'",
-            (f"main::{escaped}::%",),
-        )
-        rows = await cursor.fetchall()
-        await cursor.close()
-        for row in rows:
-            await self.checkpointer.adelete_thread(str(row[0]))
+    async def clear_threads(self, thread_ids: tuple[str, ...]) -> None:
+        for thread_id in thread_ids:
+            await self.checkpointer.adelete_thread(thread_id)
 
     async def aclose(self) -> None:
         if self._closed:
@@ -245,6 +234,16 @@ async def create_application_services(
                 runtime=cast(Any, chat), attachments=attachments
             )
             research_agent = getattr(rag, "research_agent", None)
+
+            async def clear_main_state(conversation_id: str) -> None:
+                threads = await asyncio.to_thread(
+                    store.agent_checkpoint_threads, conversation_id
+                )
+                await checkpoint.clear_threads(threads.main)
+                if research_agent is not None:
+                    for thread_id in threads.research:
+                        await research_agent.clear(thread_id)
+
             dispatcher = ChildGraphDispatcher(
                 direct_chat=conversation_executor,
                 local_rag=(RAGRuntimeChildExecutor(cast(Any, rag)) if rag else None),
@@ -262,7 +261,7 @@ async def create_application_services(
                 dispatcher=dispatcher,
                 timeout_seconds=environment.timeout_seconds,
                 checkpointer=checkpoint.checkpointer,
-                clear=checkpoint.clear,
+                clear=clear_main_state,
             )
             own(main)
         return ApplicationServices(
