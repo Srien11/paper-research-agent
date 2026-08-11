@@ -28,6 +28,15 @@ function attachDiagnostics(page, diagnostics) {
       diagnostics.httpErrors.push(`${response.status()} ${response.url()}`);
     }
   });
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (request.method() === "POST" && url.pathname === "/paper-research/api/agent/runs") {
+      diagnostics.agentRunRequests.push({ url: request.url(), body: request.postData() || "" });
+    }
+    if (["/paper-research/api/chat/stream", "/paper-research/api/ask", "/paper-research/api/tools/run"].includes(url.pathname)) {
+      diagnostics.legacyRequests.push(`${request.method()} ${url.pathname}`);
+    }
+  });
 }
 
 async function login(page) {
@@ -45,7 +54,14 @@ async function main() {
     launchOptions.executablePath = process.env.PRA_BROWSER_EXECUTABLE;
   }
   const browser = await chromium.launch(launchOptions);
-  const diagnostics = { console: [], pageErrors: [], failedRequests: [], httpErrors: [] };
+  const diagnostics = {
+    console: [],
+    pageErrors: [],
+    failedRequests: [],
+    httpErrors: [],
+    agentRunRequests: [],
+    legacyRequests: [],
+  };
   try {
     const desktop = await browser.newContext({ viewport: { width: 1440, height: 1000 } });
     const page = await desktop.newPage();
@@ -68,6 +84,16 @@ async function main() {
     }, null, { timeout: 90000 });
     const pendingRequest = await page.evaluate(() => localStorage.getItem("paper-research.pending-request.v1"));
     if (pendingRequest !== null) throw new Error("completed request_id was not cleared");
+    if (diagnostics.agentRunRequests.length !== 1) {
+      throw new Error(`expected one unified Agent request, got ${diagnostics.agentRunRequests.length}`);
+    }
+    const agentPayload = JSON.parse(diagnostics.agentRunRequests[0].body);
+    if (!/^req_[A-Za-z0-9_-]{16,}$/.test(agentPayload.request_id || "")) {
+      throw new Error("unified Agent request_id is missing or invalid");
+    }
+    if (diagnostics.legacyRequests.length) {
+      throw new Error(`legacy API was used: ${JSON.stringify(diagnostics.legacyRequests)}`);
+    }
     await page.locator("#inspector-content").waitFor({ state: "visible" });
     const inspectorText = await page.locator("#inspector-content").innerText();
     for (const expected of ["本地论文检索"]) {
