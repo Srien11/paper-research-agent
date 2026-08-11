@@ -281,6 +281,26 @@ class MainAgentRuntime:
         control = await self.load_control(request_id)
         if control is None:
             return None
+        state_reader = getattr(self._graph, "aget_state", None)
+        if callable(state_reader):
+            try:
+                snapshot = await state_reader(
+                    {
+                        "configurable": {
+                            "thread_id": (
+                                f"main::{control.conversation_id}::{control.run_id}"
+                            )
+                        }
+                    }
+                )
+                values = getattr(snapshot, "values", {})
+                draft = values.get("workspace_draft") if isinstance(values, dict) else None
+                if draft is not None:
+                    live_workspace = ConversationWorkspace.model_validate(draft)
+                    if live_workspace.conversation_id == control.conversation_id:
+                        return control, live_workspace
+            except Exception:  # noqa: BLE001 - checkpoints are a best-effort live view
+                snapshot = None
         workspace = await asyncio.to_thread(
             self._repository.load_workspace, control.conversation_id
         )

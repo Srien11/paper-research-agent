@@ -113,14 +113,22 @@ class SessionManagerTests(unittest.TestCase):
         token, created = self.manager.create()
         self.assertEqual(self.manager.resolve(token), created)
 
-        rotated = self.manager.rotate_conversation(token)
-        self.assertIsNotNone(rotated)
-        assert rotated is not None
+        rotated_pair = self.manager.rotate_conversation(token)
+        self.assertIsNotNone(rotated_pair)
+        assert rotated_pair is not None
+        rotated_token, rotated = rotated_pair
         self.assertNotEqual(rotated.conversation_id, created.conversation_id)
         self.assertEqual(rotated.session_id, created.session_id)
+        self.assertEqual(self.manager.resolve(rotated_token), rotated)
 
         self.manager.revoke(token)
         self.assertIsNone(self.manager.resolve(token))
+
+    def test_signed_session_survives_server_restart(self) -> None:
+        token, created = self.manager.create()
+        restarted = SessionManager(b"s" * 32, 300, clock=lambda: self.now)
+
+        self.assertEqual(restarted.resolve(token), created)
 
     def test_tampered_and_malformed_tokens_are_rejected(self) -> None:
         token, _created = self.manager.create()

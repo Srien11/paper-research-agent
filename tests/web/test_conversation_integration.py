@@ -324,15 +324,15 @@ class CrossRouteConversationTests(unittest.TestCase):
             },
         )
 
-    def test_new_conversation_clears_both_runtimes_and_shared_index(self) -> None:
+    def test_new_conversation_preserves_old_runtime_and_shared_index(self) -> None:
         self.stream("大模型测评", rag_mode="disabled")
         response = self.client.delete(
             "/paper-research/api/conversation", headers={"Origin": ORIGIN}
         )
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(self.store.history(self.conversation_id), ())
-        self.assertEqual(self.rag.cleared, [self.conversation_id])
-        self.assertEqual(self.chat.cleared, [self.conversation_id])
+        self.assertEqual(len(self.store.history(self.conversation_id)), 1)
+        self.assertEqual(self.rag.cleared, [])
+        self.assertEqual(self.chat.cleared, [])
 
     def test_ambiguous_historical_topics_request_clarification_without_rag(self) -> None:
         self.stream("大模型测评方法", rag_mode="disabled")

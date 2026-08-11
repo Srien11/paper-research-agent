@@ -20,6 +20,64 @@ from paper_research_agent.conversation.store import (
 
 
 class ConversationStoreTests(unittest.TestCase):
+    def test_conversation_archive_includes_pending_question_and_full_answer(self) -> None:
+        stores = [InMemoryConversationStore()]
+        with tempfile.TemporaryDirectory() as directory:
+            stores.append(SQLiteConversationStore(Path(directory) / "archive.sqlite3"))
+            for store in stores:
+                started = store.begin_agent_run(
+                    request_id="request-archive",
+                    conversation_id="conversation-archive",
+                    user_question="What was my question?",
+                )
+                result = MainAgentResult(
+                    run_id=started.run_id,
+                    request_id=started.request_id,
+                    conversation_id=started.conversation_id,
+                    status="completed",
+                    answer="The complete persisted answer.",
+                    workspace_version=1,
+                )
+                outcome = store.commit_agent_run(
+                    run_id=started.run_id,
+                    turn_id=started.turn_id,
+                    expected_workspace_version=0,
+                    workspace=started.workspace,
+                    route="direct_chat",
+                    status="completed",
+                    resolution=ConversationResolution(
+                        original_question="What was my question?",
+                        standalone_question="What was my question?",
+                        chinese_query="What was my question?",
+                        confidence=1,
+                    ),
+                    assistant_summary="short summary",
+                    source_ids=(),
+                    result=result,
+                )
+                self.assertTrue(outcome.committed)
+                store.begin_agent_run(
+                    request_id="request-pending",
+                    conversation_id="conversation-pending",
+                    user_question="Resume this exact question",
+                )
+
+                archives = store.conversations()
+
+                completed = next(
+                    item
+                    for item in archives
+                    if item.conversation_id == "conversation-archive"
+                )
+                pending = next(
+                    item
+                    for item in archives
+                    if item.conversation_id == "conversation-pending"
+                )
+                self.assertEqual(completed.messages[-1].text, "The complete persisted answer.")
+                self.assertEqual(pending.messages[0].text, "Resume this exact question")
+                self.assertEqual(pending.messages[0].status, "pending")
+
     def test_agent_request_id_cannot_cross_conversations(self) -> None:
         stores = [InMemoryConversationStore()]
         with tempfile.TemporaryDirectory() as directory:

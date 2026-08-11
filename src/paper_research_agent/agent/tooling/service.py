@@ -9,6 +9,8 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 
+import httpx
+
 from paper_research_agent.agent.models import GetEvidenceInput, SearchCorpusInput
 from paper_research_agent.agent.observability import AgentEvent, AgentEventSink, emit_agent_event
 from paper_research_agent.agent.service import ResearchToolService
@@ -168,6 +170,16 @@ class ExtendedResearchToolkit:
                 reason_code=reason_code,
                 error_type=type(exc).__name__,
             )
+            if _provider_unavailable(exc) and effective_spec.risk in {
+                "local_read",
+                "network_read",
+            }:
+                return ToolExecutionResult(
+                    tool_name=tool.public_name,
+                    status="insufficient",
+                    trust=effective_spec.trust,
+                    summary={"reason": "provider_unavailable"},
+                )
             raise
         if result.status == "approval_required":
             self._event(
@@ -300,3 +312,12 @@ class ExtendedResearchToolkit:
 
 def _elapsed(started: float) -> float:
     return max(0.0, (time.perf_counter() - started) * 1000)
+
+
+def _provider_unavailable(error: Exception) -> bool:
+    if isinstance(error, httpx.RequestError):
+        return True
+    if isinstance(error, httpx.HTTPStatusError):
+        status_code = error.response.status_code
+        return status_code in {408, 429} or status_code >= 500
+    return False

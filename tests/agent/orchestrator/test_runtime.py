@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from datetime import UTC, datetime
+from types import SimpleNamespace
 
 from paper_research_agent.agent.observability import AgentEvent
 from paper_research_agent.agent.orchestrator.artifacts import ChatArtifact
 from paper_research_agent.agent.orchestrator.models import (
+    AgentTask,
     ChildTaskResult,
+    ConversationWorkspace,
     MainAgentRequest,
     MainAgentResult,
+    TaskPlan,
 )
 from paper_research_agent.agent.orchestrator.runtime import MainAgentRuntime
 from paper_research_agent.conversation.store import InMemoryConversationStore
@@ -33,11 +38,13 @@ class _FakeGraph:
         termination_reason: str = "completed",
         base_workspace_version: int = 0,
         state_updates: dict[str, object] | None = None,
+        snapshot_values: dict[str, object] | None = None,
     ) -> None:
         self.delay = delay
         self.termination_reason = termination_reason
         self.base_workspace_version = base_workspace_version
         self.state_updates = state_updates or {}
+        self.snapshot_values = snapshot_values or {}
         self.calls = 0
         self.configs: list[object] = []
 
@@ -56,6 +63,10 @@ class _FakeGraph:
             **self.state_updates,
         }
 
+    async def aget_state(self, config: object) -> object:
+        self.configs.append(config)
+        return SimpleNamespace(values=self.snapshot_values)
+
 
 class _RecordingSink:
     def __init__(self) -> None:
@@ -67,6 +78,44 @@ class _RecordingSink:
 
 
 class MainAgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_load_workspace_for_run_prefers_live_checkpoint_draft(self) -> None:
+        now = datetime.now(UTC)
+        goal_id = "a" * 32
+        workspace = ConversationWorkspace(
+            conversation_id="conversation-live",
+            updated_at=now,
+            task_plan=TaskPlan(
+                plan_id="b" * 32,
+                goal_id=goal_id,
+                created_at=now,
+                updated_at=now,
+                tasks=(
+                    AgentTask(
+                        task_id="task-live",
+                        goal_id=goal_id,
+                        title="Live checkpoint task",
+                        objective="Expose live task state",
+                        success_criteria=("Task is visible",),
+                        capability="direct_chat",
+                        status="running",
+                    ),
+                ),
+            ),
+        )
+        graph = _FakeGraph(snapshot_values={"workspace_draft": workspace})
+        store = InMemoryConversationStore()
+        store.begin_agent_run(
+            request_id="request-live-snapshot",
+            conversation_id="conversation-live",
+            user_question="show progress",
+        )
+        runtime = MainAgentRuntime(graph=graph, repository=store)
+
+        snapshot = await runtime.load_workspace_for_run("request-live-snapshot")
+
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot[1].task_plan.tasks[0].title, "Live checkpoint task")
+
     async def test_main_runtime_emits_safe_lifecycle_route_and_child_events(self) -> None:
         sink = _RecordingSink()
         child = ChildTaskResult(

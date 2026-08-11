@@ -222,6 +222,16 @@ class AgentEventProjector:
         }
         event_type = event_types[child.capability]
         artifact = child.artifact
+        artifact_metrics = getattr(artifact, "metrics", None)
+        metric_counts = (
+            {
+                key: int(value)
+                for key, value in artifact_metrics.model_dump().items()
+                if isinstance(value, int) and value >= 0
+            }
+            if artifact_metrics is not None
+            else {}
+        )
         output_ids = tuple(getattr(artifact, "output_attachment_ids", ()))
         tool_names = tuple(getattr(artifact, "tool_names", ()))
         source_ids = tuple(child.source_ids)
@@ -232,7 +242,7 @@ class AgentEventProjector:
                     source_ids=source_ids,
                     output_attachment_ids=output_ids,
                     tool_names=tool_names,
-                    counts={"source_count": len(source_ids)},
+                    counts={"source_count": len(source_ids), **metric_counts},
                     task_id=child.task_id,
                     capability=child.capability,
                 )
@@ -241,7 +251,7 @@ class AgentEventProjector:
             events.append(
                 self.event(
                     "task_completed",
-                    counts={"source_count": len(source_ids)},
+                    counts={"source_count": len(source_ids), **metric_counts},
                     task_id=child.task_id,
                     capability=child.capability,
                 )

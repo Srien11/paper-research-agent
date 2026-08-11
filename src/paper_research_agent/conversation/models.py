@@ -56,6 +56,22 @@ class ConversationTurn(FrozenConversationModel):
         return values
 
 
+class PersistedConversationMessage(FrozenConversationModel):
+    role: Literal["user", "assistant"]
+    text: str = Field(min_length=1, max_length=20_000)
+    status: str = Field(min_length=1, max_length=64)
+    created_at: datetime
+
+
+class PersistedConversation(FrozenConversationModel):
+    conversation_id: str = Field(min_length=1, max_length=256)
+    title: str = Field(min_length=1, max_length=200)
+    created_at: datetime
+    updated_at: datetime
+    messages: tuple[PersistedConversationMessage, ...] = Field(
+        default=(), max_length=1_000
+    )
+
 class ConversationEpisode(FrozenConversationModel):
     conversation_id: str = Field(min_length=1, max_length=256)
     episode_id: str = Field(pattern=r"^[0-9a-f]{16}$")

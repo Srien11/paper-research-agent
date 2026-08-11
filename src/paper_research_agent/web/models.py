@@ -143,6 +143,26 @@ class OperationResponse(WebModel):
     ok: Literal[True] = True
 
 
+class ConversationMessageResponse(WebModel):
+    role: Literal["user", "assistant"]
+    text: str = Field(min_length=1, max_length=20_000)
+    status: str = Field(min_length=1, max_length=64)
+    created_at: str = Field(min_length=1, max_length=64)
+
+
+class ConversationArchiveItemResponse(WebModel):
+    conversation_id: str = Field(min_length=1, max_length=256)
+    title: str = Field(min_length=1, max_length=200)
+    created_at: str = Field(min_length=1, max_length=64)
+    updated_at: str = Field(min_length=1, max_length=64)
+    messages: tuple[ConversationMessageResponse, ...] = Field(max_length=1_000)
+
+
+class ConversationArchiveResponse(WebModel):
+    current_conversation_id: str = Field(min_length=1, max_length=256)
+    conversations: tuple[ConversationArchiveItemResponse, ...] = Field(max_length=500)
+
+
 class AttachmentResponse(WebModel):
     attachment_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     filename: str = Field(min_length=1, max_length=180)

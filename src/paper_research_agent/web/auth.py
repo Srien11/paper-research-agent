@@ -79,6 +79,7 @@ class SessionManager:
         self._ttl_seconds = ttl_seconds
         self._clock = clock
         self._sessions: dict[str, OwnerSession] = {}
+        self._revoked: set[str] = set()
         self._lock = threading.Lock()
 
     def create(self) -> tuple[str, OwnerSession]:
@@ -105,8 +106,13 @@ class SessionManager:
                 return None
             parsed = json.loads(payload)
             session_id = parsed["sid"]
+            conversation_id = parsed["cid"]
             expires_at = parsed["exp"]
-            if not isinstance(session_id, str) or not isinstance(expires_at, int):
+            if (
+                not isinstance(session_id, str)
+                or not isinstance(conversation_id, str)
+                or not isinstance(expires_at, int)
+            ):
                 return None
         except (ValueError, KeyError, TypeError, json.JSONDecodeError):
             return None
@@ -115,12 +121,24 @@ class SessionManager:
             self.revoke(token)
             return None
         with self._lock:
+            if session_id in self._revoked:
+                return None
             session = self._sessions.get(session_id)
-            if session is None or session.expires_at != expires_at:
+            if session is None:
+                session = OwnerSession(
+                    session_id=session_id,
+                    conversation_id=conversation_id,
+                    expires_at=expires_at,
+                )
+                self._sessions[session_id] = session
+            if (
+                session.expires_at != expires_at
+                or session.conversation_id != conversation_id
+            ):
                 return None
             return session
 
-    def rotate_conversation(self, token: str) -> OwnerSession | None:
+    def rotate_conversation(self, token: str) -> tuple[str, OwnerSession] | None:
         current = self.resolve(token)
         if current is None:
             return None
@@ -133,7 +151,25 @@ class SessionManager:
             if current.session_id not in self._sessions:
                 return None
             self._sessions[current.session_id] = replacement
-        return replacement
+        return self._encode(replacement), replacement
+
+    def select_conversation(
+        self, token: str, conversation_id: str
+    ) -> tuple[str, OwnerSession] | None:
+        current = self.resolve(token)
+        normalized = conversation_id.strip()
+        if current is None or not normalized or len(normalized) > 256:
+            return None
+        replacement = OwnerSession(
+            session_id=current.session_id,
+            conversation_id=normalized,
+            expires_at=current.expires_at,
+        )
+        with self._lock:
+            if current.session_id not in self._sessions:
+                return None
+            self._sessions[current.session_id] = replacement
+        return self._encode(replacement), replacement
 
     def revoke(self, token: str | None) -> None:
         if token is None:
@@ -146,10 +182,15 @@ class SessionManager:
         if isinstance(session_id, str):
             with self._lock:
                 self._sessions.pop(session_id, None)
+                self._revoked.add(session_id)
 
     def _encode(self, session: OwnerSession) -> str:
         payload = json.dumps(
-            {"exp": session.expires_at, "sid": session.session_id},
+            {
+                "cid": session.conversation_id,
+                "exp": session.expires_at,
+                "sid": session.session_id,
+            },
             ensure_ascii=True,
             separators=(",", ":"),
             sort_keys=True,

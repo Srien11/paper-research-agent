@@ -22,6 +22,7 @@ from paper_research_agent.agent.orchestrator.models import (
     MainAgentResult,
     TaskPlan,
 )
+from paper_research_agent.conversation.models import ConversationResolution
 from paper_research_agent.conversation.store import InMemoryConversationStore
 from paper_research_agent.web.app import create_app
 from paper_research_agent.web.config import OwnerCredentials, WebConfig
@@ -285,6 +286,19 @@ class MainAgentApiTests(unittest.TestCase):
         self.assertEqual(explanation.status_code, 200, explanation.text)
         self.assertIn("先建立证据基础", explanation.json()["explanation"])
 
+    def test_plan_endpoint_returns_running_placeholder_before_plan_exists(self) -> None:
+        self.main.workspace = self.main.workspace.model_copy(
+            update={"active_goal": None, "task_plan": None}
+        )
+
+        response = self.client.get(
+            f"/paper-research/api/agent/runs/{REQUEST_ID}/plan"
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["control"]["status"], "running")
+        self.assertEqual(response.json()["tasks"], [])
+
     def test_duplicate_request_is_projected_as_reused_and_status_is_queryable(self) -> None:
         payload = {
             "request_id": REQUEST_ID,
@@ -414,17 +428,48 @@ class MainAgentApiTests(unittest.TestCase):
             headers={"Origin": ORIGIN},
         )
 
-    def test_new_conversation_clears_main_runtime_state(self) -> None:
+    def test_new_conversation_archives_server_history_without_deleting_it(self) -> None:
         previous = self._conversation_id()
+        turn = self.store.begin_turn(previous, "持久化问题")
+        self.store.complete_turn(
+            turn.turn_id,
+            route="normal_chat",
+            status="completed",
+            resolution=ConversationResolution(
+                original_question="持久化问题",
+                standalone_question="持久化问题",
+                chinese_query="持久化问题",
+                confidence=1,
+            ),
+            assistant_summary="持久化回答",
+        )
 
         response = self.client.delete(
             "/paper-research/api/conversation",
             headers={"Origin": ORIGIN},
         )
+        archive = self.client.get("/paper-research/api/conversations")
 
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(self.main.clear_calls, [previous])
-        self.assertEqual(self.legacy.clear_calls, [previous])
+        self.assertNotEqual(response.json()["conversation_id"], previous)
+        self.assertEqual(self.main.clear_calls, [])
+        self.assertEqual(self.legacy.clear_calls, [])
+        self.assertEqual(archive.status_code, 200, archive.text)
+        saved = next(
+            item
+            for item in archive.json()["conversations"]
+            if item["conversation_id"] == previous
+        )
+        self.assertEqual(saved["messages"][0]["text"], "持久化问题")
+        self.assertEqual(saved["messages"][1]["text"], "持久化回答")
+
+        activated = self.client.post(
+            f"/paper-research/api/conversations/{previous}/activate",
+            headers={"Origin": ORIGIN},
+            json={},
+        )
+        self.assertEqual(activated.status_code, 200, activated.text)
+        self.assertEqual(self._conversation_id(), previous)
 
     def test_auth_origin_request_id_and_runtime_errors_fail_closed(self) -> None:
         payload = {"request_id": REQUEST_ID, "message": "hello"}

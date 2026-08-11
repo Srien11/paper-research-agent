@@ -4,6 +4,8 @@ import asyncio
 import unittest
 from typing import Any
 
+import httpx
+
 from paper_research_agent.agent.observability import AgentEvent
 from paper_research_agent.agent.tooling.catalog import ExtendedToolPolicy, ToolSpec
 from paper_research_agent.agent.tooling.contracts import ToolExecutionResult
@@ -103,6 +105,44 @@ def _toolkit(
 
 
 class McpToolkitIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_network_read_http_failure_degrades_to_insufficient(self) -> None:
+        request = httpx.Request("GET", "https://api.example.test/papers")
+        response = httpx.Response(429, request=request)
+        provider = FakeProvider(
+            "builtin",
+            error=httpx.HTTPStatusError("rate limited", request=request, response=response),
+        )
+        tool = _tool(
+            name="search_scholarly_sources",
+            provider_id="builtin",
+            provider_kind="builtin",
+            risk="network_read",
+        )
+
+        result = await _toolkit(provider, tool).execute(
+            tool.public_name, {"query": "agent evaluation"}
+        )
+
+        self.assertEqual(result.status, "insufficient")
+        self.assertEqual(result.summary, {"reason": "provider_unavailable"})
+
+    async def test_non_retryable_network_response_is_not_hidden(self) -> None:
+        request = httpx.Request("GET", "https://api.example.test/papers")
+        response = httpx.Response(400, request=request)
+        error = httpx.HTTPStatusError("bad request", request=request, response=response)
+        provider = FakeProvider("builtin", error=error)
+        tool = _tool(
+            name="search_scholarly_sources",
+            provider_id="builtin",
+            provider_kind="builtin",
+            risk="network_read",
+        )
+
+        with self.assertRaises(httpx.HTTPStatusError):
+            await _toolkit(provider, tool).execute(
+                tool.public_name, {"query": "agent evaluation"}
+            )
+
     async def test_dispatches_qualified_tool_and_overrides_forged_trust(self) -> None:
         provider = FakeProvider(
             "zotero",

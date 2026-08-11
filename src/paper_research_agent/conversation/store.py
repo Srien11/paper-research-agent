@@ -36,6 +36,8 @@ from paper_research_agent.conversation.models import (
     ConversationResolution,
     ConversationStatus,
     ConversationTurn,
+    PersistedConversation,
+    PersistedConversationMessage,
 )
 
 
@@ -66,6 +68,8 @@ class ConversationStore(Protocol):
     def history(
         self, conversation_id: str, *, limit: int = 500
     ) -> tuple[ConversationTurn, ...]: ...
+
+    def conversations(self, *, limit: int = 100) -> tuple[PersistedConversation, ...]: ...
 
     def episodes(
         self, conversation_id: str, *, limit: int = 100
@@ -795,6 +799,33 @@ class SQLiteConversationStore:
         rows = self._rows(conversation_id, limit=limit)
         return tuple(reversed(tuple(self._row(row) for row in rows)))
 
+    def conversations(self, *, limit: int = 100) -> tuple[PersistedConversation, ...]:
+        if limit <= 0 or limit > 500:
+            raise ValueError("conversation list limit must be between 1 and 500")
+        with self._lock, closing(self._connect()) as connection:
+            conversation_ids = tuple(
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT conversation_id FROM conversation_turns "
+                    "GROUP BY conversation_id ORDER BY MAX(created_at) DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            )
+            dialogues: list[PersistedConversation] = []
+            for conversation_id in conversation_ids:
+                rows = connection.execute(
+                    "SELECT t.user_question, t.status, t.assistant_summary, "
+                    "t.created_at, t.completed_at, r.result_json "
+                    "FROM conversation_turns AS t "
+                    "LEFT JOIN main_agent_runs AS r ON r.turn_id = t.turn_id "
+                    "WHERE t.conversation_id = ? ORDER BY t.sequence",
+                    (conversation_id,),
+                ).fetchall()
+                dialogue = _persisted_dialogue(conversation_id, rows)
+                if dialogue is not None:
+                    dialogues.append(dialogue)
+        return tuple(dialogues)
+
     def clear(self, conversation_id: str) -> int:
         normalized = _conversation_id(conversation_id)
         with self._lock, closing(self._connect()) as connection, connection:
@@ -1486,6 +1517,37 @@ class InMemoryConversationStore:
             )
         return tuple(values[-limit:])
 
+    def conversations(self, *, limit: int = 100) -> tuple[PersistedConversation, ...]:
+        if limit <= 0 or limit > 500:
+            raise ValueError("conversation list limit must be between 1 and 500")
+        with self._lock:
+            turns = tuple(self._turns.values())
+            runs_by_turn = {
+                record.turn_id: record.result.model_dump_json()
+                for record in self._runs.values()
+                if record.result is not None
+            }
+        grouped: dict[str, list[tuple[object, ...]]] = {}
+        for turn in sorted(turns, key=lambda item: item.sequence):
+            grouped.setdefault(turn.conversation_id, []).append(
+                (
+                    turn.user_question,
+                    turn.status,
+                    turn.assistant_summary,
+                    turn.created_at.isoformat(),
+                    turn.completed_at.isoformat() if turn.completed_at else None,
+                    runs_by_turn.get(turn.turn_id),
+                )
+            )
+        dialogues = tuple(
+            dialogue
+            for conversation_id, rows in grouped.items()
+            if (dialogue := _persisted_dialogue(conversation_id, rows)) is not None
+        )
+        return tuple(
+            sorted(dialogues, key=lambda item: item.updated_at, reverse=True)[:limit]
+        )
+
     def clear(self, conversation_id: str) -> int:
         normalized = _conversation_id(conversation_id)
         with self._lock:
@@ -1546,6 +1608,67 @@ class InMemoryConversationStore:
                 updated_at=turn.completed_at or turn.created_at,
             )
         return tuple(sorted(latest.values(), key=lambda item: item.last_sequence)[-limit:])
+
+
+def _persisted_dialogue(
+    conversation_id: str, rows: Sequence[Sequence[object]]
+) -> PersistedConversation | None:
+    messages: list[PersistedConversationMessage] = []
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    title = ""
+    for row in rows:
+        question = str(row[0]).strip()
+        status = str(row[1])
+        turn_created = datetime.fromisoformat(str(row[3]))
+        turn_updated = (
+            datetime.fromisoformat(str(row[4])) if row[4] is not None else turn_created
+        )
+        if created_at is None or turn_created < created_at:
+            created_at = turn_created
+        if updated_at is None or turn_updated > updated_at:
+            updated_at = turn_updated
+        if not title:
+            title = question[:200]
+        messages.append(
+            PersistedConversationMessage(
+                role="user",
+                text=question,
+                status="sent" if status != "pending" else "pending",
+                created_at=turn_created,
+            )
+        )
+        answer = _persisted_answer(row[5]) or (
+            str(row[2]).strip() if row[2] is not None else ""
+        )
+        if answer:
+            messages.append(
+                PersistedConversationMessage(
+                    role="assistant",
+                    text=answer[:20_000],
+                    status=status,
+                    created_at=turn_updated,
+                )
+            )
+    if not messages or created_at is None or updated_at is None:
+        return None
+    return PersistedConversation(
+        conversation_id=conversation_id,
+        title=title or "未命名对话",
+        created_at=created_at,
+        updated_at=updated_at,
+        messages=tuple(messages),
+    )
+
+
+def _persisted_answer(result_json: object) -> str:
+    if result_json is None:
+        return ""
+    try:
+        result = MainAgentResult.model_validate_json(str(result_json))
+    except (ValueError, TypeError):
+        return ""
+    return result.answer.strip()
 
 
 def _conversation_id(value: str) -> str:

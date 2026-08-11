@@ -5,6 +5,8 @@ const API = Object.freeze({
   login: "api/login",
   logout: "api/logout",
   conversation: "api/conversation",
+  conversations: "api/conversations",
+  activateConversation: (conversationId) => `api/conversations/${encodeURIComponent(conversationId)}/activate`,
   agentRuns: "api/agent/runs",
   agentApproval: (requestId) => `api/agent/runs/${encodeURIComponent(requestId)}/approval`,
   agentPlan: (requestId) => `api/agent/runs/${encodeURIComponent(requestId)}/plan`,
@@ -31,6 +33,10 @@ const state = {
   activePlan: null,
   controlRevision: 0,
   planPollTimer: null,
+  runStartedAt: null,
+  runMetrics: {},
+  currentConversationId: null,
+  serverConversations: [],
 };
 
 const elements = {
@@ -118,6 +124,7 @@ function createPendingRequest(question) {
     question,
     ragMode: selectedRagMode(),
     attachmentIds: state.attachments.map((item) => item.attachment_id),
+    conversationId: state.currentConversationId,
   };
 }
 
@@ -140,7 +147,8 @@ function loadPendingRequest() {
       && ["disabled", "preferred", "required"].includes(value.ragMode)
       && Array.isArray(value.attachmentIds)
       && value.attachmentIds.length <= 5
-      && value.attachmentIds.every((item) => /^[0-9a-f]{32}$/.test(item));
+      && value.attachmentIds.every((item) => /^[0-9a-f]{32}$/.test(item))
+      && (value.conversationId === undefined || typeof value.conversationId === "string");
     if (!valid) return null;
     state.pendingRequest = value;
     return value;
@@ -187,13 +195,12 @@ async function request(path, options = {}) {
   return payload || {};
 }
 
-function setAuthenticated(authenticated) {
+function setAuthenticated(authenticated, session = null) {
   elements.loginView.hidden = authenticated;
   elements.appView.hidden = !authenticated;
   if (authenticated) {
-    restoreHistory();
-    const pendingRequest = loadPendingRequest();
-    if (pendingRequest) showNotice("检测到一条未完成请求，可输入原问题重试。", "warning");
+    if (session?.conversation_id) state.currentConversationId = session.conversation_id;
+    restoreServerHistory();
     window.requestAnimationFrame(() => elements.question.focus());
   } else {
     elements.username.value = "";
@@ -205,7 +212,7 @@ function setAuthenticated(authenticated) {
 async function checkSession() {
   try {
     const payload = await request(API.session, { method: "GET" });
-    setAuthenticated(payload.authenticated !== false);
+    setAuthenticated(payload.authenticated !== false, payload);
   } catch (error) {
     setAuthenticated(false);
     if (error.status !== 401) showLoginError("研究服务暂时不可用，请稍后刷新。", true);
@@ -236,8 +243,8 @@ async function handleLogin(event) {
   button.classList.add("is-loading");
   showLoginError("", false);
   try {
-    await request(API.login, { method: "POST", body: JSON.stringify({ username, password }) });
-    setAuthenticated(true);
+    const session = await request(API.login, { method: "POST", body: JSON.stringify({ username, password }) });
+    setAuthenticated(true, session);
   } catch (error) {
     showLoginError(error.message, true);
     elements.password.select();
@@ -336,6 +343,8 @@ async function handleAsk(event) {
     }
   } finally {
     setBusy(false);
+    await refreshPlanControl();
+    await restoreServerHistory(false);
     scrollMessages();
     if (!elements.appView.hidden) elements.question.focus();
   }
@@ -389,6 +398,7 @@ async function consumeAgentStream(response, pendingRequest, sourceNote = "") {
   elements.tokenMetrics.replaceChildren();
   elements.generationMetrics.replaceChildren();
   elements.citationMap.replaceChildren();
+  renderRunMetrics();
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -409,6 +419,8 @@ async function consumeAgentStream(response, pendingRequest, sourceNote = "") {
       const event = JSON.parse(line);
       if (event.type === "run_reused") {
         meta.append(createElement("small", "source-note", "已复用原请求结果"));
+      } else if (event.type === "task_started") {
+        renderAgentInspectorEvent("节点执行中", event);
       } else if (event.type === "route_selected") {
         route = event.capability || route;
         const labels = {
@@ -438,6 +450,9 @@ async function consumeAgentStream(response, pendingRequest, sourceNote = "") {
           if (/^[0-9a-f]{32}$/.test(id) && !outputAttachmentIds.includes(id)) outputAttachmentIds.push(id);
         });
         renderAgentInspectorEvent("文件输出", event);
+      } else if (event.type === "task_completed") {
+        mergeRunMetrics(event.counts);
+        renderRunMetrics(state.activePlan);
       } else if (event.type === "approval_required" && event.pending_approval) {
         waitingApproval = true;
         openToolApproval(event.pending_approval, pendingRequest.requestId);
@@ -454,8 +469,10 @@ async function consumeAgentStream(response, pendingRequest, sourceNote = "") {
         }
       } else if (event.type === "done") {
         finalStatus = event.status || "failed";
+        stopPlanRefresh();
       } else if (event.type === "error") {
         finalStatus = "failed";
+        stopPlanRefresh();
       }
     }
     if (done) break;
@@ -488,12 +505,20 @@ async function consumeAgentStream(response, pendingRequest, sourceNote = "") {
 }
 
 function activatePlanControl(requestId) {
+  stopPlanRefresh();
   state.activeRunId = requestId;
   state.activePlan = null;
   state.controlRevision = 0;
+  state.runStartedAt = performance.now();
+  state.runMetrics = {};
   elements.planControl.hidden = false;
   elements.planControlStatus.textContent = "启动中";
   elements.planTaskList.replaceChildren(createElement("p", "history-empty", "正在生成可编辑计划…"));
+  elements.inspectorEmpty.hidden = true;
+  elements.inspectorContent.hidden = false;
+  elements.routeMetrics.replaceChildren();
+  appendMetric(elements.routeMetrics, "节点状态", "正在生成计划");
+  renderRunMetrics();
   syncPlanButtons("running");
   schedulePlanRefresh(250);
 }
@@ -501,6 +526,11 @@ function activatePlanControl(requestId) {
 function schedulePlanRefresh(delay = 800) {
   if (state.planPollTimer) window.clearTimeout(state.planPollTimer);
   state.planPollTimer = window.setTimeout(() => refreshPlanControl(), delay);
+}
+
+function stopPlanRefresh() {
+  if (state.planPollTimer) window.clearTimeout(state.planPollTimer);
+  state.planPollTimer = null;
 }
 
 async function refreshPlanControl() {
@@ -512,10 +542,17 @@ async function refreshPlanControl() {
     renderPlanControl(plan);
     if (["running", "pause_requested", "resuming", "cancel_requested"].includes(plan.control.status)) {
       schedulePlanRefresh(700);
+    } else {
+      stopPlanRefresh();
     }
   } catch (error) {
     if (error.status === 404 || error.status === 409) {
-      schedulePlanRefresh(500);
+      if (state.busy) schedulePlanRefresh(500);
+      else {
+        stopPlanRefresh();
+        elements.planControlStatus.textContent = "未生成计划";
+        elements.planTaskList.replaceChildren(createElement("p", "history-empty", "本次运行在计划生成前结束。"));
+      }
       return;
     }
     showToast(error.message);
@@ -551,6 +588,11 @@ function renderPlanControl(plan) {
   elements.planObjective.value = plan.objective || "";
   syncPlanButtons(status);
   elements.planTaskList.replaceChildren();
+  renderPlanNodeMetrics(plan);
+  renderRunMetrics(plan);
+  if (!plan.tasks.length) {
+    elements.planTaskList.append(createElement("p", "history-empty", "正在生成任务节点…"));
+  }
   plan.tasks.forEach((task, index) => {
     const card = createElement("article", "plan-task");
     const header = createElement("header");
@@ -628,6 +670,64 @@ function renderPlanControl(plan) {
     card.append(header, reason, usage, budgets, actions);
     elements.planTaskList.append(card);
   });
+}
+
+function renderPlanNodeMetrics(plan) {
+  elements.inspectorEmpty.hidden = true;
+  elements.inspectorContent.hidden = false;
+  elements.routeMetrics.replaceChildren();
+  appendMetric(elements.routeMetrics, "运行状态", planStatusLabel(plan.control.status));
+  plan.tasks.forEach((task, index) => {
+    appendMetric(
+      elements.routeMetrics,
+      `${index + 1}. ${task.title}`,
+      `${planStatusLabel(task.status)} · ${task.capability}`,
+    );
+  });
+}
+
+function mergeRunMetrics(counts) {
+  if (!counts || typeof counts !== "object") return;
+  [
+    "elapsed_ms",
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "estimated_context_tokens",
+    "token_budget",
+    "output_reserve_tokens",
+  ].forEach((key) => {
+    const value = Number(counts[key]);
+    if (Number.isFinite(value) && value >= 0) {
+      if (["token_budget", "output_reserve_tokens"].includes(key)) {
+        state.runMetrics[key] = Math.max(Number(state.runMetrics[key] || 0), value);
+      } else state.runMetrics[key] = Number(state.runMetrics[key] || 0) + value;
+    }
+  });
+  if (!state.runMetrics.total_tokens) {
+    state.runMetrics.total_tokens = Number(state.runMetrics.input_tokens || 0)
+      + Number(state.runMetrics.output_tokens || 0);
+  }
+}
+
+function renderRunMetrics(plan = null) {
+  elements.inspectorEmpty.hidden = true;
+  elements.inspectorContent.hidden = false;
+  const metrics = state.runMetrics || {};
+  const taskElapsedMs = plan && Array.isArray(plan.tasks)
+    ? plan.tasks.reduce((total, task) => total + Number(task.elapsed_seconds || 0) * 1000, 0)
+    : 0;
+  const wallElapsedMs = state.runStartedAt === null ? 0 : performance.now() - state.runStartedAt;
+  const elapsedMs = Math.max(Number(metrics.elapsed_ms || 0), taskElapsedMs, wallElapsedMs);
+  elements.tokenMetrics.replaceChildren();
+  appendMetric(elements.tokenMetrics, "已估算 Token", metrics.estimated_context_tokens ?? "—");
+  appendMetric(elements.tokenMetrics, "上下文总预算", metrics.token_budget ?? "—");
+  appendMetric(elements.tokenMetrics, "回答预留", metrics.output_reserve_tokens ?? "—");
+  elements.generationMetrics.replaceChildren();
+  appendMetric(elements.generationMetrics, "运行耗时", formatLatency(elapsedMs));
+  appendMetric(elements.generationMetrics, "输入 Token", metrics.input_tokens ?? 0);
+  appendMetric(elements.generationMetrics, "输出 Token", metrics.output_tokens ?? 0);
+  appendMetric(elements.generationMetrics, "总 Token", metrics.total_tokens ?? 0);
 }
 
 async function sendRunControl(action) {
@@ -1166,17 +1266,81 @@ function closeInspector() {
   elements.inspectorScrim.hidden = true;
 }
 
+async function restoreServerHistory(renderCurrent = true) {
+  try {
+    const payload = await request(API.conversations);
+    state.currentConversationId = payload.current_conversation_id || state.currentConversationId;
+    state.serverConversations = Array.isArray(payload.conversations) ? payload.conversations : [];
+    const current = state.serverConversations.find(
+      (item) => item.conversation_id === state.currentConversationId,
+    );
+    if (current) {
+      state.history = current.messages.map((item) => ({
+        role: item.role,
+        text: item.text,
+        status: item.status,
+      }));
+      try {
+        sessionStorage.setItem(STORAGE_KEY, JSON.stringify(state.history));
+      } catch (_error) {
+        // The server remains authoritative when browser caching is unavailable.
+      }
+      if (renderCurrent && !state.viewingArchive) showCurrentDialogue();
+    } else if (renderCurrent && !state.viewingArchive) {
+      state.history = [];
+      renderDialogueMessages([], "新研究会话");
+    }
+    renderHistoryList();
+    const pendingRequest = loadPendingRequest();
+    if (pendingRequest) {
+      elements.question.value = pendingRequest.question;
+      showNotice(`已恢复未完成的原问题：“${pendingRequest.question}”。可直接点击发送重试。`, "warning");
+    }
+  } catch (_error) {
+    restoreHistory();
+  }
+}
+
+async function activatePersistedConversation(dialogue) {
+  if (state.busy) return;
+  try {
+    const session = await request(API.activateConversation(dialogue.conversation_id), {
+      method: "POST",
+      body: "{}",
+    });
+    state.currentConversationId = session.conversation_id;
+    state.history = dialogue.messages.map((item) => ({
+      role: item.role,
+      text: item.text,
+      status: item.status,
+    }));
+    const pendingRequest = loadPendingRequest();
+    if (pendingRequest?.conversationId && pendingRequest.conversationId !== session.conversation_id) {
+      elements.question.value = "";
+      hideNotice();
+    } else if (pendingRequest) {
+      elements.question.value = pendingRequest.question;
+      showNotice(`已恢复未完成的原问题：“${pendingRequest.question}”。可直接点击发送重试。`, "warning");
+    }
+    state.viewingArchive = false;
+    showCurrentDialogue();
+    renderHistoryList();
+  } catch (error) {
+    showNotice(error.message, "error");
+  }
+}
+
 async function startNewConversation() {
   if (state.busy) return;
   elements.newConversation.disabled = true;
   try {
-    archiveCurrentDialogue();
-    await request(API.conversation, { method: "DELETE" });
+    const session = await request(API.conversation, { method: "DELETE" });
+    state.currentConversationId = session.conversation_id;
     clearPendingRequest();
     clearLocalDialogue();
-    renderHistoryList();
     resetWorkspace();
-    showToast("已开始新对话，上一轮短期记忆不再参与检索。 ");
+    await restoreServerHistory(false);
+    showToast("已开始新对话，旧对话已保存在左侧。 ");
   } catch (error) {
     if (error.status === 401) setAuthenticated(false);
     else showNotice(error.message, "error");
@@ -1206,6 +1370,22 @@ function resetWorkspace() {
 function saveHistoryItem(item) {
   state.history.push(item);
   state.history = state.history.slice(-24);
+  if (state.currentConversationId) {
+    const now = new Date().toISOString();
+    const title = state.history.find((entry) => entry.role === "user")?.text || "未命名对话";
+    const persisted = {
+      conversation_id: state.currentConversationId,
+      title,
+      created_at: now,
+      updated_at: now,
+      messages: state.history.map((entry) => ({ ...entry, created_at: now })),
+    };
+    const index = state.serverConversations.findIndex(
+      (entry) => entry.conversation_id === state.currentConversationId,
+    );
+    if (index >= 0) state.serverConversations[index] = persisted;
+    else state.serverConversations.unshift(persisted);
+  }
   try {
     sessionStorage.setItem(STORAGE_KEY, JSON.stringify(state.history));
     renderHistoryList();
@@ -1253,63 +1433,61 @@ function archiveCurrentDialogue() {
 }
 
 function renderHistoryList() {
-  let archives = [];
-  try {
-    archives = JSON.parse(sessionStorage.getItem(HISTORY_KEY) || "[]");
-  } catch (_error) {
-    archives = [];
-  }
+  const archives = [...state.serverConversations].sort((left, right) => {
+    if (left.conversation_id === state.currentConversationId) return -1;
+    if (right.conversation_id === state.currentConversationId) return 1;
+    return String(right.updated_at).localeCompare(String(left.updated_at));
+  });
   elements.conversationHistory.replaceChildren();
-  const currentQuestion = state.history.find((item) => item.role === "user")?.text;
-  if (currentQuestion) {
-    const current = createElement("button", "history-card history-card-current");
-    current.type = "button";
-    current.append(
-      createElement("strong", "", currentQuestion),
-      createElement("small", "", "当前对话"),
-    );
-    current.addEventListener("click", showCurrentDialogue);
-    elements.conversationHistory.append(current);
-  }
-  if ((!Array.isArray(archives) || !archives.length) && !currentQuestion) {
-    elements.conversationHistory.append(createElement("p", "history-empty", "开始新对话后，上一轮会保留在这里。"));
+  if (!archives.length) {
+    elements.conversationHistory.append(createElement("p", "history-empty", "完成首轮提问后，对话会永久保存在这里。"));
     return;
   }
   archives.forEach((archive) => {
-    const button = createElement("button", "history-card");
+    const isCurrent = archive.conversation_id === state.currentConversationId;
+    const button = createElement("button", `history-card${isCurrent ? " history-card-current" : ""}`);
     button.type = "button";
     button.append(
       createElement("strong", "", archive.title || "未命名对话"),
-      createElement("small", "", new Date(archive.createdAt).toLocaleString()),
+      createElement("small", "", isCurrent ? "当前对话" : new Date(archive.updated_at).toLocaleString()),
     );
-    button.addEventListener("click", () => showArchivedDialogue(archive));
+    button.addEventListener("click", () => {
+      if (isCurrent) showCurrentDialogue();
+      else activatePersistedConversation(archive);
+    });
     elements.conversationHistory.append(button);
   });
 }
 
 function showCurrentDialogue() {
-  elements.messages.replaceChildren();
-  state.history.forEach((item) => {
-    if (item.role === "user") appendUserMessage(item.text, false);
-    else appendRestoredAssistant(item.text, item.status);
-  });
+  renderDialogueMessages(state.history, "当前对话");
   state.viewingArchive = false;
-  elements.conversationLabel.textContent = "当前对话";
   hideNotice();
   scrollMessages();
 }
 
 function showArchivedDialogue(archive) {
-  const items = Array.isArray(archive.items) ? archive.items : [];
+  const items = Array.isArray(archive.messages) ? archive.messages : [];
+  renderDialogueMessages(items, "正在查看历史对话");
+  state.viewingArchive = true;
+  showNotice("这是服务端持久化的历史记录。", "warning");
+  scrollMessages();
+}
+
+function renderDialogueMessages(items, label) {
   elements.messages.replaceChildren();
+  if (!items.length) {
+    elements.messages.append(elements.emptyState);
+    elements.emptyState.hidden = false;
+    elements.conversationLabel.textContent = label;
+    return;
+  }
+  elements.emptyState.hidden = true;
   items.forEach((item) => {
     if (item.role === "user") appendUserMessage(item.text, false);
     else appendRestoredAssistant(item.text, item.status);
   });
-  state.viewingArchive = true;
-  elements.conversationLabel.textContent = "正在查看历史对话";
-  showNotice("这是历史记录；继续提问时会返回当前对话。", "warning");
-  scrollMessages();
+  elements.conversationLabel.textContent = label;
 }
 
 function appendRestoredAssistant(text, status) {
@@ -1341,9 +1519,11 @@ async function retryPendingRequest() {
       clearPendingRequest();
     }
     appendErrorMessage(error.message, true);
-  } finally {
-    setBusy(false);
-    scrollMessages();
+    } finally {
+      setBusy(false);
+      await refreshPlanControl();
+      await restoreServerHistory(false);
+      scrollMessages();
   }
 }
 

@@ -4,6 +4,11 @@ import unittest
 
 from pydantic import ValidationError
 
+from paper_research_agent.agent.orchestrator.artifacts import (
+    ChatArtifact,
+    ChildExecutionMetrics,
+)
+from paper_research_agent.agent.orchestrator.models import ChildTaskResult, MainAgentResult
 from paper_research_agent.web.events import AgentEventProjector
 from paper_research_agent.web.models import AgentRunRequest
 
@@ -43,6 +48,43 @@ class AgentEventContractTests(unittest.TestCase):
         )
         with self.assertRaises(ValidationError):
             projector.done(status="completed", workspace_version=-1)
+
+    def test_task_completed_projects_safe_timing_and_token_metrics(self) -> None:
+        projector = AgentEventProjector(
+            request_id="req_1234567890123456",
+            run_id="run-1",
+        )
+        child = ChildTaskResult(
+            child_run_id="child-1",
+            task_id="task-1",
+            capability="direct_chat",
+            status="completed",
+            artifact=ChatArtifact(
+                text="answer",
+                metrics=ChildExecutionMetrics(
+                    elapsed_ms=1250,
+                    input_tokens=240,
+                    output_tokens=36,
+                    total_tokens=276,
+                ),
+            ),
+        )
+        result = MainAgentResult(
+            run_id="run-1",
+            request_id="req_1234567890123456",
+            conversation_id="conversation-1",
+            status="completed",
+            child_results=(child,),
+        )
+
+        event = next(
+            item
+            for item in projector.project_result(result)
+            if item.type == "task_completed"
+        )
+
+        self.assertEqual(event.counts["elapsed_ms"], 1250)
+        self.assertEqual(event.counts["total_tokens"], 276)
 
 
 if __name__ == "__main__":

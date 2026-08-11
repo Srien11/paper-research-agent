@@ -73,6 +73,9 @@ from paper_research_agent.web.models import (
     AnonymousSessionResponse,
     AskResponse,
     AttachmentResponse,
+    ConversationArchiveItemResponse,
+    ConversationArchiveResponse,
+    ConversationMessageResponse,
     HealthResponse,
     LoginRequest,
     LongTermMemoryListResponse,
@@ -97,6 +100,18 @@ from paper_research_agent.web.routing import (
 APP_PREFIX = "/paper-research"
 API_PREFIX = f"{APP_PREFIX}/api"
 _REQUEST_ID = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+
+
+def _set_session_cookie(response: Response, settings: WebConfig, token: str) -> None:
+    response.set_cookie(
+        key=settings.cookie_name,
+        value=token,
+        max_age=settings.session_ttl_seconds,
+        httponly=True,
+        secure=settings.cookie_secure,
+        samesite="strict",
+        path=settings.cookie_path,
+    )
 
 
 class WebRuntime(Protocol):
@@ -498,9 +513,15 @@ def _safe_agent_plan(
     plan = workspace.task_plan
     goal = workspace.active_goal
     if plan is None or goal is None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="运行计划尚未生成",
+        return AgentPlanResponse(
+            control=_safe_agent_control(control),
+            workspace_version=workspace.version,
+            plan_revision=1,
+            objective=goal.objective if goal is not None else "正在分析本次请求",
+            acceptance_criteria=(
+                goal.acceptance_criteria if goal is not None else ()
+            ),
+            tasks=(),
         )
     return AgentPlanResponse(
         control=_safe_agent_control(control),
@@ -1035,15 +1056,7 @@ def create_app(
         if not credentials.verify(payload.username, payload.password):
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="认证失败")
         token, session = sessions.create()
-        response.set_cookie(
-            key=settings.cookie_name,
-            value=token,
-            max_age=settings.session_ttl_seconds,
-            httponly=True,
-            secure=settings.cookie_secure,
-            samesite="strict",
-            path=settings.cookie_path,
-        )
+        _set_session_cookie(response, settings, token)
         return SessionResponse(
             conversation_id=session.conversation_id,
             expires_at=session.expires_at,
@@ -1089,33 +1102,81 @@ def create_app(
         except Exception as error:  # noqa: BLE001
             raise _runtime_error_response(error) from None
 
+    @app.get(
+        f"{API_PREFIX}/conversations",
+        response_model=ConversationArchiveResponse,
+    )
+    async def list_conversations(
+        session: OwnerSession = Depends(current_session),  # noqa: B008
+    ) -> ConversationArchiveResponse:
+        dialogues = await asyncio.to_thread(conversation.store.conversations, limit=500)
+        return ConversationArchiveResponse(
+            current_conversation_id=session.conversation_id,
+            conversations=tuple(
+                ConversationArchiveItemResponse(
+                    conversation_id=item.conversation_id,
+                    title=item.title,
+                    created_at=item.created_at.isoformat(),
+                    updated_at=item.updated_at.isoformat(),
+                    messages=tuple(
+                        ConversationMessageResponse(
+                            role=message.role,
+                            text=message.text,
+                            status=message.status,
+                            created_at=message.created_at.isoformat(),
+                        )
+                        for message in item.messages
+                    ),
+                )
+                for item in dialogues
+            ),
+        )
+
+    @app.post(
+        f"{API_PREFIX}/conversations/{{conversation_id}}/activate",
+        response_model=SessionResponse,
+    )
+    async def activate_conversation(
+        conversation_id: str,
+        request: Request,
+        response: Response,
+        _origin: None = Depends(require_origin),
+        _session: OwnerSession = Depends(current_session),  # noqa: B008
+    ) -> SessionResponse:
+        known = await asyncio.to_thread(conversation.store.conversations, limit=500)
+        if conversation_id not in {item.conversation_id for item in known}:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="历史对话不存在",
+            )
+        replacement = sessions.select_conversation(
+            request.cookies.get(settings.cookie_name) or "", conversation_id
+        )
+        if replacement is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="需要站长登录")
+        token, selected = replacement
+        _set_session_cookie(response, settings, token)
+        return SessionResponse(
+            conversation_id=selected.conversation_id,
+            expires_at=selected.expires_at,
+        )
+
     @app.delete(f"{API_PREFIX}/conversation", response_model=SessionResponse)
     async def new_conversation(
         request: Request,
+        response: Response,
         _origin: None = Depends(require_origin),
         session: OwnerSession = Depends(current_session),  # noqa: B008
-        rag_runtime: WebRuntime = Depends(active_runtime),  # noqa: B008
     ) -> SessionResponse:
-        try:
-            await rag_runtime.clear_conversation(session.conversation_id)
-            chat_runtime = cast(WebRuntime | None, request.app.state.chat_runtime)
-            if chat_runtime is not None and chat_runtime is not rag_runtime:
-                await chat_runtime.clear_conversation(session.conversation_id)
-            main_runtime = cast(
-                MainAgentRuntime | None, request.app.state.main_agent_runtime
-            )
-            if main_runtime is not None:
-                await main_runtime.clear(session.conversation_id)
-            await conversation.clear(session.conversation_id)
-        except Exception as error:  # noqa: BLE001 - runtime is an isolation boundary
-            raise _runtime_error_response(error) from None
         token = request.cookies.get(settings.cookie_name)
         replacement = sessions.rotate_conversation(token or "")
         if replacement is None:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="需要站长登录")
+        replacement_token, selected = replacement
+        _set_session_cookie(response, settings, replacement_token)
         return SessionResponse(
-            conversation_id=replacement.conversation_id,
-            expires_at=replacement.expires_at,
+            conversation_id=selected.conversation_id,
+            expires_at=selected.expires_at,
         )
 
     @app.post(f"{API_PREFIX}/ask", response_model=AskResponse)

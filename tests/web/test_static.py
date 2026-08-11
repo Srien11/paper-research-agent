@@ -75,6 +75,10 @@ class StaticWebContractTests(unittest.TestCase):
             "inherited_across_route",
             "capability_plan",
             'event.type === "tool_result"',
+            'event.type === "task_started"',
+            'event.type === "task_completed"',
+            "renderRunMetrics",
+            "stopPlanRefresh",
             "recent_context_turn_count",
             "recalled_candidate_count",
             "interpretation_source",
@@ -100,11 +104,14 @@ class StaticWebContractTests(unittest.TestCase):
             'login: "api/login"',
             'logout: "api/logout"',
             'conversation: "api/conversation"',
+            'conversations: "api/conversations"',
             'agentRuns: "api/agent/runs"',
             'memories: "api/memories"',
         ):
             self.assertIn(path, self.javascript)
-        self.assertNotIn("api/conversations", self.javascript)
+        self.assertIn("restoreServerHistory", self.javascript)
+        self.assertIn("activatePersistedConversation", self.javascript)
+        self.assertIn("pendingRequest.question", self.javascript)
         self.assertNotIn('chatStream: "api/chat/stream"', self.javascript)
         self.assertNotIn('toolApproval: "api/tools/approval"', self.javascript)
         self.assertNotIn('ask: "api/ask"', self.javascript)

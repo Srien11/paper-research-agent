@@ -53,7 +53,16 @@ class _FakeConversationRuntime:
     async def stream_contextual_chat(self, request):
         self.direct_request = request
         yield {"type": "delta", "text": "上下文回答"}
-        yield {"type": "done", "metrics": {}}
+        yield {
+            "type": "done",
+            "metrics": {
+                "elapsed_ms": 1250,
+                "first_token_ms": 180,
+                "input_tokens": 240,
+                "output_tokens": 36,
+                "total_tokens": 276,
+            },
+        }
 
     async def stream_attachment_chat(
         self, question: str, *, attachment_texts: tuple[str, ...], session_id: str
@@ -81,6 +90,10 @@ class ConversationChildExecutorTests(unittest.IsolatedAsyncioTestCase):
 
             artifact = await executor.answer(_request())
 
+            self.assertEqual(artifact.metrics.elapsed_ms, 1250)
+            self.assertEqual(artifact.metrics.input_tokens, 240)
+            self.assertEqual(artifact.metrics.output_tokens, 36)
+            self.assertEqual(artifact.metrics.total_tokens, 276)
             self.assertEqual(artifact.text, "上下文回答")
             self.assertEqual(runtime.direct_request.recent_messages[0].content, "比较 RAG 与 GraphRAG")
             self.assertEqual(runtime.direct_request.active_goal, "比较 RAG 与 GraphRAG")

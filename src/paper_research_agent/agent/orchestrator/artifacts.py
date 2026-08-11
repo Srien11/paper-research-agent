@@ -13,9 +13,23 @@ class FrozenArtifact(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
+class ChildExecutionMetrics(FrozenArtifact):
+    """Safe timing, token, and context counters exposed by a child run."""
+
+    elapsed_ms: int = Field(default=0, ge=0)
+    first_token_ms: int = Field(default=0, ge=0)
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    total_tokens: int = Field(default=0, ge=0)
+    estimated_context_tokens: int = Field(default=0, ge=0)
+    token_budget: int = Field(default=0, ge=0)
+    output_reserve_tokens: int = Field(default=0, ge=0)
+
+
 class ChildArtifactBase(FrozenArtifact):
     text: str = Field(default="", max_length=20_000)
     source_ids: tuple[str, ...] = Field(default=(), max_length=100)
+    metrics: ChildExecutionMetrics = Field(default_factory=ChildExecutionMetrics)
 
     @field_validator("text")
     @classmethod
@@ -107,4 +121,3 @@ ChildArtifact = Annotated[
     | FileArtifact,
     Field(discriminator="kind"),
 ]
-

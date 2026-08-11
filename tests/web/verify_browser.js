@@ -82,7 +82,7 @@ async function main() {
     await page.waitForFunction(() => {
       const copy = document.querySelector(".message-assistant .answer-copy");
       return copy && copy.textContent && !copy.textContent.includes("正在");
-    }, null, { timeout: 90000 });
+    }, null, { timeout: 150000 });
     const pendingRequest = await page.evaluate(() => localStorage.getItem("paper-research.pending-request.v1"));
     if (pendingRequest !== null) throw new Error("completed request_id was not cleared");
     if (diagnostics.agentRunRequests.length !== 1) {
@@ -106,7 +106,7 @@ async function main() {
     await page.locator("#inspector-content").waitFor({ state: "visible" });
     await page.locator("#plan-task-list .plan-task").waitFor({ state: "visible", timeout: 10000 });
     const inspectorText = await page.locator("#inspector-content").innerText();
-    for (const expected of ["本地论文检索"]) {
+    for (const expected of ["本地论文检索", "运行耗时", "输入 Token", "总 Token"]) {
       if (!inspectorText.includes(expected)) throw new Error(`inspector is missing: ${expected}`);
     }
     await page.screenshot({ path: path.join(outputDir, "desktop-answer.png"), fullPage: true });

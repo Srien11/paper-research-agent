@@ -356,14 +356,14 @@ class AppTests(unittest.TestCase):
         self.assertNotIn("internal_path", response.text)
         self.assertEqual(self.runtime.memory_lists, 1)
 
-    def test_new_conversation_clears_memory_and_rotates_id(self) -> None:
+    def test_new_conversation_preserves_history_and_rotates_id(self) -> None:
         initial = self.login()
         response = self.client.delete(
             "/paper-research/api/conversation",
             headers={"Origin": ORIGIN},
         )
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(self.runtime.cleared, [initial["conversation_id"]])
+        self.assertEqual(self.runtime.cleared, [])
         self.assertNotEqual(response.json()["conversation_id"], initial["conversation_id"])
 
     def test_logout_revokes_session(self) -> None:
