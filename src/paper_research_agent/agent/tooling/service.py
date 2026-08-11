@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -13,14 +14,9 @@ from paper_research_agent.agent.observability import AgentEvent, AgentEventSink,
 from paper_research_agent.agent.service import ResearchToolService
 from paper_research_agent.agent.tooling.analysis import AnalysisResearchTools
 from paper_research_agent.agent.tooling.approval import ApprovalManager
-from paper_research_agent.agent.tooling.catalog import (
-    TOOL_SPEC_BY_NAME,
-    ExtendedToolPolicy,
-    effective_tool_spec,
-)
+from paper_research_agent.agent.tooling.catalog import ExtendedToolPolicy, effective_tool_spec
 from paper_research_agent.agent.tooling.content import ContentResearchTools
 from paper_research_agent.agent.tooling.contracts import (
-    TOOL_INPUT_SCHEMAS,
     AdjacentChunksInput,
     AnalyzeExperimentDataInput,
     CalculateInput,
@@ -38,8 +34,33 @@ from paper_research_agent.agent.tooling.contracts import (
     VerifyClaimInput,
 )
 from paper_research_agent.agent.tooling.local import LocalResearchTools
+from paper_research_agent.agent.tooling.registry import (
+    RegisteredTool,
+    ToolRegistrySnapshot,
+    builtin_registry_snapshot,
+)
 from paper_research_agent.agent.tooling.scholarly import ScholarlyResearchTools
 from paper_research_agent.agent.tooling.workspace import WorkspaceResearchTools
+
+
+class BuiltinToolProvider:
+    provider_id = "builtin"
+
+    def __init__(
+        self,
+        dispatch: Callable[[str, dict[str, Any]], Awaitable[ToolExecutionResult]],
+    ) -> None:
+        self._dispatch = dispatch
+
+    async def execute(
+        self,
+        tool: RegisteredTool,
+        arguments: dict[str, Any],
+        *,
+        run_id: str,
+    ) -> ToolExecutionResult:
+        del run_id
+        return await self._dispatch(tool.remote_name, arguments)
 
 
 class ExtendedResearchToolkit:
@@ -55,6 +76,7 @@ class ExtendedResearchToolkit:
         event_sink: AgentEventSink | None = None,
         approvals: ApprovalManager | None = None,
         policy: ExtendedToolPolicy | None = None,
+        registry: ToolRegistrySnapshot | None = None,
     ) -> None:
         self.local = local
         self.content = content
@@ -65,6 +87,7 @@ class ExtendedResearchToolkit:
         self.event_sink = event_sink
         self.approvals = approvals
         self.policy = policy or ExtendedToolPolicy()
+        self.registry = registry or builtin_registry_snapshot(BuiltinToolProvider(self._dispatch))
 
     def approve(self, request_id: str) -> str:
         if self.approvals is None:
@@ -79,9 +102,9 @@ class ExtendedResearchToolkit:
         run_id: str | None = None,
     ) -> ToolExecutionResult:
         resolved_run_id = run_id or uuid.uuid4().hex
-        spec = TOOL_SPEC_BY_NAME.get(tool_name)
-        schema = TOOL_INPUT_SCHEMAS.get(tool_name)
-        if spec is None or schema is None:
+        try:
+            tool, provider = self.registry.resolve(tool_name)
+        except PermissionError:
             self._event(
                 resolved_run_id,
                 "runtime_intercepted",
@@ -91,8 +114,8 @@ class ExtendedResearchToolkit:
                 error_type="PermissionError",
             )
             raise PermissionError(f"unknown extended research tool: {tool_name}")
-        request = schema.model_validate(arguments)
-        effective_spec = effective_tool_spec(spec, request.model_dump(mode="python"))
+        validated_arguments = self.registry.validate_arguments(tool_name, arguments)
+        effective_spec = effective_tool_spec(tool.spec, validated_arguments)
         try:
             self.policy.authorize(effective_spec)
         except PermissionError:
@@ -109,8 +132,14 @@ class ExtendedResearchToolkit:
         self._event(resolved_run_id, "tool_started", "started", tool_name)
         try:
             async with asyncio.timeout(effective_spec.timeout_seconds):
-                result = await self._dispatch(tool_name, request)
-                result = result.model_copy(update={"trust": effective_spec.trust})
+                result = await provider.execute(
+                    tool,
+                    validated_arguments,
+                    run_id=resolved_run_id,
+                )
+                result = result.model_copy(
+                    update={"tool_name": tool.public_name, "trust": effective_spec.trust}
+                )
         except TimeoutError:
             self._event(
                 resolved_run_id,
@@ -123,13 +152,20 @@ class ExtendedResearchToolkit:
             )
             raise TimeoutError(f"extended tool timed out: {tool_name}") from None
         except Exception as exc:
+            reason_code = "tool_execution_failed"
+            if tool.provider_kind == "mcp":
+                reason_code = (
+                    "mcp_schema_rejected"
+                    if isinstance(exc, ValueError)
+                    else "mcp_server_unavailable"
+                )
             self._event(
                 resolved_run_id,
                 "tool_failed",
                 "failed",
                 tool_name,
                 duration_ms=_elapsed(started),
-                reason_code="tool_execution_failed",
+                reason_code=reason_code,
                 error_type=type(exc).__name__,
             )
             raise
@@ -154,7 +190,7 @@ class ExtendedResearchToolkit:
             )
         return result
 
-    async def _dispatch(self, name: str, request: Any) -> ToolExecutionResult:
+    async def _dispatch(self, name: str, request: dict[str, Any]) -> ToolExecutionResult:
         if name == "get_adjacent_chunks":
             return self.local.get_adjacent_chunks(AdjacentChunksInput.model_validate(request))
         if name == "get_paper_metadata":

@@ -93,6 +93,10 @@ class ToolRegistrySnapshot:
         return self._tools
 
     @property
+    def providers(self) -> Mapping[str, ToolProvider]:
+        return self._providers
+
+    @property
     def names(self) -> frozenset[str]:
         return frozenset(self._tools)
 
@@ -104,6 +108,16 @@ class ToolRegistrySnapshot:
         if tool is None:
             raise PermissionError(f"tool is not registered: {name}")
         return tool, self._providers[tool.provider_id]
+
+    def validate_arguments(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        tool, _provider = self.resolve(name)
+        if tool.provider_kind == "builtin":
+            schema = TOOL_INPUT_SCHEMAS[tool.remote_name]
+            return schema.model_validate(arguments).model_dump(mode="python")
+        # jsonschema remains an optional dependency and is imported only for an admitted MCP call.
+        from paper_research_agent.agent.mcp.provider import validate_mcp_arguments
+
+        return validate_mcp_arguments(tool, arguments)
 
 
 def builtin_registry_snapshot(provider: ToolProvider) -> ToolRegistrySnapshot:

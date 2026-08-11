@@ -6,6 +6,7 @@ import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 import httpx
 
@@ -23,13 +24,29 @@ from paper_research_agent.ingestion.models import DocumentElement, SectionRecord
 from paper_research_agent.models import FrozenPaper
 
 
+class AsyncClosable(Protocol):
+    async def aclose(self) -> None: ...
+
+
 @dataclass
 class ExtendedToolkitHandle:
     toolkit: ExtendedResearchToolkit
     client: httpx.AsyncClient
+    mcp_manager: AsyncClosable | None = None
 
     async def aclose(self) -> None:
-        await self.client.aclose()
+        failures: list[Exception] = []
+        try:
+            await self.client.aclose()
+        except Exception as exc:  # noqa: BLE001 - still close the independent MCP lifecycle
+            failures.append(exc)
+        if self.mcp_manager is not None:
+            try:
+                await self.mcp_manager.aclose()
+            except Exception as exc:  # noqa: BLE001 - both resources must be attempted
+                failures.append(exc)
+        if failures:
+            raise RuntimeError("extended toolkit shutdown failed") from None
 
 
 def create_extended_research_toolkit(
