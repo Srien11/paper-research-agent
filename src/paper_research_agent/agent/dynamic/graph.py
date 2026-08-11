@@ -22,11 +22,33 @@ from paper_research_agent.agent.dynamic.models import (
     PendingApproval,
     ToolDecision,
     ToolObservation,
+    validate_tool_decision,
 )
 from paper_research_agent.agent.dynamic.router import DynamicToolRouter
 from paper_research_agent.agent.observability import AgentEvent, AgentEventSink, emit_agent_event
 from paper_research_agent.agent.tooling.contracts import ToolExecutionResult
+from paper_research_agent.agent.tooling.registry import (
+    RegisteredTool,
+    ToolRegistrySnapshot,
+    builtin_registry_snapshot,
+)
 from paper_research_agent.agent.tooling.service import ExtendedResearchToolkit
+
+
+class _ToolkitBuiltinProvider:
+    provider_id = "builtin"
+
+    def __init__(self, toolkit: ExtendedResearchToolkit) -> None:
+        self._toolkit = toolkit
+
+    async def execute(
+        self,
+        tool: RegisteredTool,
+        arguments: dict[str, Any],
+        *,
+        run_id: str,
+    ) -> ToolExecutionResult:
+        return await self._toolkit.execute(tool.public_name, arguments, run_id=run_id)
 
 
 class DynamicToolState(TypedDict, total=False):
@@ -55,11 +77,15 @@ def build_dynamic_tool_graph(
     event_sink: AgentEventSink | None = None,
     memory_proposer: DynamicMemoryProposer | None = None,
     memory_scope_id: str = "global",
+    registry: ToolRegistrySnapshot | None = None,
 ) -> CompiledStateGraph[Any, Any, Any, Any]:
     if max_steps <= 0 or max_steps > 12:
         raise ValueError("dynamic tool max_steps must be between 1 and 12")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", memory_scope_id):
         raise ValueError("dynamic memory scope is invalid")
+    snapshot = registry or getattr(toolkit, "registry", None)
+    if snapshot is None:
+        snapshot = builtin_registry_snapshot(_ToolkitBuiltinProvider(toolkit))
 
     async def recall_memory(state: DynamicToolState) -> DynamicToolState:
         if state.get("memory_supplied", False):
@@ -107,6 +133,8 @@ def build_dynamic_tool_graph(
                 "pending_approval": None,
                 "next_action": "propose_memory" if memory_proposer else "finalize",
             }
+        validated_call = validate_tool_decision(decision, snapshot)
+        decision = decision.model_copy(update={"arguments": validated_call.arguments})
         if decision.tool_name == "manage_long_term_memory" and decision.arguments.get("action") in {
             "add",
             "update",
@@ -157,7 +185,9 @@ def build_dynamic_tool_graph(
 
     async def execute(state: DynamicToolState) -> DynamicToolState:
         decision = ToolDecision.model_validate(state.get("pending_decision"))
-        tool_name = cast(str, decision.tool_name)
+        validated_call = validate_tool_decision(decision, snapshot)
+        decision = decision.model_copy(update={"arguments": validated_call.arguments})
+        tool_name = validated_call.tool.public_name
         result = await toolkit.execute(
             tool_name,
             decision.arguments,

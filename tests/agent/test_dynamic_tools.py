@@ -10,10 +10,28 @@ from pydantic import ValidationError
 
 from paper_research_agent.agent.dynamic.graph import build_dynamic_tool_graph
 from paper_research_agent.agent.dynamic.memory import MemoryProposal
-from paper_research_agent.agent.dynamic.models import ToolDecision
+from paper_research_agent.agent.dynamic.models import ToolDecision, validate_tool_decision
 from paper_research_agent.agent.dynamic.runtime import DynamicResearchRuntime
 from paper_research_agent.agent.observability import AgentEvent
+from paper_research_agent.agent.tooling.catalog import ToolSpec
 from paper_research_agent.agent.tooling.contracts import ToolExecutionResult
+from paper_research_agent.agent.tooling.registry import (
+    RegisteredTool,
+    ToolRegistrySnapshot,
+    builtin_registry_snapshot,
+)
+
+
+class ValidationProvider:
+    provider_id = "builtin"
+
+    async def execute(self, *args: Any, **kwargs: Any) -> ToolExecutionResult:
+        del args, kwargs
+        raise AssertionError("validation provider must not execute")
+
+
+class McpValidationProvider(ValidationProvider):
+    provider_id = "zotero"
 
 
 class SequenceRouter:
@@ -132,20 +150,23 @@ class FakeMemoryProposer:
 
 class DynamicToolModelTests(unittest.TestCase):
     def test_rejects_unknown_tool_and_invalid_arguments(self) -> None:
+        registry = builtin_registry_snapshot(ValidationProvider())
+        unknown = ToolDecision(
+            action="call_tool",
+            tool_name="run_shell",
+            arguments={},
+            purpose="Unsafe",
+        )
+        with self.assertRaises(PermissionError):
+            validate_tool_decision(unknown, registry)
+        invalid = ToolDecision(
+            action="call_tool",
+            tool_name="calculate",
+            arguments={"expression": ""},
+            purpose="Calculate",
+        )
         with self.assertRaises(ValidationError):
-            ToolDecision(
-                action="call_tool",
-                tool_name="run_shell",
-                arguments={},
-                purpose="Unsafe",
-            )
-        with self.assertRaises(ValidationError):
-            ToolDecision(
-                action="call_tool",
-                tool_name="calculate",
-                arguments={"expression": ""},
-                purpose="Calculate",
-            )
+            validate_tool_decision(invalid, registry)
         with self.assertRaises(ValidationError):
             ToolDecision(
                 action="call_tool",
@@ -160,6 +181,50 @@ class DynamicToolModelTests(unittest.TestCase):
 
 
 class DynamicToolGraphTests(unittest.IsolatedAsyncioTestCase):
+    async def test_registered_mcp_tool_is_authorized_by_captured_snapshot(self) -> None:
+        toolkit = FakeToolkit()
+        provider = McpValidationProvider()
+        tool = RegisteredTool(
+            public_name="zotero__search_items",
+            provider_id="zotero",
+            provider_kind="mcp",
+            remote_name="search_items",
+            spec=ToolSpec(
+                name="zotero__search_items",
+                risk="local_read",
+                trust="research_context",
+                timeout_seconds=5,
+                max_result_items=20,
+                description="在本机 Zotero 文献库中搜索条目。",
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {"query": {"type": "string", "minLength": 1}},
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        )
+        snapshot = ToolRegistrySnapshot({tool.public_name: tool}, {"zotero": provider})
+        graph = build_dynamic_tool_graph(
+            router=SequenceRouter(
+                ToolDecision(
+                    action="call_tool",
+                    tool_name=tool.public_name,
+                    arguments={"query": "agent"},
+                    purpose="Search local library",
+                ),
+                ToolDecision(action="finish", purpose="Done", final_summary="完成。"),
+            ),
+            toolkit=toolkit,  # type: ignore[arg-type]
+            registry=snapshot,
+            max_steps=2,
+        )
+        result = await DynamicResearchRuntime(graph=graph, max_steps=2).run(
+            "查我的 Zotero 文献库", thread_id="mcp-snapshot"
+        )
+        self.assertEqual(result.status, "completed")
+        self.assertIn((tool.public_name, {"query": "agent"}), toolkit.calls)
+
     async def test_greeting_cannot_trigger_sensitive_note_write(self) -> None:
         toolkit = FakeToolkit()
         graph = build_dynamic_tool_graph(

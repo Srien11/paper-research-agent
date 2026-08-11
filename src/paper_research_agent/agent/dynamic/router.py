@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import json
-from typing import Protocol
+from collections.abc import Mapping
+from typing import Any, Protocol, cast
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from paper_research_agent.agent.dynamic.models import ToolDecision, ToolObservation
-from paper_research_agent.agent.tooling.catalog import EXTENDED_TOOL_SPECS
-from paper_research_agent.agent.tooling.contracts import TOOL_INPUT_SCHEMAS
+from paper_research_agent.agent.tooling.registry import RegisteredTool, ToolRegistrySnapshot
 
 
 class DynamicToolRouter(Protocol):
@@ -28,12 +28,12 @@ class DynamicToolRouter(Protocol):
 class LangChainToolRouter:
     """Let the model select one registered tool or finish; Runtime still authorizes it."""
 
-    def __init__(self, model: BaseChatModel):
+    def __init__(self, model: BaseChatModel, registry: ToolRegistrySnapshot):
         self._structured_model = model.with_structured_output(
             ToolDecision,
             method="function_calling",
         )
-        self._catalog = "\n".join(_tool_contract(spec.name) for spec in EXTENDED_TOOL_SPECS)
+        self._catalog = "\n".join(_tool_contract(tool) for tool in registry.list_tools())
 
     async def decide(
         self,
@@ -161,9 +161,9 @@ def _bounded_memory_context_json(memories: tuple[dict[str, object], ...]) -> str
     )
 
 
-def _tool_contract(name: str) -> str:
-    spec = next(item for item in EXTENDED_TOOL_SPECS if item.name == name)
-    schema = TOOL_INPUT_SCHEMAS[name].model_json_schema()
+def _tool_contract(tool: RegisteredTool) -> str:
+    spec = tool.spec
+    schema = cast(dict[str, Any], _plain_json(tool.input_schema))
     properties = schema.get("properties", {})
     arguments = {
         key: {
@@ -183,10 +183,18 @@ def _tool_contract(name: str) -> str:
     )
     approval = (
         "add/update/delete only; search/list are read-only"
-        if name == "manage_long_term_memory"
+        if tool.public_name == "manage_long_term_memory"
         else str(spec.approval_required)
     )
     return (
         f"- {spec.name}: {spec.description} risk={spec.risk}; trust={spec.trust}; "
         f"approval={approval}; arguments={contract}"
     )
+
+
+def _plain_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _plain_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_json(item) for item in value]
+    return value

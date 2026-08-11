@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from paper_research_agent.agent.tooling.catalog import EXTENDED_TOOL_NAMES
-from paper_research_agent.agent.tooling.contracts import TOOL_INPUT_SCHEMAS, ToolExecutionResult
+from paper_research_agent.agent.tooling.contracts import ToolExecutionResult
+from paper_research_agent.agent.tooling.registry import RegisteredTool, ToolRegistrySnapshot
 
 
 class FrozenModel(BaseModel):
@@ -29,12 +30,10 @@ class ToolDecision(FrozenModel):
             if self.tool_name is not None or self.arguments or self.final_summary is None:
                 raise ValueError("finish decision requires only final_summary")
             return self
-        if self.tool_name not in EXTENDED_TOOL_NAMES or self.final_summary is not None:
-            raise ValueError("call_tool decision contains an unavailable tool")
+        if self.tool_name is None or self.final_summary is not None:
+            raise ValueError("call_tool decision requires a tool name and no final summary")
         if "approval_token" in self.arguments:
             raise ValueError("router decisions cannot supply approval tokens")
-        schema = TOOL_INPUT_SCHEMAS[self.tool_name]
-        schema.model_validate(self.arguments)
         return self
 
     @property
@@ -42,6 +41,25 @@ class ToolDecision(FrozenModel):
         payload = {"tool_name": self.tool_name, "arguments": self.arguments}
         canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class ValidatedToolCall:
+    tool: RegisteredTool
+    arguments: dict[str, Any]
+
+
+def validate_tool_decision(
+    decision: ToolDecision,
+    registry: ToolRegistrySnapshot,
+) -> ValidatedToolCall:
+    if decision.action != "call_tool" or decision.tool_name is None:
+        raise ValueError("only call_tool decisions can be authorized")
+    tool, _provider = registry.resolve(decision.tool_name)
+    arguments = registry.validate_arguments(tool.public_name, decision.arguments)
+    if arguments.get("approval_token") is None:
+        arguments.pop("approval_token", None)
+    return ValidatedToolCall(tool=tool, arguments=arguments)
 
 
 class ToolObservation(FrozenModel):

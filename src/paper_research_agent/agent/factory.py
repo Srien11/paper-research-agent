@@ -159,12 +159,13 @@ async def create_research_agent_runtime(
             from paper_research_agent.agent.dynamic.runtime import DynamicResearchRuntime
 
             dynamic_graph = build_dynamic_tool_graph(
-                router=LangChainToolRouter(model),
+                router=LangChainToolRouter(model, extended_handle.toolkit.registry),
                 toolkit=extended_handle.toolkit,
                 max_steps=runtime_policy.max_dynamic_tool_steps,
                 checkpointer=checkpointer,
                 event_sink=resolved_event_sink,
                 memory_proposer=LangChainMemoryProposer(model),
+                registry=extended_handle.toolkit.registry,
             )
             dynamic_runtime = DynamicResearchRuntime(
                 graph=dynamic_graph,
