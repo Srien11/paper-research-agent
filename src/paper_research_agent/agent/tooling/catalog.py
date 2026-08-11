@@ -14,7 +14,7 @@ ToolTrust = Literal["citation_evidence", "research_context", "computed_result", 
 class ToolSpec(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    name: str = Field(pattern=r"^[a-z][a-z0-9_]{1,63}$")
+    name: str = Field(pattern=r"^[a-z][a-z0-9_]{1,127}$")
     risk: ToolRisk
     trust: ToolTrust
     timeout_seconds: float = Field(gt=0, le=60)

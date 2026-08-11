@@ -165,6 +165,14 @@ class McpClientManager:
             return ()
         return runtime.tools
 
+    def degrade(self, server_id: str, reason_code: str) -> None:
+        runtime = self._servers.get(server_id)
+        if runtime is None:
+            raise PermissionError(f"unknown MCP server: {server_id}")
+        if runtime.state != "closed":
+            runtime.state = "degraded"
+            runtime.reason_code = reason_code
+
     async def call_tool(
         self,
         server_id: str,
