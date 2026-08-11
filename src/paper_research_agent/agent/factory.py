@@ -235,6 +235,7 @@ async def create_main_agent_runtime(
     approval_resumer: Any = None,
     close: Any = None,
     clear: Any = None,
+    event_sink: AgentEventSink | None = None,
 ) -> Any:
     """Assemble the cross-turn main Agent runtime from ready components."""
     from paper_research_agent.agent.orchestrator.factory import build_main_agent_runtime
@@ -252,6 +253,7 @@ async def create_main_agent_runtime(
         approval_resumer=approval_resumer,
         close=close,
         clear=clear,
+        event_sink=event_sink,
     )
 
 
@@ -264,6 +266,7 @@ def create_main_agent_runtime_from_model(
     checkpointer: Any = None,
     close: Any = None,
     clear: Any = None,
+    event_sink: AgentEventSink | None = None,
 ) -> Any:
     """Assemble all model-backed main-Agent stages from one shared client."""
     from paper_research_agent.agent.orchestrator.factory import (
@@ -278,4 +281,5 @@ def create_main_agent_runtime_from_model(
         checkpointer=checkpointer,
         close=close,
         clear=clear,
+        event_sink=event_sink,
     )

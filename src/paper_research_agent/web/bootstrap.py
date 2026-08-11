@@ -17,6 +17,7 @@ from paper_research_agent.agent.factory import (
     create_main_agent_model,
     create_main_agent_runtime_from_model,
 )
+from paper_research_agent.agent.observability import SQLiteAgentEventLogger
 from paper_research_agent.agent.orchestrator.children import ChildGraphDispatcher
 from paper_research_agent.agent.orchestrator.runtime import MainAgentRuntime
 from paper_research_agent.conversation.store import ConversationStore, SQLiteConversationStore
@@ -230,6 +231,9 @@ async def create_application_services(
                 own(model_client, model_close)
             checkpoint = await _open_main_checkpoint(environment.main_checkpoint_path)
             own(checkpoint)
+            event_sink = SQLiteAgentEventLogger(
+                environment.main_checkpoint_path.with_name("agent-events-v1.sqlite3")
+            )
             conversation_executor = ConversationChildExecutor(
                 runtime=cast(Any, chat), attachments=attachments
             )
@@ -262,6 +266,7 @@ async def create_application_services(
                 timeout_seconds=environment.timeout_seconds,
                 checkpointer=checkpoint.checkpointer,
                 clear=clear_main_state,
+                event_sink=event_sink,
             )
             own(main)
         return ApplicationServices(

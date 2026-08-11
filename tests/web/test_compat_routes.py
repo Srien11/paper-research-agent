@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
+from paper_research_agent.agent.observability import AgentEvent
 from paper_research_agent.agent.orchestrator.artifacts import DynamicToolArtifact
 from paper_research_agent.agent.orchestrator.models import (
     ChildTaskResult,
@@ -51,6 +52,7 @@ class _MainRuntime:
     def __init__(self) -> None:
         self.requests: list[MainAgentRequest] = []
         self.resume_calls: list[tuple[str, bool]] = []
+        self.event_sink: object | None = None
 
     async def run(self, request: MainAgentRequest) -> MainAgentResult:
         self.requests.append(request)
@@ -102,7 +104,9 @@ class _MainRuntime:
             workspace_version=1,
         )
 
-    async def resume_approval(self, *, request_id: str, approved: bool) -> MainAgentResult:
+    async def resume_approval(
+        self, *, request_id: str, approved: bool
+    ) -> MainAgentResult:
         self.resume_calls.append((request_id, approved))
         return MainAgentResult(
             run_id="b" * 32,
@@ -114,10 +118,20 @@ class _MainRuntime:
         )
 
 
+class _RecordingSink:
+    def __init__(self) -> None:
+        self.events: list[AgentEvent] = []
+
+    def write(self, event: AgentEvent) -> bool:
+        self.events.append(event)
+        return True
+
+
 class CompatibilityRouteTests(unittest.TestCase):
     def setUp(self) -> None:
         self.runtime = _LegacyRuntime()
         self.main = _MainRuntime()
+        self.main.event_sink = _RecordingSink()
         self.mode = patch.dict(os.environ, {"PRA_MAIN_AGENT_MODE": "primary"})
         self.mode.start()
         config = WebConfig(
@@ -206,6 +220,22 @@ class CompatibilityRouteTests(unittest.TestCase):
         counters = self.app.state.compatibility.deprecated_counts
         self.assertEqual(counters["chat_stream"], 1)
         self.assertNotIn("sensitive-body", repr(counters))
+        sink = self.main.event_sink
+        self.assertIsInstance(sink, _RecordingSink)
+        self.assertEqual(sink.events[-1].event_type, "deprecated_endpoint_used")
+
+    def test_deprecated_route_emits_body_free_observability_event(self) -> None:
+        from paper_research_agent.web.compat import CompatibilityAdapter
+
+        sink = _RecordingSink()
+        adapter = CompatibilityAdapter(event_sink=sink)
+
+        adapter.mark("chat_stream")
+
+        event = sink.events[0]
+        self.assertEqual(event.event_type, "deprecated_endpoint_used")
+        self.assertEqual(event.endpoint, "chat_stream")
+        self.assertEqual(event.requested_count, 1)
 
 
 if __name__ == "__main__":

@@ -24,9 +24,28 @@ AgentEventType = Literal[
     "tool_failed",
     "runtime_intercepted",
     "output_rejected",
+    "main_runtime_built",
+    "main_run_started",
+    "capability_routed",
+    "child_completed",
+    "main_run_paused",
+    "main_commit_rejected",
+    "main_run_completed",
+    "deprecated_endpoint_used",
 ]
 AgentEventStatus = Literal["started", "succeeded", "failed", "intercepted"]
 AgentEventComponent = Literal["runtime", "node", "tool"]
+MainCapability = Literal[
+    "direct_chat",
+    "local_rag",
+    "dynamic_tools",
+    "attachment_qa",
+    "file_edit",
+]
+ChildStatus = Literal[
+    "completed", "insufficient_evidence", "failed", "waiting_approval"
+]
+DeprecatedEndpoint = Literal["ask", "chat_stream", "tools_run", "tools_approval"]
 
 
 class AgentEvent(BaseModel):
@@ -63,6 +82,11 @@ class AgentEvent(BaseModel):
     max_steps: int | None = Field(default=None, ge=1)
     max_tool_calls: int | None = Field(default=None, ge=1)
     timeout_seconds: float | None = Field(default=None, gt=0)
+    capability: MainCapability | None = None
+    child_status: ChildStatus | None = None
+    endpoint: DeprecatedEndpoint | None = None
+    workspace_version: int | None = Field(default=None, ge=0)
+    validation_error_count: int | None = Field(default=None, ge=0)
 
     @field_validator("occurred_at")
     @classmethod
@@ -78,7 +102,12 @@ class AgentEvent(BaseModel):
             expected = "started"
         elif self.event_type == "runtime_intercepted":
             expected = "intercepted"
-        elif self.event_type.endswith("_completed"):
+        elif self.event_type.endswith("_completed") or self.event_type in {
+            "main_runtime_built",
+            "main_run_paused",
+            "deprecated_endpoint_used",
+            "capability_routed",
+        }:
             expected = "succeeded"
         else:
             expected = "failed"
@@ -88,6 +117,15 @@ class AgentEvent(BaseModel):
             raise ValueError("started events cannot contain a duration")
         if expected in {"failed", "intercepted"} and self.reason_code is None:
             raise ValueError("failed and intercepted events require a reason code")
+        if (
+            self.event_type in {"capability_routed", "child_completed"}
+            and self.capability is None
+        ):
+            raise ValueError("capability event requires a fixed capability")
+        if self.event_type == "child_completed" and self.child_status is None:
+            raise ValueError("child completion requires a fixed child status")
+        if self.event_type == "deprecated_endpoint_used" and self.endpoint is None:
+            raise ValueError("deprecated endpoint event requires an endpoint")
         return self
 
 
@@ -141,6 +179,11 @@ class SQLiteAgentEventLogger:
         "max_steps",
         "max_tool_calls",
         "timeout_seconds",
+        "capability",
+        "child_status",
+        "endpoint",
+        "workspace_version",
+        "validation_error_count",
     )
 
     def __init__(self, path: Path):
@@ -197,15 +240,36 @@ class SQLiteAgentEventLogger:
                     replan_count INTEGER,
                     max_steps INTEGER,
                     max_tool_calls INTEGER,
-                    timeout_seconds REAL
+                    timeout_seconds REAL,
+                    capability TEXT,
+                    child_status TEXT,
+                    endpoint TEXT,
+                    workspace_version INTEGER,
+                    validation_error_count INTEGER
                 );
                 CREATE INDEX IF NOT EXISTS agent_events_run
                     ON agent_events(run_id, event_id);
                 CREATE INDEX IF NOT EXISTS agent_events_type_time
                     ON agent_events(event_type, occurred_at DESC);
-                PRAGMA user_version = 1;
                 """
             )
+            existing = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(agent_events)")
+            }
+            additions = {
+                "capability": "TEXT",
+                "child_status": "TEXT",
+                "endpoint": "TEXT",
+                "workspace_version": "INTEGER",
+                "validation_error_count": "INTEGER",
+            }
+            for column, sql_type in additions.items():
+                if column not in existing:
+                    connection.execute(
+                        f"ALTER TABLE agent_events ADD COLUMN {column} {sql_type}"
+                    )
+            connection.execute("PRAGMA user_version = 2")
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=5.0)

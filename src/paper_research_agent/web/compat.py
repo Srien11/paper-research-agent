@@ -6,7 +6,13 @@ import re
 import uuid
 from collections import Counter
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
+from paper_research_agent.agent.observability import (
+    AgentEvent,
+    AgentEventSink,
+    emit_agent_event,
+)
 from paper_research_agent.agent.orchestrator.models import MainAgentRequest, MainAgentResult
 from paper_research_agent.web.events import AgentEventProjector, AgentStreamEvent
 from paper_research_agent.web.models import (
@@ -16,6 +22,9 @@ from paper_research_agent.web.models import (
 )
 
 _PUBLIC_REQUEST_ID = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+_DEPRECATED_ENDPOINTS = frozenset(
+    {"ask", "chat_stream", "tools_run", "tools_approval"}
+)
 
 
 class CompatibilityProjectionError(ValueError):
@@ -27,10 +36,26 @@ class CompatibilityAdapter:
     """Convert DTOs only; never execute a child runtime or inspect message bodies."""
 
     deprecated_counts: Counter[str] = field(default_factory=Counter)
+    event_sink: AgentEventSink | None = field(default=None, repr=False)
     _pending_by_conversation: dict[str, str] = field(default_factory=dict, repr=False)
 
     def mark(self, endpoint: str) -> None:
+        if endpoint not in _DEPRECATED_ENDPOINTS:
+            raise ValueError("unknown deprecated endpoint")
         self.deprecated_counts[endpoint] += 1
+        emit_agent_event(
+            self.event_sink,
+            AgentEvent(
+                run_id="0" * 32,
+                occurred_at=datetime.now(UTC),
+                event_type="deprecated_endpoint_used",
+                status="succeeded",
+                component="runtime",
+                name="compatibility",
+                endpoint=endpoint,
+                requested_count=self.deprecated_counts[endpoint],
+            ),
+        )
 
     def main_request(
         self,

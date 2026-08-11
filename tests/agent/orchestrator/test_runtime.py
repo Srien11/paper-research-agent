@@ -3,7 +3,13 @@ from __future__ import annotations
 import asyncio
 import unittest
 
-from paper_research_agent.agent.orchestrator.models import MainAgentRequest, MainAgentResult
+from paper_research_agent.agent.observability import AgentEvent
+from paper_research_agent.agent.orchestrator.artifacts import ChatArtifact
+from paper_research_agent.agent.orchestrator.models import (
+    ChildTaskResult,
+    MainAgentRequest,
+    MainAgentResult,
+)
 from paper_research_agent.agent.orchestrator.runtime import MainAgentRuntime
 from paper_research_agent.conversation.store import InMemoryConversationStore
 
@@ -26,10 +32,12 @@ class _FakeGraph:
         *,
         termination_reason: str = "completed",
         base_workspace_version: int = 0,
+        state_updates: dict[str, object] | None = None,
     ) -> None:
         self.delay = delay
         self.termination_reason = termination_reason
         self.base_workspace_version = base_workspace_version
+        self.state_updates = state_updates or {}
         self.calls = 0
         self.configs: list[object] = []
 
@@ -45,10 +53,108 @@ class _FakeGraph:
             "final_answer": "完成",
             "termination_reason": self.termination_reason,
             "child_results": [],
+            **self.state_updates,
         }
 
 
+class _RecordingSink:
+    def __init__(self) -> None:
+        self.events: list[AgentEvent] = []
+
+    def write(self, event: AgentEvent) -> bool:
+        self.events.append(event)
+        return True
+
+
 class MainAgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_main_runtime_emits_safe_lifecycle_route_and_child_events(self) -> None:
+        sink = _RecordingSink()
+        child = ChildTaskResult(
+            child_run_id="child-private-id",
+            task_id="task-private-id",
+            capability="direct_chat",
+            status="completed",
+            artifact=ChatArtifact(text="private answer", source_ids=("chunk-private",)),
+        )
+        runtime = MainAgentRuntime(
+            graph=_FakeGraph(
+                state_updates={
+                    "route_trace": ["direct_chat"],
+                    "child_results": [child],
+                }
+            ),
+            repository=InMemoryConversationStore(),
+            event_sink=sink,
+        )
+
+        await runtime.run(
+            MainAgentRequest(
+                request_id="request-private",
+                conversation_id="conversation-private",
+                message="private prompt C:\\private\\paper.pdf",
+                rag_mode="disabled",
+            )
+        )
+
+        self.assertEqual(
+            [event.event_type for event in sink.events],
+            [
+                "main_runtime_built",
+                "main_run_started",
+                "capability_routed",
+                "child_completed",
+                "main_run_completed",
+            ],
+        )
+        serialized = "\n".join(event.model_dump_json() for event in sink.events)
+        for private in (
+            "private prompt",
+            "private answer",
+            "chunk-private",
+            "task-private-id",
+            "child-private-id",
+            "C:\\\\private",
+        ):
+            self.assertNotIn(private, serialized)
+
+    async def test_waiting_and_rejected_runs_emit_explicit_reason_events(self) -> None:
+        pending = {
+            "approval_request_id": "approval-private",
+            "tool_name": "write_file",
+            "purpose": "save private output",
+            "arguments_sha256": "f" * 64,
+            "expires_at_epoch": 2_000_000_000.0,
+        }
+        waiting_sink = _RecordingSink()
+        waiting = MainAgentRuntime(
+            graph=_FakeGraph(
+                termination_reason="waiting_approval",
+                state_updates={"pending_approval": pending},
+            ),
+            repository=InMemoryConversationStore(),
+            event_sink=waiting_sink,
+        )
+        await waiting.run(_request(request_id="request-waiting"))
+        self.assertIn("main_run_paused", [item.event_type for item in waiting_sink.events])
+
+        rejected_sink = _RecordingSink()
+        rejected = MainAgentRuntime(
+            graph=_FakeGraph(
+                termination_reason="failed",
+                state_updates={"validation_errors": ("private state mismatch",)},
+            ),
+            repository=InMemoryConversationStore(),
+            event_sink=rejected_sink,
+        )
+        await rejected.run(_request(request_id="request-rejected"))
+        event = next(
+            item
+            for item in rejected_sink.events
+            if item.event_type == "main_commit_rejected"
+        )
+        self.assertEqual(event.reason_code, "commit_validation_failed")
+        self.assertEqual(event.validation_error_count, 1)
+        self.assertNotIn("private state mismatch", event.model_dump_json())
     async def test_run_returns_result_from_graph(self) -> None:
         runtime = MainAgentRuntime(
             graph=_FakeGraph(),
@@ -165,6 +271,7 @@ class MainAgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_resume_approval_delegates_to_resumer(self) -> None:
         calls: list[tuple[str, bool]] = []
+        sink = _RecordingSink()
 
         async def resumer(request_id: str, approved: bool) -> MainAgentResult:
             calls.append((request_id, approved))
@@ -181,10 +288,12 @@ class MainAgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             graph=_FakeGraph(),
             repository=InMemoryConversationStore(),
             approval_resumer=resumer,
+            event_sink=sink,
         )
         result = await runtime.resume_approval(request_id="request-1", approved=True)
         self.assertEqual(calls, [("request-1", True)])
         self.assertEqual(result.answer, "已批准")
+        self.assertEqual(sink.events[-1].event_type, "main_run_completed")
 
     async def test_clear_removes_lock_and_calls_callback(self) -> None:
         cleared: list[str] = []

@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi.testclient import TestClient
 
+from paper_research_agent.agent.observability import SQLiteAgentEventLogger
 from paper_research_agent.conversation.store import SQLiteConversationStore
 from paper_research_agent.web.app import create_app
 from paper_research_agent.web.bootstrap import (
@@ -95,6 +96,9 @@ class ApplicationBootstrapTests(unittest.IsolatedAsyncioTestCase):
                 build_main.call_args.kwargs["store"], services.conversation_store
             )
             self.assertIs(build_main.call_args.kwargs["checkpointer"], checkpoint.checkpointer)
+            self.assertIsInstance(
+                build_main.call_args.kwargs["event_sink"], SQLiteAgentEventLogger
+            )
             started = services.conversation_store.begin_agent_run(
                 request_id="request-checkpoint",
                 conversation_id="conversation-a",

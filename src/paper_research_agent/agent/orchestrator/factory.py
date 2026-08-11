@@ -6,6 +6,7 @@ from typing import Any
 
 from langchain_core.language_models import BaseChatModel
 
+from paper_research_agent.agent.observability import AgentEventSink
 from paper_research_agent.agent.orchestrator.children import ChildGraphDispatcher
 from paper_research_agent.agent.orchestrator.evaluator import (
     MAX_CHILD_CALLS_PER_RUN,
@@ -45,6 +46,7 @@ def build_main_agent_runtime(
     approval_resumer: ApprovalResumer | None = None,
     close: Closer | None = None,
     clear: ConversationClearer | None = None,
+    event_sink: AgentEventSink | None = None,
 ) -> MainAgentRuntime:
     """Assemble one closable main Agent runtime with a strict Pydantic graph."""
     resolved_synthesizer = synthesizer or AnswerSynthesizer()
@@ -72,6 +74,7 @@ def build_main_agent_runtime(
         timeout_seconds=timeout_seconds,
         close=close,
         clear=clear,
+        event_sink=event_sink,
     )
 
 
@@ -86,6 +89,7 @@ def build_main_agent_runtime_from_model(
     checkpointer: Any | None = None,
     close: Closer | None = None,
     clear: ConversationClearer | None = None,
+    event_sink: AgentEventSink | None = None,
 ) -> MainAgentRuntime:
     """Build production stages while sharing one lifecycle-managed model client."""
     return build_main_agent_runtime(
@@ -102,6 +106,7 @@ def build_main_agent_runtime_from_model(
         checkpointer=checkpointer,
         close=close,
         clear=clear,
+        event_sink=event_sink,
     )
 
 

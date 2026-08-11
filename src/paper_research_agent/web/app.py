@@ -551,6 +551,9 @@ def create_app(
             app.state.runtime = services.runtime
             app.state.chat_runtime = services.chat_runtime
             app.state.main_agent_runtime = services.main_agent_runtime
+            app.state.compatibility = CompatibilityAdapter(
+                event_sink=getattr(services.main_agent_runtime, "event_sink", None)
+            )
             app.state.main_agent_mode = services.mode
             app.state.attachments = services.attachment_store
             conversation = ConversationCoordinator(services.conversation_store)
@@ -606,7 +609,9 @@ def create_app(
     app.state.main_agent_runtime = main_agent_runtime
     app.state.main_agent_mode = main_agent_mode_from_environment()
     app.state.services = None
-    app.state.compatibility = CompatibilityAdapter()
+    app.state.compatibility = CompatibilityAdapter(
+        event_sink=getattr(main_agent_runtime, "event_sink", None)
+    )
     app.state.config = settings
     app.state.sessions = sessions
     app.state.attachments = shared_attachments
