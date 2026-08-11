@@ -60,10 +60,13 @@ class McpConfigTests(unittest.TestCase):
             McpHostConfig.model_validate(payload)
 
     def test_rejects_shell_launcher(self) -> None:
-        payload = _valid_payload()
-        payload["servers"][0]["command"] = "C:\\Windows\\System32\\cmd.exe"
-        with self.assertRaisesRegex(ValidationError, "shell launchers are forbidden"):
-            McpHostConfig.model_validate(payload)
+        for command in ("C:\\Windows\\System32\\cmd.exe", "/bin/sh"):
+            payload = _valid_payload()
+            payload["servers"][0]["command"] = command
+            with self.subTest(command=command), self.assertRaisesRegex(
+                ValidationError, "shell launchers are forbidden"
+            ):
+                McpHostConfig.model_validate(payload)
 
     def test_rejects_duplicate_server_and_public_names(self) -> None:
         payload = _valid_payload()

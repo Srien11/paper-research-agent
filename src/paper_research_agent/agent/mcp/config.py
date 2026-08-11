@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Literal, Self
 
 from pydantic import (
@@ -58,11 +58,15 @@ class McpStdioServerConfig(FrozenModel):
     @field_validator("command")
     @classmethod
     def _validate_command(cls, value: str) -> str:
+        launcher_names = {
+            PurePosixPath(value).name.lower(),
+            PureWindowsPath(value).name.lower(),
+        }
+        if launcher_names & _SHELL_LAUNCHERS:
+            raise ValueError("shell launchers are forbidden")
         path = Path(value)
         if not path.is_absolute():
             raise ValueError("MCP command must be an absolute path")
-        if path.name.lower() in _SHELL_LAUNCHERS:
-            raise ValueError("shell launchers are forbidden")
         return str(path)
 
     @field_validator("args")
