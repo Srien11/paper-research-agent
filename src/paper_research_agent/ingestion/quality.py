@@ -264,40 +264,41 @@ def _check_record_links(
 
     reading_orders: dict[str, set[int]] = defaultdict(set)
     for element in elements:
-        page = pages_by_id.get(element.page_id)
-        if page is None:
+        current_page = pages_by_id.get(element.page_id)
+        if current_page is None:
             errors["orphan_element_page"] += 1
             continue
         if (
-            element.asset_id != page.asset_id
-            or element.corpus_id != page.corpus_id
-            or element.page_number != page.page_number
-            or element.source_sha256 != page.source_sha256
+            element.asset_id != current_page.asset_id
+            or element.corpus_id != current_page.corpus_id
+            or element.page_number != current_page.page_number
+            or element.source_sha256 != current_page.source_sha256
         ):
             errors["element_page_mismatch"] += 1
         if element.reading_order in reading_orders[element.page_id]:
             errors["duplicate_reading_order"] += 1
         reading_orders[element.page_id].add(element.reading_order)
         if element.section_id is not None:
-            section = sections_by_id.get(element.section_id)
-            if section is None:
+            current_section = sections_by_id.get(element.section_id)
+            if current_section is None:
                 errors["orphan_element_section"] += 1
-            elif section.asset_id != element.asset_id:
+            elif current_section.asset_id != element.asset_id:
                 errors["element_section_mismatch"] += 1
         if (
-            page.raw_text is not None
+            current_page.raw_text is not None
             and element.raw_start is not None
             and element.raw_end is not None
+            and current_page.raw_text[element.raw_start : element.raw_end]
+            != element.raw_text
         ):
-            if page.raw_text[element.raw_start : element.raw_end] != element.raw_text:
-                errors["raw_span_mismatch"] += 1
+            errors["raw_span_mismatch"] += 1
         if element.bbox is not None:
             x0, y0, x1, y1 = element.bbox
             if (
                 x0 < -1
                 or y0 < -1
-                or x1 > page.width_points + 1
-                or y1 > page.height_points + 1
+                or x1 > current_page.width_points + 1
+                or y1 > current_page.height_points + 1
             ):
                 errors["bbox_out_of_page"] += 1
 
@@ -322,8 +323,8 @@ def _check_manifest_counts(
         "sections": len(sections),
         "elements": len(elements),
     }
-    for key in expected:
-        if expected[key] != actual[key]:
+    for key, expected_count in expected.items():
+        if expected_count != actual[key]:
             errors[f"manifest_{key}_count_mismatch"] += 1
 
 

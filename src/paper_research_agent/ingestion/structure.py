@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Literal
 
 from paper_research_agent.ingestion.identity import make_section_id, sha256_text
 from paper_research_agent.ingestion.models import (
@@ -153,7 +154,7 @@ def detect_heading(element: DocumentElement) -> HeadingCandidate | None:
 
 def detect_caption_type(
     element: DocumentElement,
-) -> str | None:
+) -> Literal["table_caption", "figure_caption"] | None:
     """识别带编号的表格与图片标题，供后续切块保留语义边界。"""
 
     text = element.normalized_text.strip()

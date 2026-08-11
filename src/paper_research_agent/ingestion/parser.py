@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path
 from typing import Literal
 
@@ -21,8 +22,8 @@ from paper_research_agent.ingestion.models import (
     PageRecord,
     SectionRecord,
 )
-from paper_research_agent.ingestion.text import normalize_text
 from paper_research_agent.ingestion.structure import infer_document_structure
+from paper_research_agent.ingestion.text import normalize_text
 
 PARSER_NAME = "pdfplumber"
 PARSER_VERSION = pdfplumber.__version__
@@ -314,7 +315,7 @@ def _extract_page_draft(page: object, page_number: int) -> PageDraft:
     try:
         lines = order_page_lines(extract_lines(page), width)
         return PageDraft(page_number, width, height, lines)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - isolate one malformed PDF page
         return PageDraft(
             page_number,
             width,
@@ -331,21 +332,18 @@ def _build_page_records(
     repeated: frozenset[tuple[str, str]],
 ) -> tuple[PageRecord, tuple[DocumentElement, ...]]:
     page_id = make_page_id(asset.source_sha256, draft.page_number)
-    common = {
-        "page_id": page_id,
-        "asset_id": asset.asset_id,
-        "corpus_id": asset.corpus_id,
-        "page_number": draft.page_number,
-        "width_points": draft.width,
-        "height_points": draft.height,
-        "source_sha256": asset.source_sha256,
-        "parser_name": PARSER_NAME,
-        "parser_version": PARSER_VERSION,
-    }
     if draft.error_code is not None:
         return (
             PageRecord(
-                **common,
+                page_id=page_id,
+                asset_id=asset.asset_id,
+                corpus_id=asset.corpus_id,
+                page_number=draft.page_number,
+                width_points=draft.width,
+                height_points=draft.height,
+                source_sha256=asset.source_sha256,
+                parser_name=PARSER_NAME,
+                parser_version=PARSER_VERSION,
                 status="failed",
                 error_code=draft.error_code,
                 error_message=draft.error_message,
@@ -357,10 +355,32 @@ def _build_page_records(
     cleaned_lines = clean_page_lines(draft, repeated)
     normalized_text = normalize_text("\n".join(line.text for line in cleaned_lines))
     if not normalized_text:
-        return PageRecord(**common, status="empty"), ()
+        return (
+            PageRecord(
+                page_id=page_id,
+                asset_id=asset.asset_id,
+                corpus_id=asset.corpus_id,
+                page_number=draft.page_number,
+                width_points=draft.width,
+                height_points=draft.height,
+                source_sha256=asset.source_sha256,
+                parser_name=PARSER_NAME,
+                parser_version=PARSER_VERSION,
+                status="empty",
+            ),
+            (),
+        )
 
     page_record = PageRecord(
-        **common,
+        page_id=page_id,
+        asset_id=asset.asset_id,
+        corpus_id=asset.corpus_id,
+        page_number=draft.page_number,
+        width_points=draft.width,
+        height_points=draft.height,
+        source_sha256=asset.source_sha256,
+        parser_name=PARSER_NAME,
+        parser_version=PARSER_VERSION,
         status="parsed",
         raw_text=raw_text,
         normalized_text=normalized_text,
@@ -523,8 +543,8 @@ def _is_rotated_side_margin(item: dict[str, object], page_width: float) -> bool:
         return False
     if any(bool(char.get("upright", True)) for char in chars if isinstance(char, dict)):
         return False
-    x0 = float(item["x0"])
-    x1 = float(item["x1"])
+    x0 = _as_float(item["x0"])
+    x1 = _as_float(item["x1"])
     return x1 <= page_width * MARGIN_RATIO or x0 >= page_width * (1 - MARGIN_RATIO)
 
 
@@ -547,15 +567,12 @@ def _split_cross_column_line(
             and "x0" in char
             and "x1" in char
         ),
-        key=lambda char: float(char["x0"]),
+        key=lambda char: _as_float(char["x0"]),
     )
     midpoint = page_width / 2
     candidates = [
-        (float(right["x0"]) - float(left["x1"]), index)
-        for index, (left, right) in enumerate(
-            zip(horizontal_chars, horizontal_chars[1:]),
-            start=1,
-        )
+        (_as_float(right["x0"]) - _as_float(left["x1"]), index)
+        for index, (left, right) in enumerate(pairwise(horizontal_chars), start=1)
         if _looks_like_column_gutter(left, right, midpoint, page_width)
     ]
     if not candidates:
@@ -577,8 +594,8 @@ def _looks_like_column_gutter(
     midpoint: float,
     page_width: float,
 ) -> bool:
-    left_edge = float(left["x1"])
-    right_edge = float(right["x0"])
+    left_edge = _as_float(left["x1"])
+    right_edge = _as_float(right["x0"])
     if left_edge <= midpoint <= right_edge:
         return True
     gap_center_ratio = ((left_edge + right_edge) / 2) / page_width
@@ -588,10 +605,10 @@ def _looks_like_column_gutter(
 def _item_to_text_line(item: dict[str, object]) -> TextLine:
     return TextLine(
         text=str(item.get("text", "")).strip(),
-        x0=float(item["x0"]),
-        top=float(item["top"]),
-        x1=float(item["x1"]),
-        bottom=float(item["bottom"]),
+        x0=_as_float(item["x0"]),
+        top=_as_float(item["top"]),
+        x1=_as_float(item["x1"]),
+        bottom=_as_float(item["bottom"]),
     )
 
 
@@ -624,9 +641,15 @@ def _chars_to_text_line(
 ) -> TextLine:
     return TextLine(
         text=text,
-        x0=min(float(char["x0"]) for char in chars),
-        top=min(float(char["top"]) for char in chars),
-        x1=max(float(char["x1"]) for char in chars),
-        bottom=max(float(char["bottom"]) for char in chars),
+        x0=min(_as_float(char["x0"]) for char in chars),
+        top=min(_as_float(char["top"]) for char in chars),
+        x1=max(_as_float(char["x1"]) for char in chars),
+        bottom=max(_as_float(char["bottom"]) for char in chars),
         column=column,
     )
+
+
+def _as_float(value: object) -> float:
+    if isinstance(value, (int, float, str)):
+        return float(value)
+    raise TypeError("PDF coordinate must be numeric")

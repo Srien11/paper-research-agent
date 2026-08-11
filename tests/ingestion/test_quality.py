@@ -11,7 +11,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from paper_research_agent.ingestion.quality import assess_ingestion
 from paper_research_agent.ingestion.runner import run_corpus_ingestion
-from ingestion.helpers import fake_parse, write_manifests
+from tests.ingestion.helpers import fake_parse, write_manifests
 
 
 class IngestionQualityTests(unittest.TestCase):

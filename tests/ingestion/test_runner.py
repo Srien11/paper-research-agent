@@ -13,7 +13,7 @@ from paper_research_agent.ingestion.runner import (
     IngestionRunError,
     run_corpus_ingestion,
 )
-from ingestion.helpers import fake_parse, write_manifests
+from tests.ingestion.helpers import fake_parse, write_manifests
 
 
 class IngestionRunnerTests(unittest.TestCase):

@@ -18,6 +18,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from paper_research_agent.agent.observability import DeprecatedEndpoint
 from paper_research_agent.agent.orchestrator.models import (
     MainAgentRequest,
     MainAgentResult,
@@ -691,7 +692,7 @@ def create_app(
         payload: QuestionRequest,
         session: OwnerSession,
         *,
-        endpoint: str,
+        endpoint: DeprecatedEndpoint,
     ) -> MainAgentResult:
         compatibility = cast(CompatibilityAdapter, app.state.compatibility)
         compatibility.mark(endpoint)
@@ -1074,7 +1075,7 @@ def create_app(
                 )
                 raise ValueError("conversation context requires clarification")
             resolution = _resolution_for_route(resolution, "web_research")
-            result = await rag_runtime.run_tool_research(
+            tool_research_result = await rag_runtime.run_tool_research(
                 resolution.standalone_question,
                 session_id=session.conversation_id,
             )
@@ -1083,9 +1084,9 @@ def create_app(
                 route="web_research",
                 status="completed",
                 resolution=resolution,
-                assistant_summary=_value(result, "final_summary"),
+                assistant_summary=_value(tool_research_result, "final_summary"),
             )
-            return _safe_tool_research_response(result)
+            return _safe_tool_research_response(tool_research_result)
         except HTTPException:
             raise
         except Exception as error:  # noqa: BLE001
@@ -1222,7 +1223,7 @@ def create_app(
                         )
                         + "\n"
                     ).encode()
-                    answer_parts: list[str] = []
+                    hybrid_answer_parts: list[str] = []
                     source = stream_method(
                         _hybrid_chat_request(payload.question, local_result),
                         session_id=session.conversation_id,
@@ -1230,14 +1231,14 @@ def create_app(
                     async for event in source:
                         text_value = event.get("text")
                         if isinstance(text_value, str):
-                            answer_parts.append(text_value)
+                            hybrid_answer_parts.append(text_value)
                         yield (json.dumps(event, ensure_ascii=False) + "\n").encode()
                     await conversation.complete(
                         turn.turn_id,
                         route=selected_route,
                         status="completed",
                         resolution=resolution,
-                        assistant_summary="".join(answer_parts),
+                        assistant_summary="".join(hybrid_answer_parts),
                         source_ids=source_ids,
                     )
                     finalized = True
@@ -1516,11 +1517,11 @@ def create_app(
             except Exception as error:  # noqa: BLE001 - sanitize runtime boundary
                 raise _main_agent_runtime_error(error, approval=True) from None
         try:
-            result = await rag_runtime.resume_tool_research(
+            legacy_approval_result = await rag_runtime.resume_tool_research(
                 session_id=session.conversation_id,
                 approved=payload.approved,
             )
-            return _safe_tool_research_response(result)
+            return _safe_tool_research_response(legacy_approval_result)
         except HTTPException:
             raise
         except Exception as error:  # noqa: BLE001

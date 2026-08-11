@@ -49,6 +49,8 @@ class StaticWebContractTests(unittest.TestCase):
         self.assertIn('aria-live="polite"', self.html)
         self.assertIn('aria-controls="inspector"', self.html)
         self.assertIn('href="#main-content"', self.html)
+        self.assertIn("clip-path: inset(50%)", self.css)
+        self.assertIn(".skip-link:focus", self.css)
 
     def test_ui_contains_all_visible_operational_states(self) -> None:
         for text in (

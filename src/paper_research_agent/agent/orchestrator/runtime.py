@@ -5,12 +5,18 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from functools import partial
+from typing import Any, cast
 
 from paper_research_agent.agent.observability import (
     AgentEvent,
     AgentEventSink,
+    AgentEventStatus,
+    AgentEventType,
+    ChildStatus,
+    MainCapability,
     emit_agent_event,
     safe_fingerprint,
 )
@@ -29,6 +35,13 @@ ConversationClearer = Callable[[str], Awaitable[None]]
 _MAIN_CAPABILITIES = frozenset(
     {"direct_chat", "local_rag", "dynamic_tools", "attachment_qa", "file_edit"}
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _EventContext:
+    run_id: str
+    question_sha256: str
+    thread_sha256: str
 
 
 class MainAgentRuntime:
@@ -95,11 +108,7 @@ class MainAgentRuntime:
                 self._inflight_conversations[request.request_id] = (
                     request.conversation_id
                 )
-                task.add_done_callback(
-                    lambda completed, request_id=request.request_id: self._task_done(
-                        request_id, completed
-                    )
-                )
+                task.add_done_callback(partial(self._task_done, request.request_id))
         return await asyncio.shield(task)
 
     async def _run_serialized(self, request: MainAgentRequest) -> MainAgentResult:
@@ -113,18 +122,15 @@ class MainAgentRuntime:
                 user_question=request.message,
             )
             should_emit = start.outcome == "created"
-            common = {
-                "run_id": start.run_id,
-                "component": "runtime",
-                "name": "main_agent",
-                "question_sha256": safe_fingerprint(request.message),
-                "thread_sha256": safe_fingerprint(request.conversation_id),
-            }
+            common = _EventContext(
+                run_id=start.run_id,
+                question_sha256=safe_fingerprint(request.message),
+                thread_sha256=safe_fingerprint(request.conversation_id),
+            )
             if should_emit:
                 self._emit(
-                    AgentEvent(
-                        **common,
-                        occurred_at=datetime.now(UTC),
+                    _runtime_event(
+                        common,
                         event_type="main_run_started",
                         status="started",
                         timeout_seconds=self._timeout_seconds,
@@ -154,9 +160,8 @@ class MainAgentRuntime:
                 )
                 if should_emit:
                     self._emit(
-                        AgentEvent(
-                            **common,
-                            occurred_at=datetime.now(UTC),
+                        _runtime_event(
+                            common,
                             event_type="runtime_intercepted",
                             status="intercepted",
                             duration_ms=_elapsed_ms(started_at),
@@ -183,9 +188,8 @@ class MainAgentRuntime:
                 )
                 if should_emit:
                     self._emit(
-                        AgentEvent(
-                            **common,
-                            occurred_at=datetime.now(UTC),
+                        _runtime_event(
+                            common,
                             event_type="run_failed",
                             status="failed",
                             duration_ms=_elapsed_ms(started_at),
@@ -214,14 +218,16 @@ class MainAgentRuntime:
         request = MainAgentResumeRequest(request_id=request_id, approved=approved)
         started_at = time.perf_counter()
         result = await resumer(request.request_id, request.approved)
-        event_type = (
+        event_type: AgentEventType = (
             "main_run_paused"
             if result.status == "waiting_approval"
             else "main_run_completed"
             if result.status == "completed"
             else "run_failed"
         )
-        event_status = "failed" if event_type == "run_failed" else "succeeded"
+        event_status: AgentEventStatus = (
+            "failed" if event_type == "run_failed" else "succeeded"
+        )
         self._emit(
             AgentEvent(
                 run_id=_observable_run_id(result.run_id),
@@ -290,19 +296,20 @@ class MainAgentRuntime:
         *,
         result: MainAgentResult,
         state: dict[str, Any],
-        common: dict[str, object],
+        common: _EventContext,
         started_at: float,
     ) -> None:
         routes = tuple(
             dict.fromkeys(
-                route for route in result.route_trace if route in _MAIN_CAPABILITIES
+                cast(MainCapability, route)
+                for route in result.route_trace
+                if route in _MAIN_CAPABILITIES
             )
         )
         for capability in routes:
             self._emit(
-                AgentEvent(
-                    **common,
-                    occurred_at=datetime.now(UTC),
+                _runtime_event(
+                    common,
                     event_type="capability_routed",
                     status="succeeded",
                     capability=capability,
@@ -310,9 +317,8 @@ class MainAgentRuntime:
             )
         for child in result.child_results:
             self._emit(
-                AgentEvent(
-                    **common,
-                    occurred_at=datetime.now(UTC),
+                _runtime_event(
+                    common,
                     event_type="child_completed",
                     status="succeeded",
                     capability=child.capability,
@@ -323,9 +329,8 @@ class MainAgentRuntime:
         duration_ms = _elapsed_ms(started_at)
         if result.status == "waiting_approval":
             self._emit(
-                AgentEvent(
-                    **common,
-                    occurred_at=datetime.now(UTC),
+                _runtime_event(
+                    common,
                     event_type="main_run_paused",
                     status="succeeded",
                     duration_ms=duration_ms,
@@ -344,9 +349,8 @@ class MainAgentRuntime:
         )
         if result.status == "failed" and validation_error_count:
             self._emit(
-                AgentEvent(
-                    **common,
-                    occurred_at=datetime.now(UTC),
+                _runtime_event(
+                    common,
                     event_type="main_commit_rejected",
                     status="failed",
                     duration_ms=duration_ms,
@@ -358,9 +362,8 @@ class MainAgentRuntime:
             return
         if result.status == "completed":
             self._emit(
-                AgentEvent(
-                    **common,
-                    occurred_at=datetime.now(UTC),
+                _runtime_event(
+                    common,
                     event_type="main_run_completed",
                     status="succeeded",
                     duration_ms=duration_ms,
@@ -381,6 +384,48 @@ class MainAgentRuntime:
                 lock = asyncio.Lock()
                 self._locks[conversation_id] = lock
             return lock
+
+
+def _runtime_event(
+    context: _EventContext,
+    *,
+    event_type: AgentEventType,
+    status: AgentEventStatus,
+    duration_ms: float | None = None,
+    error_type: str | None = None,
+    reason_code: str | None = None,
+    termination_reason: str | None = None,
+    requested_count: int | None = None,
+    returned_count: int | None = None,
+    evidence_count: int | None = None,
+    timeout_seconds: float | None = None,
+    capability: MainCapability | None = None,
+    child_status: ChildStatus | None = None,
+    workspace_version: int | None = None,
+    validation_error_count: int | None = None,
+) -> AgentEvent:
+    return AgentEvent(
+        run_id=context.run_id,
+        occurred_at=datetime.now(UTC),
+        event_type=event_type,
+        status=status,
+        component="runtime",
+        name="main_agent",
+        duration_ms=duration_ms,
+        question_sha256=context.question_sha256,
+        thread_sha256=context.thread_sha256,
+        error_type=error_type,
+        reason_code=reason_code,
+        termination_reason=termination_reason,
+        requested_count=requested_count,
+        returned_count=returned_count,
+        evidence_count=evidence_count,
+        timeout_seconds=timeout_seconds,
+        capability=capability,
+        child_status=child_status,
+        workspace_version=workspace_version,
+        validation_error_count=validation_error_count,
+    )
 
 
 def _result_from_state(

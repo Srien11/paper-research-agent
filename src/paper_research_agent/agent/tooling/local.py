@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from typing import Literal
 
 from paper_research_agent.agent.tooling.contracts import (
     AdjacentChunksInput,
@@ -76,7 +77,7 @@ class LocalResearchTools:
         )
 
     def trace_evidence_source(self, request: ChunkIdsInput) -> ToolExecutionResult:
-        items = []
+        items: list[dict[str, object]] = []
         for chunk_id in request.chunk_ids:
             chunk = self._chunk_map.get(chunk_id)
             if chunk is None:
@@ -110,7 +111,7 @@ class LocalResearchTools:
             (section for section in self._sections if section.corpus_id == request.corpus_id),
             key=lambda section: (section.ordinal, section.level, section.section_id),
         )
-        items = tuple(
+        items: tuple[dict[str, object], ...] = tuple(
             {
                 "section_id": section.section_id,
                 "parent_section_id": section.parent_section_id,
@@ -145,7 +146,9 @@ def _chunk_item(chunk: EvidenceChunk, storage: Mapping[str, str]) -> dict[str, o
 
 def _result(
     name: str,
-    status: str = "ok",
+    status: Literal[
+        "ok", "not_found", "insufficient", "approval_required", "denied"
+    ] = "ok",
     items: tuple[dict[str, object], ...] = (),
     summary: dict[str, object] | None = None,
 ) -> ToolExecutionResult:

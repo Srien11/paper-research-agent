@@ -106,8 +106,16 @@ def _referenced_spans(question: GoldQuestion) -> list[EvidenceSpan]:
 
 
 def _selection_score(selected: Sequence[GoldQuestion]) -> tuple[int, int]:
-    language_target = {"zh": 18, "en": 9, "mixed": 3}
-    difficulty_target = {"easy": 10, "medium": 12, "hard": 8}
+    language_target: dict[Literal["zh", "en", "mixed"], int] = {
+        "zh": 18,
+        "en": 9,
+        "mixed": 3,
+    }
+    difficulty_target: dict[Literal["easy", "medium", "hard"], int] = {
+        "easy": 10,
+        "medium": 12,
+        "hard": 8,
+    }
     language = Counter(item.language for item in selected)
     difficulty = Counter(item.difficulty for item in selected)
     primary_split = Counter(

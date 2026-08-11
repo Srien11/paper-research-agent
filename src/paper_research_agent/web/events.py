@@ -204,10 +204,13 @@ class AgentEventProjector:
         return tuple(events)
 
     def _project_child(self, child: ChildTaskResult) -> list[AgentStreamEvent]:
-        common = {"task_id": child.task_id, "capability": child.capability}
         events = [
-            self.event("task_started", **common),
-            self.event("route_selected", **common),
+            self.event(
+                "task_started", task_id=child.task_id, capability=child.capability
+            ),
+            self.event(
+                "route_selected", task_id=child.task_id, capability=child.capability
+            ),
         ]
         event_types: dict[Capability, AgentStreamEventType] = {
             "local_rag": "rag_result",
@@ -229,7 +232,8 @@ class AgentEventProjector:
                     output_attachment_ids=output_ids,
                     tool_names=tool_names,
                     counts={"source_count": len(source_ids)},
-                    **common,
+                    task_id=child.task_id,
+                    capability=child.capability,
                 )
             )
         if child.status != "waiting_approval":
@@ -237,7 +241,8 @@ class AgentEventProjector:
                 self.event(
                     "task_completed",
                     counts={"source_count": len(source_ids)},
-                    **common,
+                    task_id=child.task_id,
+                    capability=child.capability,
                 )
             )
         return events

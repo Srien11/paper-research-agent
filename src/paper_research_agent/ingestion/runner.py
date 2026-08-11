@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -157,7 +158,7 @@ def _validate_source_assets(papers: list[FrozenPaper]) -> None:
         raise IngestionRunError("\n".join(errors))
 
 
-def _write_jsonl(path: Path, records: list[BaseModel]) -> Path:
+def _write_jsonl(path: Path, records: Sequence[BaseModel]) -> Path:
     content = "".join(
         f"{_canonical_json(record.model_dump(mode='json'))}\n"
         for record in records

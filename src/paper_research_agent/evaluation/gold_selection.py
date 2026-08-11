@@ -5,7 +5,7 @@ from __future__ import annotations
 import random
 import re
 from collections.abc import Mapping, Sequence
-from typing import Literal
+from typing import Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -47,6 +47,12 @@ CandidateTaskType = Literal[
     "multi_hop_synthesis",
     "figure_table_explanation",
 ]
+CandidateLanguage = Literal["zh", "en", "mixed"]
+CandidateDifficulty = Literal["easy", "medium", "hard"]
+CandidateEvidenceSource = Literal[
+    "body", "table_appendix", "figure_caption", "mixed_sources"
+]
+CandidateSplit = Literal["core", "challenge"]
 
 
 class CandidateBlueprint(BaseModel):
@@ -57,10 +63,10 @@ class CandidateBlueprint(BaseModel):
     case_id: str = Field(pattern=r"^G\d{3}$")
     answerable: bool
     task_type: CandidateTaskType
-    language: Literal["zh", "en", "mixed"]
-    difficulty: Literal["easy", "medium", "hard"]
-    evidence_source: Literal["body", "table_appendix", "figure_caption", "mixed_sources"]
-    primary_split: Literal["core", "challenge"]
+    language: CandidateLanguage
+    difficulty: CandidateDifficulty
+    evidence_source: CandidateEvidenceSource
+    primary_split: CandidateSplit
     target_paper_ids: tuple[str, ...] = Field(min_length=1, max_length=3)
     expected_status: Literal["answered", "insufficient_evidence"]
     unanswerable_reason: str | None = None
@@ -122,11 +128,11 @@ def build_candidate_blueprint(
             CandidateBlueprint(
                 case_id=f"G{index + 1:03d}",
                 answerable=True,
-                task_type=task_type,
-                language=languages[index],
-                difficulty=difficulties[index],
-                evidence_source=evidence_sources[index],
-                primary_split=primary["dataset_split"],
+                task_type=cast(CandidateTaskType, task_type),
+                language=cast(CandidateLanguage, languages[index]),
+                difficulty=cast(CandidateDifficulty, difficulties[index]),
+                evidence_source=cast(CandidateEvidenceSource, evidence_sources[index]),
+                primary_split=cast(CandidateSplit, primary["dataset_split"]),
                 target_paper_ids=tuple(target_ids),
                 expected_status="answered",
             )
@@ -152,10 +158,10 @@ def build_candidate_blueprint(
                 case_id=f"G{61 + offset:03d}",
                 answerable=False,
                 task_type=_negative_task_type(reason, offset),
-                language=negative_languages[offset],
-                difficulty=negative_difficulties[offset],
+                language=cast(CandidateLanguage, negative_languages[offset]),
+                difficulty=cast(CandidateDifficulty, negative_difficulties[offset]),
                 evidence_source="body",
-                primary_split=anchor["dataset_split"],
+                primary_split=cast(CandidateSplit, anchor["dataset_split"]),
                 target_paper_ids=(str(anchor["corpus_id"]),),
                 expected_status="insufficient_evidence",
                 unanswerable_reason=reason,

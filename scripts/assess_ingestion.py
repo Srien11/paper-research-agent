@@ -11,7 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
 sys.path.insert(0, str(SRC_ROOT))
 
-from paper_research_agent.ingestion.quality import (  # noqa: E402
+from paper_research_agent.ingestion.quality import (
     QualityAuditError,
     assess_ingestion,
     write_quality_report,
@@ -62,4 +62,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -77,14 +77,24 @@ button { min-height: 44px; }
   z-index: 100;
   top: var(--space-3);
   left: var(--space-3);
-  padding: var(--space-3) var(--space-4);
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
   color: #fff;
   background: var(--ink);
   border-radius: var(--radius-sm);
-  transform: translateY(-150%);
 }
 
-.skip-link:focus { transform: translateY(0); }
+.skip-link:focus {
+  width: auto;
+  height: auto;
+  padding: var(--space-3) var(--space-4);
+  overflow: visible;
+  clip-path: none;
+}
 
 .eyebrow {
   margin: 0 0 var(--space-2);
@@ -359,9 +369,10 @@ kbd { padding: .1rem .3rem; background: #ebe6dc; border: 1px solid var(--line); 
 @media (max-width: 760px) {
   body { overflow: auto; }
   .app-shell { height: auto; min-height: 100vh; overflow: visible; }
-  .topbar { align-items: flex-start; }
+  .topbar { align-items: center; }
+  .brand > span:last-child { display: none; }
   .brand small, .stage-badge { display: none; }
-  .topbar-actions { flex-wrap: wrap; justify-content: flex-end; }
+  .topbar-actions { flex-wrap: nowrap; justify-content: flex-end; }
   .topbar .button { min-height: 44px; padding: .5rem .65rem; font-size: .875rem; }
   .workspace { display: block; overflow: visible; }
   .library-panel { border: 0; border-bottom: 1px solid var(--line); padding: var(--space-4); gap: var(--space-5); }

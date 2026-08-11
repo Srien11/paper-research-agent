@@ -15,7 +15,7 @@
 - **状态、安全与审批**：SQLite Checkpoint 恢复 thread；笔记、报告和长期记忆写入使用与工具名、参数哈希绑定的一次性审批令牌，避免旧确认复用到新参数。
 - **后端智能路由**：前端提交问题、附件和明确的 `rag_mode`（`disabled` / `preferred` / `required`）；关闭时禁止本地检索，优先模式允许本地 RAG、普通聊天和联网研究动态分流，仅本地模式则强制使用论文库。策略层继续校验路由合法性，高风险覆盖、删除和外发仍要求确认。
 - **隐私可观测性**：事件日志仅记录指纹、耗时、计数、路由和原因码，不记录问题、证据正文或 Provider 原始载荷；论文原文、本地索引、密钥、运行数据库和内部资料均不进入 Git。
-- **资源受控部署**：针对 2 核 2G 环境采用单 worker、串行重任务和 850MB systemd 内存上限，将模型推理与重排交给外部服务；当前 596 项 `unittest` 测试和 8 项 `pytest` 评测测试通过。
+- **资源受控部署**：针对 2 核 2G 环境采用单 worker、串行重任务和 850MB systemd 内存上限，将模型推理与重排交给外部服务；发布门禁要求自动测试不少于 596 项且全部通过。
 
 ## 当前里程碑
 
@@ -57,14 +57,28 @@ Top 4 正文水化深度和最终覆盖完整性仍是主要瓶颈。完整聚�
 
 ## 主 Agent 统一编排
 
-在原有本地论文研究图与动态工具图之上新增跨轮次主 Agent 主体图
-（`paper_research_main_v1`）。每轮先恢复最近历史、滚动摘要、活动目标、
-会话任务计划、远距会话召回与长期记忆，再依次解释本轮变化、对齐目标、
-规划任务、按策略路由子图，执行后评估结果并原子提交新的会话状态。普通
-聊天、本地论文、动态工具与附件均由主图统一路由，目标和任务计划跨轮次
-持久化，重复请求幂等返回缓存，审批恢复只恢复原任务而不重跑解释、目标
-与规划。`PRA_MAIN_AGENT_ENABLED=true` 时 Web 的 ask 入口整体切换到主
-Agent 并输出统一 NDJSON 事件，关闭时保持旧路径完全兼容。
+生产启动首先进入跨轮次主 Agent 主体图（`paper_research_main_v1`），不是先
+进入某个执行子图。主图先恢复最近历史、滚动摘要、活动目标、会话任务计划、
+远距会话召回与长期记忆，再解释本轮变化、对齐目标和规划任务；只有完成这些
+步骤后，才按能力把受控任务派发给普通聊天、本地论文、动态工具、附件问答或
+文件编辑执行器。本地论文研究图与动态工具图都是 child executor（子执行器），
+不能自行修改主目标、任务计划或会话版本。
+
+浏览器只使用以下统一接口：
+
+- `POST /paper-research/api/agent/runs`：提交带稳定 `request_id`、`message`、
+  `rag_mode` 和附件 ID 的请求，返回统一 NDJSON 事件流。
+- `GET /paper-research/api/agent/runs/{request_id}`：断流后查询终态或等待状态。
+- `POST /paper-research/api/agent/runs/{request_id}/approval`：批准或拒绝原写任务，
+  只恢复暂停的 child，不重新解释、对齐目标或规划。
+
+同一 `request_id` 重试会返回持久化结果和 `run_reused`，不会新增 turn 或重复副作用。
+旧 `/ask`、`/chat/stream`、`/tools/run` 与 `/tools/approval` 在 `primary` 模式只作为
+兼容代理保留，浏览器不得调用；`legacy` 模式则可在紧急回滚时恢复旧实现。
+
+生产命令 `scripts/serve_web.py` 默认使用 `PRA_MAIN_AGENT_MODE=primary`。显式配置
+`PRA_MAIN_AGENT_MODE=legacy` 并重启即可回滚；已废弃的
+`PRA_MAIN_AGENT_ENABLED` 只为旧部署读取兼容，不应继续写入新环境文件。
 
 ## 数据边界
 
@@ -398,8 +412,20 @@ JSON 均关闭失败。没有可用证据时在本地直接返回“证据不足
 
 ```powershell
 python -m pip install -e ".[retrieval,web]"
+$env:PRA_MAIN_AGENT_MODE = 'primary'
 python scripts/serve_web.py --host 127.0.0.1 --port 8092
 ```
+
+启动日志必须显示 `主 Agent Web 启动模式：primary`。若统一入口出现数据撕裂、
+重复副作用、引用丢失或持续提交拒绝，执行以下回滚并重启同一服务：
+
+```powershell
+$env:PRA_MAIN_AGENT_MODE = 'legacy'
+python scripts/serve_web.py --host 127.0.0.1 --port 8092
+```
+
+回滚不删除主 Agent checkpoint、Conversation Store（会话存储）或事件库，也不得在
+生产 SQLite 中手工改状态。问题修复后复用原数据验证，再显式切回 `primary`。
 
 生产凭据优先复用个人站现有 `ZHIMO_ADMIN_USER`、`ZHIMO_ADMIN_SALT`、
 `ZHIMO_ADMIN_HASH` 和 `ZHIMO_PBKDF2_ITERATIONS`；另需独立设置至少 32 字节的

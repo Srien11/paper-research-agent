@@ -130,6 +130,8 @@ class ToolRoutingCase(BaseModel):
 
         if self.expected_tool not in EXTENDED_TOOL_NAMES:
             raise ValueError("expected_tool is not in the extended tool catalog")
+        if self.expected_tool is None:
+            raise ValueError("tool actions require expected_tool")
         if self.expected_tool not in self.allowed_tools:
             raise ValueError("expected_tool must be included in allowed_tools")
         if (
@@ -173,6 +175,8 @@ class ToolRoutingCase(BaseModel):
                 }
             )
             return
+        if self.expected_tool is None:
+            raise ValueError("tool argument scoring requires expected_tool")
         schema = TOOL_INPUT_SCHEMAS[self.expected_tool]
         schema.model_validate(self.expected_arguments)
 

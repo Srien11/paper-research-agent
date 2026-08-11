@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Self
 from unittest.mock import patch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -38,7 +39,7 @@ class FakeDocument:
     def __init__(self, pages: list[FakePage]) -> None:
         self.pages = pages
 
-    def __enter__(self) -> FakeDocument:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *_: object) -> None:
@@ -87,16 +88,14 @@ class PdfParserTests(unittest.TestCase):
         )
 
     def test_two_columns_are_read_left_then_right(self) -> None:
-        lines = tuple(
-            [
-                TextLine("Title", 50, 20, 550, 40),
-                TextLine("L1", 50, 100, 250, 110),
-                TextLine("R1", 350, 100, 550, 110),
-                TextLine("L2", 50, 120, 250, 130),
-                TextLine("R2", 350, 120, 550, 130),
-                TextLine("L3", 50, 140, 250, 150),
-                TextLine("R3", 350, 140, 550, 150),
-            ]
+        lines = (
+            TextLine("Title", 50, 20, 550, 40),
+            TextLine("L1", 50, 100, 250, 110),
+            TextLine("R1", 350, 100, 550, 110),
+            TextLine("L2", 50, 120, 250, 130),
+            TextLine("R2", 350, 120, 550, 130),
+            TextLine("L3", 50, 140, 250, 150),
+            TextLine("R3", 350, 140, 550, 150),
         )
 
         ordered = order_page_lines(lines, 600)

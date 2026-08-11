@@ -274,16 +274,29 @@ def build_dynamic_tool_graph(
     builder = StateGraph(DynamicToolState)
     builder.add_node(
         "recall_memory",
-        _instrument_node("dynamic_recall_memory", recall_memory, event_sink),
+        cast(Any, _instrument_node("dynamic_recall_memory", recall_memory, event_sink)),
     )
-    builder.add_node("route", _instrument_node("dynamic_route", route, event_sink))
+    builder.add_node(
+        "route", cast(Any, _instrument_node("dynamic_route", route, event_sink))
+    )
     builder.add_node(
         "propose_memory",
-        _instrument_node("dynamic_propose_memory", propose_memory, event_sink),
+        cast(
+            Any,
+            _instrument_node("dynamic_propose_memory", propose_memory, event_sink),
+        ),
     )
-    builder.add_node("execute", _instrument_node("dynamic_execute", execute, event_sink))
-    builder.add_node("approval", _instrument_node("dynamic_approval", approval, event_sink))
-    builder.add_node("finalize", _instrument_node("dynamic_finalize", finalize, event_sink))
+    builder.add_node(
+        "execute", cast(Any, _instrument_node("dynamic_execute", execute, event_sink))
+    )
+    builder.add_node(
+        "approval",
+        cast(Any, _instrument_node("dynamic_approval", approval, event_sink)),
+    )
+    builder.add_node(
+        "finalize",
+        cast(Any, _instrument_node("dynamic_finalize", finalize, event_sink)),
+    )
     builder.add_edge(START, "recall_memory")
     builder.add_edge("recall_memory", "route")
     builder.add_conditional_edges(
@@ -350,6 +363,7 @@ def _finished(summary: str, reason: str) -> DynamicToolState:
 
 def _has_explicit_write_intent(question: str, tool_name: str) -> bool:
     normalized = question.casefold()
+    markers: tuple[str, ...]
     if tool_name == "save_research_note":
         markers = ("保存", "记下", "记录", "写入", "存下", "save", "record", "write down")
     else:

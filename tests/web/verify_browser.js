@@ -74,10 +74,11 @@ async function main() {
     await page.getByLabel("站长密码").fill(password);
     await page.getByRole("button", { name: "登录研究台" }).click();
     await page.locator("#app-view").waitFor({ state: "visible" });
-    await page.locator(".question-card").first().waitFor();
+    await page.locator("#ask-form").waitFor({ state: "visible" });
 
+    await page.getByLabel("使用本地论文知识库").check();
     await page.getByLabel("研究问题").fill("RAGAS 和 ARES 在评估忠实度时有什么主要区别？");
-    await page.getByRole("button", { name: "开始研究" }).click();
+    await page.getByRole("button", { name: "发送" }).click();
     await page.waitForFunction(() => {
       const copy = document.querySelector(".message-assistant .answer-copy");
       return copy && copy.textContent && !copy.textContent.includes("正在");
@@ -88,9 +89,17 @@ async function main() {
       throw new Error(`expected one unified Agent request, got ${diagnostics.agentRunRequests.length}`);
     }
     const agentPayload = JSON.parse(diagnostics.agentRunRequests[0].body);
-    if (!/^req_[A-Za-z0-9_-]{16,}$/.test(agentPayload.request_id || "")) {
+    if (!/^[A-Za-z0-9_-]{16,128}$/.test(agentPayload.request_id || "")) {
       throw new Error("unified Agent request_id is missing or invalid");
     }
+    if (agentPayload.rag_mode !== "preferred") {
+      throw new Error(`unexpected rag_mode: ${agentPayload.rag_mode}`);
+    }
+    diagnostics.agentRunRequests = [{
+      url: diagnostics.agentRunRequests[0].url,
+      requestId: agentPayload.request_id,
+      ragMode: agentPayload.rag_mode,
+    }];
     if (diagnostics.legacyRequests.length) {
       throw new Error(`legacy API was used: ${JSON.stringify(diagnostics.legacyRequests)}`);
     }

@@ -144,14 +144,22 @@ class WorkspaceResearchTools:
                 return _memory_not_found("update")
             old = _memory_item(row)
             kind = request.kind or str(old["kind"])
-            source_ids = request.source_chunk_ids or tuple(old["source_chunk_ids"])
+            raw_source_ids = old["source_chunk_ids"]
+            if not isinstance(raw_source_ids, (list, tuple)) or not all(
+                isinstance(item, str) for item in raw_source_ids
+            ):
+                raise RuntimeError("stored memory source IDs are invalid")
+            source_ids = request.source_chunk_ids or tuple(raw_source_ids)
             self._validate_memory_sources(kind, source_ids)
             connection.execute(
                 "UPDATE memories SET status = 'superseded', updated_at = ? WHERE memory_id = ?",
                 (now, request.memory_id),
             )
             memory_id = uuid.uuid4().hex
-            version = int(old["version"]) + 1
+            raw_version = old["version"]
+            if not isinstance(raw_version, int):
+                raise TypeError("stored memory version is invalid")
+            version = raw_version + 1
             self._insert_memory(
                 connection,
                 memory_id=memory_id,

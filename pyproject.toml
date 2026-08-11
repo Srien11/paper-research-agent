@@ -51,6 +51,8 @@ line-length = 100
 target-version = "py311"
 
 [tool.mypy]
-python_version = "3.11"
+# The validated development/deployment toolchain is Python 3.12; current
+# NumPy stubs use PEP 695 syntax even though the package runtime remains 3.11+.
+python_version = "3.12"
 strict = true
 packages = ["paper_research_agent"]

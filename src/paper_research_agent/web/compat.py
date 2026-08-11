@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from paper_research_agent.agent.observability import (
     AgentEvent,
     AgentEventSink,
+    DeprecatedEndpoint,
     emit_agent_event,
 )
 from paper_research_agent.agent.orchestrator.models import MainAgentRequest, MainAgentResult
@@ -39,7 +40,7 @@ class CompatibilityAdapter:
     event_sink: AgentEventSink | None = field(default=None, repr=False)
     _pending_by_conversation: dict[str, str] = field(default_factory=dict, repr=False)
 
-    def mark(self, endpoint: str) -> None:
+    def mark(self, endpoint: DeprecatedEndpoint) -> None:
         if endpoint not in _DEPRECATED_ENDPOINTS:
             raise ValueError("unknown deprecated endpoint")
         self.deprecated_counts[endpoint] += 1

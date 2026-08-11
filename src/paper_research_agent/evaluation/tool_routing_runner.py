@@ -349,8 +349,12 @@ def _no_tool_f1(records: Sequence[Mapping[str, Any]]) -> float | None:
     selected = [record for record in records if "action" in record["scoring_scope"]]
     if not selected:
         return None
-    expected_none = lambda record: record.get("expected_action") in {"finish", "none"}
-    predicted_none = lambda record: record.get("predicted_action") in {"finish", "none"}
+    def expected_none(record: Mapping[str, Any]) -> bool:
+        return record.get("expected_action") in {"finish", "none"}
+
+    def predicted_none(record: Mapping[str, Any]) -> bool:
+        return record.get("predicted_action") in {"finish", "none"}
+
     true_positive = sum(expected_none(record) and predicted_none(record) for record in selected)
     false_positive = sum(not expected_none(record) and predicted_none(record) for record in selected)
     false_negative = sum(expected_none(record) and not predicted_none(record) for record in selected)

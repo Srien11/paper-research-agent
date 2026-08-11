@@ -273,7 +273,9 @@ def _retrieval_hits(
 
 
 def _aggregates(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    total = lambda field: sum(int(record[field]) for record in records)
+    def total(field: str) -> int:
+        return sum(int(record[field]) for record in records)
+
     must_total = total("must_have_total")
     answer_claims = total("answer_claim_count")
     claim_precision = _ratio(total("supported_answer_claim_count"), answer_claims)
@@ -349,8 +351,13 @@ def _percentile(values: Sequence[float], percentile: float) -> float | None:
 
 def write_rag_gold_report(result: Mapping[str, Any], path: Path) -> None:
     values = result["aggregates"]
-    pct = lambda value: "N/A" if value is None else f"{value * 100:.2f}%"
-    ms = lambda value: "N/A" if value is None else f"{value:.2f} ms"
+
+    def pct(value: float | None) -> str:
+        return "N/A" if value is None else f"{value * 100:.2f}%"
+
+    def ms(value: float | None) -> str:
+        return "N/A" if value is None else f"{value:.2f} ms"
+
     rows = [
         ("运行成功率", pct(values["run_success_rate"])),
         ("回答状态准确率", pct(values["status_accuracy"])),

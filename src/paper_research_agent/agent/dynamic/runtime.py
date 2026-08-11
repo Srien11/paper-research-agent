@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import Mapping
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol, cast
 
 from langgraph.types import Command
 
@@ -81,7 +81,9 @@ class DynamicResearchRuntime:
         approved: bool,
     ) -> DynamicResearchResult:
         normalized_thread = _thread(thread_id)
-        command = Command(resume=ApprovalDecision(approved=approved).model_dump(mode="json"))
+        command: Command[Any] = Command(
+            resume=ApprovalDecision(approved=approved).model_dump(mode="json")
+        )
         raw = await self._invoke(command, normalized_thread)
         return self._project(raw, normalized_thread)
 
@@ -130,7 +132,16 @@ class DynamicResearchRuntime:
             status="completed",
             observations=observations,
             final_summary=summary,
-            termination_reason=reason,
+            termination_reason=cast(
+                Literal[
+                    "router_finished",
+                    "max_steps",
+                    "repeated_tool_call",
+                    "approval_denied",
+                    "approval_expired",
+                ],
+                reason,
+            ),
         )
 
 
