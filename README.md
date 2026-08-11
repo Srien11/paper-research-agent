@@ -437,6 +437,35 @@ python scripts/serve_web.py --host 127.0.0.1 --port 8092
 路径、完整 figure JSON、系统提示词、Provider 原始响应或未选中证据全文。部署模板见
 `deploy/`，推荐问题见 `configs/web/recommended-questions-v1.json`。
 
+## 可选 MCP 只读工具
+
+MCP（Model Context Protocol，模型上下文协议）只作为现有 Dynamic Tools 子图的工具
+provider（提供方），不新增子图，也不进入固定 Local RAG 证据闭环。默认安装和默认运行均
+关闭 MCP；安装可选依赖后，由管理员静态配置文件决定准入的 Server 与工具：
+
+```powershell
+python -m pip install -e ".[agent,mcp]"
+$env:PRA_MCP_ENABLED = 'true'
+$env:PRA_MCP_CONFIG_PATH = 'D:\secure-config\mcp-servers.json'
+python scripts/serve_web.py
+```
+
+示例见 `deploy/mcp-servers.example.json`。示例不含真实路径或密钥；生产配置必须把 Zotero
+命令指向本项目固定 Python 环境，把 GitHub 命令指向已审查且固定版本的官方二进制。
+GitHub PAT 只通过 `GITHUB_PERSONAL_ACCESS_TOKEN` 继承，禁止写入 JSON、日志或 Git。
+
+所有 MCP 结果都是低信任 `research_context`，不能直接成为论文引用。Server 离线时应用
+继续启动，相关工具不进入当次不可变 Registry snapshot（注册快照）；安全事件只记录
+Server ID、`ready/degraded`、工具数和 reason code。紧急关闭无需迁移或删除状态：
+
+```powershell
+$env:PRA_MCP_ENABLED = 'false'
+python scripts/serve_web.py
+```
+
+完整安装、升级审查、隐私、监控与回滚步骤见
+[MCP 工具接入与运维](docs/MCP工具接入与运维.md)。
+
 ## 工程原则
 
 - 每个结论最终绑定 `paper_id / element_id / page / evidence_span`。
