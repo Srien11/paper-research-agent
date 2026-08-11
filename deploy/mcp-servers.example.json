@@ -1,0 +1,39 @@
+{
+  "schema_version": "mcp-host-v1",
+  "servers": [
+    {
+      "server_id": "zotero",
+      "enabled": false,
+      "transport": "stdio",
+      "command": "C:\\absolute\\path\\to\\python.exe",
+      "args": ["-m", "paper_research_agent.mcp_servers.zotero"],
+      "inherit_env": [],
+      "startup_timeout_seconds": 10,
+      "tools": [
+        {"remote_name": "search_items", "public_name": "zotero__search_items", "description": "在本机 Zotero 文献库中按题名、作者、关键词或索引内容搜索条目。", "risk": "local_read", "trust": "research_context", "timeout_seconds": 5, "max_result_items": 20, "max_output_bytes": 131072},
+        {"remote_name": "get_item", "public_name": "zotero__get_item", "description": "读取一个本机 Zotero 条目的有限书目元数据。", "risk": "local_read", "trust": "research_context", "timeout_seconds": 5, "max_result_items": 1, "max_output_bytes": 65536},
+        {"remote_name": "list_collections", "public_name": "zotero__list_collections", "description": "列出本机 Zotero 收藏夹的有限元数据。", "risk": "local_read", "trust": "research_context", "timeout_seconds": 5, "max_result_items": 20, "max_output_bytes": 65536},
+        {"remote_name": "get_annotations", "public_name": "zotero__get_annotations", "description": "读取指定本机 Zotero 条目下有界的 PDF 批注。", "risk": "local_read", "trust": "research_context", "timeout_seconds": 5, "max_result_items": 20, "max_output_bytes": 131072},
+        {"remote_name": "get_attachment_metadata", "public_name": "zotero__get_attachment_metadata", "description": "读取本机 Zotero 附件的类型、父条目和页数等元数据。", "risk": "local_read", "trust": "research_context", "timeout_seconds": 5, "max_result_items": 1, "max_output_bytes": 65536},
+        {"remote_name": "get_fulltext", "public_name": "zotero__get_fulltext", "description": "读取本机 Zotero 索引中最多 20000 字符的全文片段。", "risk": "local_read", "trust": "research_context", "timeout_seconds": 5, "max_result_items": 1, "max_output_bytes": 131072}
+      ]
+    },
+    {
+      "server_id": "github",
+      "enabled": false,
+      "transport": "stdio",
+      "command": "C:\\absolute\\path\\to\\github-mcp-server-v0.50.0.exe",
+      "args": ["stdio", "--read-only", "--tools", "search_repositories,search_code,get_file_contents,list_commits,list_releases,issue_read"],
+      "inherit_env": ["GITHUB_PERSONAL_ACCESS_TOKEN"],
+      "startup_timeout_seconds": 10,
+      "tools": [
+        {"remote_name": "search_repositories", "public_name": "github__search_repositories", "description": "在 GitHub 上搜索公开或凭证可读的代码仓库。", "risk": "network_read", "trust": "research_context", "timeout_seconds": 15, "max_result_items": 20, "max_output_bytes": 131072},
+        {"remote_name": "search_code", "public_name": "github__search_code", "description": "在 GitHub 仓库中搜索代码。", "risk": "network_read", "trust": "research_context", "timeout_seconds": 15, "max_result_items": 20, "max_output_bytes": 131072},
+        {"remote_name": "get_file_contents", "public_name": "github__get_file_contents", "description": "读取 GitHub 仓库中一个有界文件或目录的内容。", "risk": "network_read", "trust": "research_context", "timeout_seconds": 15, "max_result_items": 20, "max_output_bytes": 131072},
+        {"remote_name": "list_commits", "public_name": "github__list_commits", "description": "列出 GitHub 仓库的有限提交元数据。", "risk": "network_read", "trust": "research_context", "timeout_seconds": 15, "max_result_items": 20, "max_output_bytes": 131072},
+        {"remote_name": "list_releases", "public_name": "github__list_releases", "description": "列出 GitHub 仓库的有限发布版本元数据。", "risk": "network_read", "trust": "research_context", "timeout_seconds": 15, "max_result_items": 20, "max_output_bytes": 131072},
+        {"remote_name": "issue_read", "public_name": "github__issue_read", "description": "读取一个 GitHub Issue 的有限内容与元数据。", "risk": "network_read", "trust": "research_context", "timeout_seconds": 15, "max_result_items": 20, "max_output_bytes": 131072}
+      ]
+    }
+  ]
+}

@@ -32,6 +32,7 @@ AgentEventType = Literal[
     "main_commit_rejected",
     "main_run_completed",
     "deprecated_endpoint_used",
+    "mcp_server_status",
 ]
 AgentEventStatus = Literal["started", "succeeded", "failed", "intercepted"]
 AgentEventComponent = Literal["runtime", "node", "tool"]
@@ -59,7 +60,7 @@ class AgentEvent(BaseModel):
     event_type: AgentEventType
     status: AgentEventStatus
     component: AgentEventComponent
-    name: str = Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")
+    name: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")
     duration_ms: float | None = Field(default=None, ge=0)
     question_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     thread_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
@@ -102,6 +103,8 @@ class AgentEvent(BaseModel):
             expected = "started"
         elif self.event_type == "runtime_intercepted":
             expected = "intercepted"
+        elif self.event_type == "mcp_server_status":
+            expected = "failed" if self.degraded else "succeeded"
         elif self.event_type.endswith("_completed") or self.event_type in {
             "main_runtime_built",
             "main_run_paused",

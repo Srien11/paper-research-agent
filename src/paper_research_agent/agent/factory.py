@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import uuid
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -15,8 +17,10 @@ from pydantic import SecretStr
 from paper_research_agent.agent.graph import build_research_graph
 from paper_research_agent.agent.models import StorageClass
 from paper_research_agent.agent.observability import (
+    AgentEvent,
     AgentEventSink,
     SQLiteAgentEventLogger,
+    emit_agent_event,
 )
 from paper_research_agent.agent.planner import (
     ComparisonQueryResolver,
@@ -36,6 +40,75 @@ from paper_research_agent.retrieval.query_rewrite import (
     DEFAULT_BASE_URL,
     DEFAULT_BASE_URL_ENV,
 )
+
+
+async def _configure_mcp_toolkit(
+    *,
+    toolkit: Any,
+    handle: Any,
+    project_root: Path,
+    environ: Mapping[str, str] | None = None,
+    manager_factory: Any = None,
+) -> None:
+    """Optionally merge ready, allowlisted MCP tools into one immutable snapshot."""
+    source = os.environ if environ is None else environ
+    raw_enabled = source.get("PRA_MCP_ENABLED", "false").strip().casefold()
+    if raw_enabled in {"", "false", "0", "no"}:
+        return
+    if raw_enabled not in {"true", "1", "yes"}:
+        raise ValueError("PRA_MCP_ENABLED must be true or false")
+
+    from paper_research_agent.agent.mcp.client import McpClientManager
+    from paper_research_agent.agent.mcp.config import load_mcp_host_config
+    from paper_research_agent.agent.mcp.provider import McpToolProvider
+    from paper_research_agent.agent.tooling.registry import ToolRegistrySnapshot
+
+    raw_path = source.get("PRA_MCP_CONFIG_PATH", "deploy/mcp-servers.json").strip()
+    if not raw_path:
+        raise ValueError("PRA_MCP_CONFIG_PATH cannot be blank when MCP is enabled")
+    config_path = Path(raw_path)
+    if not config_path.is_absolute():
+        config_path = project_root / config_path
+    host_config = load_mcp_host_config(config_path)
+    enabled_servers = tuple(server for server in host_config.servers if server.enabled)
+    manager = (
+        manager_factory(enabled_servers)
+        if manager_factory is not None
+        else McpClientManager(enabled_servers)
+    )
+    try:
+        await manager.start()
+        tools = dict(toolkit.registry.tools)
+        providers = dict(toolkit.registry.providers)
+        for server in enabled_servers:
+            if manager.status(server.server_id).state != "ready":
+                pass
+            else:
+                provider = McpToolProvider(server, manager)
+                discovered = provider.discover()
+                if manager.status(server.server_id).state == "ready":
+                    providers[provider.provider_id] = provider
+                    tools.update({tool.public_name: tool for tool in discovered})
+            status = manager.status(server.server_id)
+            emit_agent_event(
+                getattr(toolkit, "event_sink", None),
+                AgentEvent(
+                    run_id=uuid.uuid4().hex,
+                    occurred_at=datetime.now(UTC),
+                    event_type="mcp_server_status",
+                    status="succeeded" if status.state == "ready" else "failed",
+                    component="runtime",
+                    name=server.server_id,
+                    reason_code=status.reason_code,
+                    degraded=status.state != "ready",
+                    returned_count=status.tool_count,
+                ),
+            )
+        toolkit.registry = ToolRegistrySnapshot(tools, providers)
+        handle.mcp_manager = manager
+    except BaseException:
+        await manager.aclose()
+        raise
 
 
 def create_main_agent_model(
@@ -150,6 +223,11 @@ async def create_research_agent_runtime(
                 sections=sections,
                 elements=elements,
                 event_sink=resolved_event_sink,
+            )
+            await _configure_mcp_toolkit(
+                toolkit=extended_handle.toolkit,
+                handle=extended_handle,
+                project_root=resolved_root,
             )
         dynamic_runtime = None
         if extended_handle is not None:

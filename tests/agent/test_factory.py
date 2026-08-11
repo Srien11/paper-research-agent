@@ -1,18 +1,25 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
+import sys
 import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
 from paper_research_agent.agent.dynamic.memory import MemoryProposal
 from paper_research_agent.agent.dynamic.models import ToolDecision
-from paper_research_agent.agent.factory import create_research_agent_runtime
+from paper_research_agent.agent.factory import _configure_mcp_toolkit, create_research_agent_runtime
+from paper_research_agent.agent.mcp.client import McpServerStatus
 from paper_research_agent.agent.models import EvidenceAssessment, ResearchPlan, ResearchStep
 from paper_research_agent.agent.policy import ResearchRuntimePolicy
+from paper_research_agent.agent.tooling.contracts import ToolExecutionResult
+from paper_research_agent.agent.tooling.registry import RegisteredTool, builtin_registry_snapshot
 from paper_research_agent.chunking.models import EvidenceChunk
 from paper_research_agent.retrieval.contracts import (
     BilingualRetrievalRun,
@@ -231,6 +238,150 @@ class FakeRetriever:
             storage_classes={"C001": "internal_research_only"},
             rights_status="loaded",
         )
+
+
+class _BuiltinProvider:
+    provider_id = "builtin"
+
+    async def execute(
+        self,
+        tool: RegisteredTool,
+        arguments: dict[str, Any],
+        *,
+        run_id: str,
+    ) -> ToolExecutionResult:
+        del arguments, run_id
+        return ToolExecutionResult(tool_name=tool.public_name)
+
+
+class _McpManager:
+    def __init__(self, *, ready: bool) -> None:
+        self.ready = ready
+        self.started = False
+        self.closed = False
+        self.degraded: tuple[str, str] | None = None
+
+    async def start(self) -> None:
+        self.started = True
+
+    def status(self, server_id: str) -> McpServerStatus:
+        return McpServerStatus(
+            server_id=server_id,
+            state="ready" if self.ready else "degraded",
+            reason_code=None if self.ready else "mcp_server_unavailable",
+            tool_count=1 if self.ready else 0,
+        )
+
+    def tools_for(self, server_id: str) -> tuple[object, ...]:
+        del server_id
+        if not self.ready:
+            return ()
+        return (
+            SimpleNamespace(
+                name="search_items",
+                description="untrusted remote description",
+                inputSchema={
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
+            ),
+        )
+
+    def degrade(self, server_id: str, reason_code: str) -> None:
+        self.degraded = (server_id, reason_code)
+
+    async def call_tool(self, *args: Any, **kwargs: Any) -> object:
+        del args, kwargs
+        raise AssertionError("assembly test must not call tools")
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+def _mcp_payload() -> dict[str, object]:
+    return {
+        "schema_version": "mcp-host-v1",
+        "servers": [
+            {
+                "server_id": "zotero",
+                "enabled": True,
+                "command": sys.executable,
+                "tools": [
+                    {
+                        "remote_name": "search_items",
+                        "public_name": "zotero__search_items",
+                        "description": "在本机 Zotero 文献库中搜索条目。",
+                        "risk": "local_read",
+                        "timeout_seconds": 5,
+                        "max_result_items": 20,
+                    }
+                ],
+            }
+        ],
+    }
+
+
+class McpFactoryAssemblyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_disabled_does_not_read_config_or_change_eighteen_tools(self) -> None:
+        toolkit = SimpleNamespace(registry=builtin_registry_snapshot(_BuiltinProvider()))
+        handle = SimpleNamespace(mcp_manager=None)
+        await _configure_mcp_toolkit(
+            toolkit=toolkit,
+            handle=handle,
+            project_root=Path("missing-project"),
+            environ={"PRA_MCP_CONFIG_PATH": "missing.json"},
+        )
+        self.assertEqual(len(toolkit.registry.names), 18)
+        self.assertIsNone(handle.mcp_manager)
+
+    async def test_enabled_requires_valid_config(self) -> None:
+        toolkit = SimpleNamespace(registry=builtin_registry_snapshot(_BuiltinProvider()))
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            self.assertRaises(FileNotFoundError),
+        ):
+            await _configure_mcp_toolkit(
+                toolkit=toolkit,
+                handle=SimpleNamespace(mcp_manager=None),
+                project_root=Path(directory),
+                environ={"PRA_MCP_ENABLED": "true", "PRA_MCP_CONFIG_PATH": "missing.json"},
+            )
+
+    async def test_ready_server_is_merged_and_degraded_server_is_omitted(self) -> None:
+        for ready in (True, False):
+            with self.subTest(ready=ready), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "mcp.json").write_text(
+                    json.dumps(_mcp_payload(), ensure_ascii=False), encoding="utf-8"
+                )
+                toolkit = SimpleNamespace(registry=builtin_registry_snapshot(_BuiltinProvider()))
+                handle = SimpleNamespace(mcp_manager=None)
+                manager = _McpManager(ready=ready)
+                await _configure_mcp_toolkit(
+                    toolkit=toolkit,
+                    handle=handle,
+                    project_root=root,
+                    environ={"PRA_MCP_ENABLED": "true", "PRA_MCP_CONFIG_PATH": "mcp.json"},
+                    manager_factory=lambda _servers, current=manager: current,
+                )
+                self.assertTrue(manager.started)
+                self.assertIs(handle.mcp_manager, manager)
+                self.assertEqual(
+                    "zotero__search_items" in toolkit.registry.names,
+                    ready,
+                )
+                self.assertEqual(len(toolkit.registry.names), 19 if ready else 18)
+
+    async def test_rejects_unknown_boolean_value(self) -> None:
+        toolkit = SimpleNamespace(registry=builtin_registry_snapshot(_BuiltinProvider()))
+        with self.assertRaisesRegex(ValueError, "PRA_MCP_ENABLED"):
+            await _configure_mcp_toolkit(
+                toolkit=toolkit,
+                handle=SimpleNamespace(mcp_manager=None),
+                project_root=Path("."),
+                environ={"PRA_MCP_ENABLED": "sometimes"},
+            )
 
 
 if __name__ == "__main__":
