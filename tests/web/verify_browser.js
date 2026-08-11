@@ -104,6 +104,7 @@ async function main() {
       throw new Error(`legacy API was used: ${JSON.stringify(diagnostics.legacyRequests)}`);
     }
     await page.locator("#inspector-content").waitFor({ state: "visible" });
+    await page.locator("#plan-task-list .plan-task").waitFor({ state: "visible", timeout: 10000 });
     const inspectorText = await page.locator("#inspector-content").innerText();
     for (const expected of ["本地论文检索"]) {
       if (!inspectorText.includes(expected)) throw new Error(`inspector is missing: ${expected}`);

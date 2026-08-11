@@ -7,6 +7,9 @@ const API = Object.freeze({
   conversation: "api/conversation",
   agentRuns: "api/agent/runs",
   agentApproval: (requestId) => `api/agent/runs/${encodeURIComponent(requestId)}/approval`,
+  agentPlan: (requestId) => `api/agent/runs/${encodeURIComponent(requestId)}/plan`,
+  agentControl: (requestId) => `api/agent/runs/${encodeURIComponent(requestId)}/control`,
+  agentExplanation: (requestId, taskId) => `api/agent/runs/${encodeURIComponent(requestId)}/tasks/${encodeURIComponent(taskId)}/explanation`,
   files: "api/files",
   fileDownload: (attachmentId) => `api/files/${encodeURIComponent(attachmentId)}/download`,
   memories: "api/memories",
@@ -24,6 +27,10 @@ const state = {
   pendingRequest: null,
   viewingArchive: false,
   attachments: [],
+  activeRunId: null,
+  activePlan: null,
+  controlRevision: 0,
+  planPollTimer: null,
 };
 
 const elements = {
@@ -73,6 +80,15 @@ const elements = {
   memoriesList: document.querySelector("#memories-list"),
   toastRegion: document.querySelector("#toast-region"),
   conversationLabel: document.querySelector("#conversation-label"),
+  planControl: document.querySelector("#plan-control"),
+  planControlStatus: document.querySelector("#plan-control-status"),
+  planPause: document.querySelector("#plan-pause"),
+  planResume: document.querySelector("#plan-resume"),
+  planCancel: document.querySelector("#plan-cancel"),
+  planRefresh: document.querySelector("#plan-refresh"),
+  planObjective: document.querySelector("#plan-objective"),
+  planSaveObjective: document.querySelector("#plan-save-objective"),
+  planTaskList: document.querySelector("#plan-task-list"),
 };
 
 function createElement(tag, className, text) {
@@ -326,7 +342,8 @@ async function handleAsk(event) {
 }
 
 async function streamConversation(pendingRequest, sourceNote = "") {
-  const response = await fetch(API.agentRuns, {
+  activatePlanControl(pendingRequest.requestId);
+  const responsePromise = fetch(API.agentRuns, {
     method: "POST",
     credentials: "same-origin",
     headers: { "Content-Type": "application/json" },
@@ -337,6 +354,7 @@ async function streamConversation(pendingRequest, sourceNote = "") {
       rag_mode: pendingRequest.ragMode,
     }),
   });
+  const response = await responsePromise;
   return consumeAgentStream(response, pendingRequest, sourceNote);
 }
 
@@ -453,6 +471,11 @@ async function consumeAgentStream(response, pendingRequest, sourceNote = "") {
     showNotice("敏感工具等待审批；批准或拒绝后将使用同一请求继续。", "warning");
     return;
   }
+  if (finalStatus === "paused") {
+    showNotice("运行已暂停，已完成步骤不会重跑。你可以编辑计划后继续。", "warning");
+    await refreshPlanControl();
+    return;
+  }
   const editMode = route === "file_edit";
   const finalText = (editMode ? rawText : naturalText(rawText)).trim();
   if (editMode) {
@@ -462,6 +485,197 @@ async function consumeAgentStream(response, pendingRequest, sourceNote = "") {
     article.append(createServerDownloadButton(attachmentId));
   });
   saveHistoryItem({ role: "assistant", text: finalText, status: finalStatus });
+}
+
+function activatePlanControl(requestId) {
+  state.activeRunId = requestId;
+  state.activePlan = null;
+  state.controlRevision = 0;
+  elements.planControl.hidden = false;
+  elements.planControlStatus.textContent = "启动中";
+  elements.planTaskList.replaceChildren(createElement("p", "history-empty", "正在生成可编辑计划…"));
+  syncPlanButtons("running");
+  schedulePlanRefresh(250);
+}
+
+function schedulePlanRefresh(delay = 800) {
+  if (state.planPollTimer) window.clearTimeout(state.planPollTimer);
+  state.planPollTimer = window.setTimeout(() => refreshPlanControl(), delay);
+}
+
+async function refreshPlanControl() {
+  if (!state.activeRunId) return;
+  try {
+    const plan = await request(API.agentPlan(state.activeRunId));
+    state.activePlan = plan;
+    state.controlRevision = plan.control.revision;
+    renderPlanControl(plan);
+    if (["running", "pause_requested", "resuming", "cancel_requested"].includes(plan.control.status)) {
+      schedulePlanRefresh(700);
+    }
+  } catch (error) {
+    if (error.status === 404 || error.status === 409) {
+      schedulePlanRefresh(500);
+      return;
+    }
+    showToast(error.message);
+  }
+}
+
+function syncPlanButtons(status) {
+  const paused = status === "paused";
+  elements.planPause.disabled = !["running", "resuming"].includes(status);
+  elements.planResume.disabled = !paused;
+  elements.planCancel.disabled = ["cancelled", "completed", "failed"].includes(status);
+  elements.planSaveObjective.disabled = !paused || !state.activePlan;
+  elements.planObjective.disabled = !paused || !state.activePlan;
+}
+
+function planStatusLabel(status) {
+  return ({
+    running: "执行中",
+    pause_requested: "正在暂停",
+    paused: "已暂停",
+    resuming: "正在继续",
+    cancel_requested: "正在取消",
+    cancelled: "已取消",
+    completed: "已完成",
+    failed: "失败",
+    waiting_approval: "等待审批",
+  })[status] || status;
+}
+
+function renderPlanControl(plan) {
+  const status = plan.control.status;
+  elements.planControlStatus.textContent = planStatusLabel(status);
+  elements.planObjective.value = plan.objective || "";
+  syncPlanButtons(status);
+  elements.planTaskList.replaceChildren();
+  plan.tasks.forEach((task, index) => {
+    const card = createElement("article", "plan-task");
+    const header = createElement("header");
+    header.append(
+      createElement("strong", "", `${index + 1}. ${task.title}`),
+      createElement("small", "", planStatusLabel(task.status)),
+    );
+    const reason = createElement("p", "", task.execution_reason);
+    const usage = createElement(
+      "small",
+      "",
+      `调用 ${task.call_count}${task.max_calls ? `/${task.max_calls}` : ""} · ${Number(task.elapsed_seconds || 0).toFixed(1)} 秒 · $${Number(task.cost_usd || 0).toFixed(4)}`,
+    );
+    const budgets = createElement("div", "plan-task-budget");
+    const budgetFields = [
+      ["max_seconds", "秒"],
+      ["max_calls", "调用"],
+      ["max_cost_usd", "美元"],
+    ];
+    const inputs = {};
+    budgetFields.forEach(([field, label]) => {
+      const wrapper = createElement("label", "", label);
+      const input = createElement("input");
+      input.type = "number";
+      input.min = field === "max_cost_usd" ? "0" : "1";
+      input.step = field === "max_cost_usd" ? "0.01" : "1";
+      input.value = task[field] ?? "";
+      input.disabled = status !== "paused" || task.status === "completed";
+      inputs[field] = input;
+      wrapper.append(input);
+      budgets.append(wrapper);
+    });
+    const actions = createElement("div", "plan-task-actions");
+    const explain = createElement("button", "button button-quiet", "为什么");
+    explain.type = "button";
+    explain.addEventListener("click", async () => {
+      try {
+        const payload = await request(API.agentExplanation(state.activeRunId, task.task_id));
+        showToast(payload.explanation);
+      } catch (error) {
+        showToast(error.message);
+      }
+    });
+    actions.append(explain);
+    if (status === "paused" && task.status !== "completed") {
+      const saveBudget = createElement("button", "button button-secondary", "保存预算");
+      saveBudget.type = "button";
+      saveBudget.addEventListener("click", () => updateTaskBudget(task.task_id, inputs));
+      actions.append(saveBudget);
+      if (!["skipped", "cancelled"].includes(task.status)) {
+        const skip = createElement("button", "button button-quiet", "跳过");
+        skip.type = "button";
+        skip.addEventListener("click", () => editActivePlan({ skip_task_ids: [task.task_id] }));
+        actions.append(skip);
+      }
+      if (task.status === "failed") {
+        const retry = createElement("button", "button button-secondary", "只重试此步");
+        retry.type = "button";
+        retry.addEventListener("click", () => editActivePlan({ retry_task_ids: [task.task_id] }));
+        actions.append(retry);
+      }
+      if (index > 0) {
+        const up = createElement("button", "button button-quiet", "上移");
+        up.type = "button";
+        up.addEventListener("click", () => movePlanTask(index, -1));
+        actions.append(up);
+      }
+      if (index < plan.tasks.length - 1) {
+        const down = createElement("button", "button button-quiet", "下移");
+        down.type = "button";
+        down.addEventListener("click", () => movePlanTask(index, 1));
+        actions.append(down);
+      }
+    }
+    card.append(header, reason, usage, budgets, actions);
+    elements.planTaskList.append(card);
+  });
+}
+
+async function sendRunControl(action) {
+  if (!state.activeRunId) return;
+  try {
+    const control = await request(API.agentControl(state.activeRunId), {
+      method: "POST",
+      body: JSON.stringify({ action, expected_revision: state.controlRevision }),
+    });
+    state.controlRevision = control.revision;
+    elements.planControlStatus.textContent = planStatusLabel(control.status);
+    syncPlanButtons(control.status);
+    schedulePlanRefresh(250);
+  } catch (error) {
+    showToast(error.message);
+    refreshPlanControl();
+  }
+}
+
+async function editActivePlan(changes) {
+  if (!state.activeRunId || !state.activePlan) return;
+  try {
+    const plan = await request(API.agentPlan(state.activeRunId), {
+      method: "PATCH",
+      body: JSON.stringify({ expected_revision: state.activePlan.plan_revision, ...changes }),
+    });
+    state.activePlan = plan;
+    renderPlanControl(plan);
+    showToast("计划已更新，已完成结果保持不变。" );
+  } catch (error) {
+    showToast(error.message);
+    refreshPlanControl();
+  }
+}
+
+function updateTaskBudget(taskId, inputs) {
+  const budget = {};
+  Object.entries(inputs).forEach(([field, input]) => {
+    if (input.value !== "") budget[field] = Number(input.value);
+  });
+  editActivePlan({ task_edits: [{ task_id: taskId, budget }] });
+}
+
+function movePlanTask(index, offset) {
+  const ids = state.activePlan.tasks.map((task) => task.task_id);
+  const target = index + offset;
+  [ids[index], ids[target]] = [ids[target], ids[index]];
+  editActivePlan({ ordered_task_ids: ids });
 }
 
 function renderAgentInspectorEvent(label, event) {
@@ -977,6 +1191,12 @@ function resetWorkspace() {
   elements.emptyState.hidden = false;
   elements.inspectorEmpty.hidden = false;
   elements.inspectorContent.hidden = true;
+  if (state.planPollTimer) window.clearTimeout(state.planPollTimer);
+  state.planPollTimer = null;
+  state.activeRunId = null;
+  state.activePlan = null;
+  state.controlRevision = 0;
+  elements.planControl.hidden = true;
   elements.conversationLabel.textContent = "新研究会话";
   hideNotice();
   closeInspector();
@@ -1167,6 +1387,14 @@ elements.toolApprovalReject.addEventListener("click", () => resolveToolApproval(
 elements.memoriesClose.addEventListener("click", () => elements.memoriesDialog.close());
 elements.memoriesDialog.addEventListener("click", (event) => {
   if (event.target === elements.memoriesDialog) elements.memoriesDialog.close();
+});
+elements.planPause.addEventListener("click", () => sendRunControl("pause"));
+elements.planResume.addEventListener("click", () => sendRunControl("resume"));
+elements.planCancel.addEventListener("click", () => sendRunControl("cancel"));
+elements.planRefresh.addEventListener("click", refreshPlanControl);
+elements.planSaveObjective.addEventListener("click", () => {
+  const objective = elements.planObjective.value.trim();
+  if (objective) editActivePlan({ objective });
 });
 
 checkSession();

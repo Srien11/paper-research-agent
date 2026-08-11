@@ -46,3 +46,4 @@ class MainAgentGraphState(TypedDict, total=False):
     validation_errors: tuple[str, ...]
     commit_outcome: CommitOutcome
     route_trace: list[str]
+    resuming: bool

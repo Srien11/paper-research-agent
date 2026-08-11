@@ -134,6 +134,25 @@
             </div>
             <button id="inspector-close" class="icon-button mobile-only" type="button" aria-label="关闭上下文检查器">×</button>
           </div>
+          <section id="plan-control" class="plan-control" aria-labelledby="plan-control-title" hidden>
+            <div class="plan-control-heading">
+              <div>
+                <p class="eyebrow">RUN CONTROL</p>
+                <h3 id="plan-control-title">计划执行</h3>
+              </div>
+              <span id="plan-control-status" class="plan-status">准备中</span>
+            </div>
+            <div class="plan-actions" aria-label="运行控制">
+              <button id="plan-pause" class="button button-secondary" type="button">暂停</button>
+              <button id="plan-resume" class="button button-secondary" type="button">继续</button>
+              <button id="plan-cancel" class="button button-quiet" type="button">取消</button>
+              <button id="plan-refresh" class="button button-quiet" type="button">刷新</button>
+            </div>
+            <label class="plan-objective-label" for="plan-objective">目标与成功标准</label>
+            <textarea id="plan-objective" rows="3" maxlength="2000" placeholder="计划生成后可在暂停状态下修改目标"></textarea>
+            <button id="plan-save-objective" class="button button-secondary" type="button">保存目标</button>
+            <div id="plan-task-list" class="plan-task-list" aria-live="polite"></div>
+          </section>
           <div id="inspector-empty" class="inspector-empty">
             <p>完成一次提问后，这里会展示安全的检索状态、Token 统计和引用链路。</p>
           </div>

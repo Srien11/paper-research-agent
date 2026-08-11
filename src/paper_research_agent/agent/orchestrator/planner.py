@@ -173,6 +173,9 @@ class _TaskDraft(FrozenModel):
     success_criteria: tuple[str, ...] = Field(min_length=1, max_length=8)
     capability: Capability
     depends_on: tuple[str, ...] = Field(default=(), max_length=8)
+    execution_reason: str = Field(
+        default="完成目标所需的计划步骤", min_length=1, max_length=500
+    )
 
 
 class _TaskPlanDraft(FrozenModel):
@@ -253,6 +256,7 @@ class TaskPlanner:
                 capability=item.capability,
                 status="pending",
                 depends_on=item.depends_on,
+                execution_reason=item.execution_reason,
             )
             for item in draft.tasks
             if item.task_id not in kept_ids
@@ -300,6 +304,7 @@ class TaskPlanner:
             success_criteria=("完成当前请求",),
             capability=capability,
             status="pending",
+            execution_reason="直接完成当前请求并据此判断目标是否达成",
         )
         now = datetime.now(UTC)
         revision = (

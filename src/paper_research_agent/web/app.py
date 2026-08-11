@@ -19,7 +19,16 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from paper_research_agent.agent.observability import DeprecatedEndpoint
+from paper_research_agent.agent.orchestrator.control import (
+    AgentRunControl,
+    PlanEdit,
+    PlanEditConflict,
+    RunControlCommand,
+    RunControlConflict,
+    explain_task,
+)
 from paper_research_agent.agent.orchestrator.models import (
+    ConversationWorkspace,
     MainAgentRequest,
     MainAgentResult,
     MainAgentResumeRequest,
@@ -53,8 +62,14 @@ from paper_research_agent.web.events import AgentEventProjector
 from paper_research_agent.web.files import AttachmentStore
 from paper_research_agent.web.models import (
     AgentApprovalRequest,
+    AgentPlanEditRequest,
+    AgentPlanResponse,
+    AgentPlanTaskResponse,
+    AgentRunControlRequest,
+    AgentRunControlResponse,
     AgentRunRequest,
     AgentRunStatusResponse,
+    AgentTaskExplanationResponse,
     AnonymousSessionResponse,
     AskResponse,
     AttachmentResponse,
@@ -467,6 +482,55 @@ def _safe_agent_status(result: MainAgentResult) -> AgentRunStatusResponse:
     )
 
 
+def _safe_agent_control(control: AgentRunControl) -> AgentRunControlResponse:
+    return AgentRunControlResponse(
+        request_id=control.request_id,
+        run_id=control.run_id,
+        status=control.status,
+        revision=control.revision,
+        updated_at=control.updated_at.isoformat(),
+    )
+
+
+def _safe_agent_plan(
+    control: AgentRunControl, workspace: ConversationWorkspace
+) -> AgentPlanResponse:
+    plan = workspace.task_plan
+    goal = workspace.active_goal
+    if plan is None or goal is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="运行计划尚未生成",
+        )
+    return AgentPlanResponse(
+        control=_safe_agent_control(control),
+        workspace_version=workspace.version,
+        plan_revision=plan.revision,
+        objective=goal.objective,
+        acceptance_criteria=goal.acceptance_criteria,
+        tasks=tuple(
+            AgentPlanTaskResponse(
+                task_id=task.task_id,
+                title=task.title,
+                objective=task.objective,
+                success_criteria=task.success_criteria,
+                capability=task.capability,
+                status=task.status,
+                depends_on=task.depends_on,
+                attempt_count=task.attempt_count,
+                result_ref=task.result_ref,
+                blocked_reason=task.blocked_reason,
+                execution_reason=task.execution_reason,
+                max_seconds=task.budget.max_seconds,
+                max_calls=task.budget.max_calls,
+                max_cost_usd=task.budget.max_cost_usd,
+                elapsed_seconds=task.usage.elapsed_seconds,
+                call_count=task.usage.call_count,
+                cost_usd=task.usage.cost_usd,
+            )
+            for task in plan.tasks
+        ),
+    )
 def _validated_request_id(value: str) -> str:
     if _REQUEST_ID.fullmatch(value) is None:
         raise HTTPException(
@@ -837,6 +901,106 @@ def create_app(
                 detail="主 Agent 结果与当前会话不匹配",
             )
         return _agent_stream_response(result, reused=False)
+
+    async def owned_run_workspace(
+        request_id: str,
+        session: OwnerSession,
+        main_runtime: MainAgentRuntime,
+    ) -> tuple[AgentRunControl, ConversationWorkspace]:
+        snapshot = await main_runtime.load_workspace_for_run(
+            _validated_request_id(request_id)
+        )
+        if snapshot is None or snapshot[0].conversation_id != session.conversation_id:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="主 Agent 运行记录不存在",
+            )
+        return snapshot
+
+    @app.get(
+        f"{API_PREFIX}/agent/runs/{{request_id}}/plan",
+        response_model=AgentPlanResponse,
+    )
+    async def get_main_agent_plan(
+        request_id: str,
+        session: OwnerSession = Depends(current_session),  # noqa: B008
+        main_runtime: MainAgentRuntime = Depends(active_main_agent),  # noqa: B008
+    ) -> AgentPlanResponse:
+        control, workspace = await owned_run_workspace(
+            request_id, session, main_runtime
+        )
+        return _safe_agent_plan(control, workspace)
+
+    @app.post(
+        f"{API_PREFIX}/agent/runs/{{request_id}}/control",
+        response_model=AgentRunControlResponse,
+    )
+    async def control_main_agent_run(
+        request_id: str,
+        payload: AgentRunControlRequest,
+        _origin: None = Depends(require_origin),
+        session: OwnerSession = Depends(current_session),  # noqa: B008
+        main_runtime: MainAgentRuntime = Depends(active_main_agent),  # noqa: B008
+    ) -> AgentRunControlResponse:
+        await owned_run_workspace(request_id, session, main_runtime)
+        try:
+            control = await main_runtime.command_run(
+                request_id=request_id,
+                command=RunControlCommand(
+                    action=payload.action,
+                    expected_revision=payload.expected_revision,
+                ),
+            )
+        except RunControlConflict as error:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail=str(error)
+            ) from None
+        return _safe_agent_control(control)
+
+    @app.patch(
+        f"{API_PREFIX}/agent/runs/{{request_id}}/plan",
+        response_model=AgentPlanResponse,
+    )
+    async def edit_main_agent_plan(
+        request_id: str,
+        payload: AgentPlanEditRequest,
+        _origin: None = Depends(require_origin),
+        session: OwnerSession = Depends(current_session),  # noqa: B008
+        main_runtime: MainAgentRuntime = Depends(active_main_agent),  # noqa: B008
+    ) -> AgentPlanResponse:
+        control, _ = await owned_run_workspace(request_id, session, main_runtime)
+        try:
+            workspace = await main_runtime.edit_plan(
+                request_id=request_id,
+                edit=PlanEdit.model_validate(payload.model_dump()),
+            )
+        except (PlanEditConflict, RunControlConflict) as error:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail=str(error)
+            ) from None
+        refreshed = await main_runtime.load_control(request_id)
+        return _safe_agent_plan(refreshed or control, workspace)
+
+    @app.get(
+        f"{API_PREFIX}/agent/runs/{{request_id}}/tasks/{{task_id}}/explanation",
+        response_model=AgentTaskExplanationResponse,
+    )
+    async def explain_main_agent_task(
+        request_id: str,
+        task_id: str,
+        session: OwnerSession = Depends(current_session),  # noqa: B008
+        main_runtime: MainAgentRuntime = Depends(active_main_agent),  # noqa: B008
+    ) -> AgentTaskExplanationResponse:
+        _, workspace = await owned_run_workspace(request_id, session, main_runtime)
+        try:
+            explanation = explain_task(workspace, task_id)
+        except PlanEditConflict as error:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=str(error)
+            ) from None
+        return AgentTaskExplanationResponse(
+            task_id=task_id, explanation=explanation
+        )
 
     @app.get(f"{APP_PREFIX}/healthz", response_model=HealthResponse)
     async def health() -> HealthResponse:

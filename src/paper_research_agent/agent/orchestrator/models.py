@@ -39,6 +39,7 @@ RequestRelation = Literal[
 ]
 RunStatus = Literal[
     "running",
+    "paused",
     "waiting_user",
     "waiting_approval",
     "completed",
@@ -50,6 +51,22 @@ RunStatus = Literal[
 
 class FrozenModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class TaskBudget(FrozenModel):
+    """Hard limits applied to one task without affecting completed siblings."""
+
+    max_seconds: float | None = Field(default=None, gt=0, le=3600)
+    max_calls: int | None = Field(default=None, ge=1, le=100)
+    max_cost_usd: float | None = Field(default=None, ge=0, le=10_000)
+
+
+class TaskUsage(FrozenModel):
+    """Durable task resource counters used by resume and retry decisions."""
+
+    elapsed_seconds: float = Field(default=0, ge=0)
+    call_count: int = Field(default=0, ge=0)
+    cost_usd: float = Field(default=0, ge=0)
 
 
 class AcceptanceCriterion(FrozenModel):
@@ -107,6 +124,9 @@ class AgentTask(FrozenModel):
     attempt_count: int = Field(default=0, ge=0, le=5)
     result_ref: str | None = Field(default=None, max_length=128)
     blocked_reason: str | None = Field(default=None, max_length=500)
+    execution_reason: str = Field(default="完成目标所需的计划步骤", min_length=1, max_length=500)
+    budget: TaskBudget = Field(default_factory=TaskBudget)
+    usage: TaskUsage = Field(default_factory=TaskUsage)
 
     @field_validator("title", "objective")
     @classmethod
@@ -339,6 +359,7 @@ class ChildTaskResult(FrozenModel):
     pending_approval: dict[str, object] | None = None
     error_code: str | None = None
     artifact: ChildArtifact | None = None
+    estimated_cost_usd: float = Field(default=0, ge=0)
 
     @model_validator(mode="after")
     def validate_result_consistency(self) -> ChildTaskResult:
@@ -405,6 +426,9 @@ class AgentRunStart(FrozenModel):
         "running_reused",
         "completed_cached",
         "waiting_approval_cached",
+        "paused_cached",
+        "cancelled_cached",
+        "resuming",
         "failed_cached",
     ]
     result: MainAgentResult | None = None

@@ -6,6 +6,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from paper_research_agent.agent.orchestrator.control import TaskEdit
+from paper_research_agent.agent.orchestrator.models import AcceptanceCriterion
 from paper_research_agent.answering.models import RAGAnswer, StorageClass
 
 RAGMode = Literal["disabled", "preferred", "required"]
@@ -52,6 +54,75 @@ class AgentRunRequest(WebModel):
 
 class AgentApprovalRequest(WebModel):
     approved: bool
+
+
+class AgentRunControlRequest(WebModel):
+    action: Literal["pause", "resume", "cancel"]
+    expected_revision: int = Field(ge=0)
+
+
+class AgentRunControlResponse(WebModel):
+    request_id: str = Field(min_length=1, max_length=256)
+    run_id: str = Field(min_length=1, max_length=256)
+    status: Literal[
+        "running",
+        "pause_requested",
+        "paused",
+        "resuming",
+        "cancel_requested",
+        "cancelled",
+        "completed",
+        "failed",
+        "waiting_approval",
+    ]
+    revision: int = Field(ge=0)
+    updated_at: str = Field(min_length=1, max_length=64)
+
+
+class AgentPlanEditRequest(WebModel):
+    expected_revision: int = Field(ge=1)
+    objective: str | None = Field(default=None, min_length=1, max_length=2000)
+    acceptance_criteria: tuple[AcceptanceCriterion, ...] | None = Field(
+        default=None, max_length=12
+    )
+    ordered_task_ids: tuple[str, ...] | None = Field(default=None, min_length=1, max_length=12)
+    task_edits: tuple[TaskEdit, ...] = Field(default=(), max_length=12)
+    skip_task_ids: tuple[str, ...] = Field(default=(), max_length=12)
+    retry_task_ids: tuple[str, ...] = Field(default=(), max_length=12)
+
+
+class AgentPlanTaskResponse(WebModel):
+    task_id: str
+    title: str
+    objective: str
+    success_criteria: tuple[str, ...]
+    capability: str
+    status: str
+    depends_on: tuple[str, ...]
+    attempt_count: int = Field(ge=0)
+    result_ref: str | None = None
+    blocked_reason: str | None = None
+    execution_reason: str
+    max_seconds: float | None = None
+    max_calls: int | None = None
+    max_cost_usd: float | None = None
+    elapsed_seconds: float = Field(ge=0)
+    call_count: int = Field(ge=0)
+    cost_usd: float = Field(ge=0)
+
+
+class AgentPlanResponse(WebModel):
+    control: AgentRunControlResponse
+    workspace_version: int = Field(ge=0)
+    plan_revision: int = Field(ge=1)
+    objective: str
+    acceptance_criteria: tuple[AcceptanceCriterion, ...]
+    tasks: tuple[AgentPlanTaskResponse, ...]
+
+
+class AgentTaskExplanationResponse(WebModel):
+    task_id: str
+    explanation: str = Field(min_length=1, max_length=2000)
 
 
 class ToolApprovalRequest(WebModel):
@@ -189,6 +260,7 @@ class AgentRunStatusResponse(WebModel):
     run_id: str = Field(min_length=1, max_length=256)
     status: Literal[
         "running",
+        "paused",
         "waiting_user",
         "waiting_approval",
         "completed",

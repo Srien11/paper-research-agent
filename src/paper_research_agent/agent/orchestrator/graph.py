@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import UTC, datetime
 from typing import Any, Literal, cast
 
@@ -11,6 +12,7 @@ from langgraph.graph.state import CompiledStateGraph
 
 from paper_research_agent.agent.dynamic.models import PendingApproval
 from paper_research_agent.agent.orchestrator.children import ChildGraphDispatcher
+from paper_research_agent.agent.orchestrator.control import task_budget_exhausted
 from paper_research_agent.agent.orchestrator.evaluator import (
     MAX_CHILD_CALLS_PER_RUN,
     MAX_REPLANS_PER_RUN,
@@ -103,6 +105,23 @@ def build_main_agent_graph(
                 "final_answer": "该请求此前未通过提交校验。",
                 "termination_reason": "failed",
             }
+        if start.outcome == "cancelled_cached":
+            return {
+                "run_id": start.run_id,
+                "turn_id": start.turn_id,
+                "base_workspace_version": start.workspace.version,
+                "final_answer": start.result.answer if start.result is not None else "运行已取消。",
+                "termination_reason": "cancelled_cached",
+            }
+        if start.outcome == "paused_cached":
+            return {
+                "run_id": start.run_id,
+                "turn_id": start.turn_id,
+                "base_workspace_version": start.workspace.version,
+                "final_answer": start.result.answer if start.result is not None else "运行已暂停。",
+                "child_results": list(start.result.child_results) if start.result is not None else [],
+                "termination_reason": "paused_cached",
+            }
         if start.outcome == "waiting_approval_cached":
             cached = start.result
             update: MainAgentGraphState = {
@@ -116,6 +135,18 @@ def build_main_agent_graph(
             if cached is not None and cached.pending_approval is not None:
                 update["pending_approval"] = cached.pending_approval
             return update
+        if start.outcome == "resuming":
+            used_calls = sum(task.usage.call_count for task in (start.workspace.task_plan.tasks if start.workspace.task_plan is not None else ()))
+            return {
+                "run_id": start.run_id,
+                "turn_id": start.turn_id,
+                "base_workspace_version": start.workspace.version,
+                "workspace_draft": start.workspace,
+                "child_results": list(start.result.child_results) if start.result is not None else [],
+                "remaining_child_calls": max(0, max_child_calls - used_calls),
+                "remaining_replans": max_replans,
+                "resuming": True,
+            }
         return {
             "run_id": start.run_id,
             "turn_id": start.turn_id,
@@ -161,6 +192,23 @@ def build_main_agent_graph(
 
     async def select_next_task(state: MainAgentGraphState) -> MainAgentGraphState:
         workspace = ConversationWorkspace.model_validate(state["workspace_draft"])
+        control = await asyncio.to_thread(
+            repository.load_agent_control, run_id=str(state.get("run_id", ""))
+        )
+        if control is not None and control.status == "pause_requested":
+            return {
+                "workspace_draft": workspace,
+                "final_answer": "运行已暂停；已完成步骤及其结果均已保留。",
+                "termination_reason": "paused",
+                "next_action": "control_stop",
+            }
+        if control is not None and control.status == "cancel_requested":
+            return {
+                "workspace_draft": _cancel_open_tasks(workspace),
+                "final_answer": "运行已取消；已完成步骤及其结果均已保留。",
+                "termination_reason": "cancelled",
+                "next_action": "control_stop",
+            }
         selection = select_next_task_pure(workspace)
         if selection.outcome == "finalize":
             return {"next_action": "synthesize"}
@@ -179,6 +227,15 @@ def build_main_agent_graph(
             return {"workspace_draft": workspace, "next_action": "synthesize"}
         if selection.task_id is None:
             raise ValueError("execute selection requires a task id")
+        selected_task = _task_by_id(workspace, selection.task_id)
+        budget_reason = task_budget_exhausted(selected_task)
+        if budget_reason is not None:
+            return {
+                "workspace_draft": _fail_task_for_budget(
+                    workspace, selected_task.task_id, budget_reason
+                ),
+                "next_action": "select_next_task",
+            }
         return {"active_task_id": selection.task_id, "next_action": "route"}
 
     async def route_task(state: MainAgentGraphState) -> MainAgentGraphState:
@@ -190,10 +247,40 @@ def build_main_agent_graph(
 
     async def dispatch_child(state: MainAgentGraphState) -> MainAgentGraphState:
         child_request = _child_request(state)
-        result = await dispatcher.dispatch(child_request)
+        workspace = ConversationWorkspace.model_validate(state["workspace_draft"])
+        task = _task_by_id(workspace, child_request.task_id)
+        remaining_seconds = (
+            task.budget.max_seconds - task.usage.elapsed_seconds
+            if task.budget.max_seconds is not None
+            else None
+        )
+        started = time.perf_counter()
+        try:
+            if remaining_seconds is not None:
+                async with asyncio.timeout(max(0.001, remaining_seconds)):
+                    result = await dispatcher.dispatch(child_request)
+            else:
+                result = await dispatcher.dispatch(child_request)
+        except TimeoutError:
+            result = ChildTaskResult(
+                child_run_id=f"budget-{task.task_id}",
+                task_id=task.task_id,
+                capability=task.capability,
+                status="failed",
+                summary="任务超过单步时间预算。",
+                error_code="task_time_budget_exhausted",
+            )
+        elapsed = max(0.0, time.perf_counter() - started)
+        workspace = _record_task_usage(
+            workspace,
+            task.task_id,
+            elapsed_seconds=elapsed,
+            cost_usd=result.estimated_cost_usd,
+        )
         child_results = list(state.get("child_results", []))
         child_results.append(result)
         return {
+            "workspace_draft": workspace,
             "child_results": child_results,
             "child_result": result,
             "remaining_child_calls": int(
@@ -307,12 +394,23 @@ def build_main_agent_graph(
         request = MainAgentRequest.model_validate(state["request"])
         workspace = ConversationWorkspace.model_validate(state["workspace_draft"])
         pending = state.get("pending_approval")
-        status: Literal["waiting_approval", "completed"] = (
-            "waiting_approval" if pending is not None else "completed"
-        )
-        turn_status: ConversationStatus = (
-            "pending" if pending is not None else "completed"
-        )
+        termination = str(state.get("termination_reason", ""))
+        status: Literal["paused", "cancelled", "waiting_approval", "completed"]
+        if termination == "paused":
+            status = "paused"
+        elif termination == "cancelled":
+            status = "cancelled"
+        elif pending is not None:
+            status = "waiting_approval"
+        else:
+            status = "completed"
+        turn_status: ConversationStatus
+        if status in {"paused", "waiting_approval"}:
+            turn_status = "pending"
+        elif status == "cancelled":
+            turn_status = "cancelled"
+        else:
+            turn_status = "completed"
         answer = str(state.get("final_answer", ""))
         if not answer and status == "waiting_approval":
             answer = "等待敏感工具审批。"
@@ -364,9 +462,14 @@ def build_main_agent_graph(
             "waiting_approval",
             "waiting_approval_cached",
             "failed",
+            "paused_cached",
+            "cancelled_cached",
         }:
             return END
         return "hydrate_context"
+
+    def after_hydrate(state: MainAgentGraphState) -> str:
+        return "select_next_task" if state.get("resuming") else "interpret_turn"
 
     def after_interpret(state: MainAgentGraphState) -> str:
         raw = state.get("interpretation")
@@ -380,6 +483,10 @@ def build_main_agent_graph(
             return "route_task"
         if action == "clarify":
             return "clarify_response"
+        if action == "control_stop":
+            return "update_workspace_summary"
+        if action == "select_next_task":
+            return "select_next_task"
         return "synthesize_response"
 
     def after_route(state: MainAgentGraphState) -> str:
@@ -420,7 +527,11 @@ def build_main_agent_graph(
     builder.add_node("commit_turn", commit_turn)
     builder.add_edge(START, "initialize_turn")
     builder.add_conditional_edges("initialize_turn", after_initialize, {END: END, "hydrate_context": "hydrate_context"})
-    builder.add_edge("hydrate_context", "interpret_turn")
+    builder.add_conditional_edges(
+        "hydrate_context",
+        after_hydrate,
+        {"interpret_turn": "interpret_turn", "select_next_task": "select_next_task"},
+    )
     builder.add_conditional_edges(
         "interpret_turn",
         after_interpret,
@@ -438,6 +549,8 @@ def build_main_agent_graph(
             "route_task": "route_task",
             "clarify_response": "clarify_response",
             "synthesize_response": "synthesize_response",
+            "update_workspace_summary": "update_workspace_summary",
+            "select_next_task": "select_next_task",
         },
     )
     builder.add_conditional_edges(
@@ -683,6 +796,71 @@ def _task_by_id(workspace: ConversationWorkspace, task_id: str) -> AgentTask:
         if task.task_id == task_id:
             return task
     raise ValueError(f"unknown task id: {task_id}")
+
+
+def _replace_task(
+    workspace: ConversationWorkspace, task_id: str, updated_task: AgentTask
+) -> ConversationWorkspace:
+    plan = workspace.task_plan
+    if plan is None:
+        raise ValueError("no task plan in workspace")
+    tasks = tuple(
+        updated_task if task.task_id == task_id else task for task in plan.tasks
+    )
+    now = datetime.now(UTC)
+    return workspace.model_copy(
+        update={
+            "task_plan": plan.model_copy(update={"tasks": tasks, "updated_at": now}),
+            "updated_at": now,
+        }
+    )
+
+
+def _record_task_usage(
+    workspace: ConversationWorkspace,
+    task_id: str,
+    *,
+    elapsed_seconds: float,
+    cost_usd: float,
+) -> ConversationWorkspace:
+    task = _task_by_id(workspace, task_id)
+    usage = task.usage.model_copy(
+        update={
+            "elapsed_seconds": task.usage.elapsed_seconds + elapsed_seconds,
+            "call_count": task.usage.call_count + 1,
+            "cost_usd": task.usage.cost_usd + cost_usd,
+        }
+    )
+    return _replace_task(workspace, task_id, task.model_copy(update={"usage": usage}))
+
+
+def _fail_task_for_budget(
+    workspace: ConversationWorkspace, task_id: str, reason: str
+) -> ConversationWorkspace:
+    task = _task_by_id(workspace, task_id)
+    failed = task.model_copy(update={"status": "failed", "blocked_reason": reason})
+    return _replace_task(workspace, task_id, failed)
+
+
+def _cancel_open_tasks(workspace: ConversationWorkspace) -> ConversationWorkspace:
+    plan = workspace.task_plan
+    if plan is None:
+        return workspace
+    tasks = tuple(
+        task
+        if task.status in {"completed", "skipped", "cancelled"}
+        else task.model_copy(
+            update={"status": "cancelled", "blocked_reason": "用户取消运行"}
+        )
+        for task in plan.tasks
+    )
+    now = datetime.now(UTC)
+    return workspace.model_copy(
+        update={
+            "task_plan": plan.model_copy(update={"tasks": tasks, "updated_at": now}),
+            "updated_at": now,
+        }
+    )
 
 
 def _child_request(state: MainAgentGraphState) -> ChildTaskRequest:

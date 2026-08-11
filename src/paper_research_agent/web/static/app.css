@@ -321,6 +321,27 @@ kbd { padding: .1rem .3rem; background: #ebe6dc; border: 1px solid var(--line); 
 .inspector-header { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-3); padding-bottom: var(--space-5); border-bottom: 1px solid var(--line); }
 .inspector-empty { padding: var(--space-8) 0; color: var(--muted); font-size: .82rem; line-height: 1.65; }
 .inspector-section { padding: var(--space-5) 0; border-bottom: 1px solid var(--line); }
+.plan-control { padding: var(--space-4) 0 var(--space-5); border-bottom: 1px solid var(--line); }
+.plan-control-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: .75rem; }
+.plan-control-heading h3 { margin: 0; font-size: 1rem; }
+.plan-status { padding: .25rem .5rem; color: var(--forest); background: var(--forest-soft); border-radius: 999px; font-size: .7rem; font-weight: 700; }
+.plan-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .45rem; margin: .9rem 0; }
+.plan-actions .button { min-height: 2.25rem; padding: .4rem .65rem; font-size: .72rem; }
+.plan-objective-label { display: block; margin-bottom: .35rem; color: var(--muted); font-size: .72rem; font-weight: 700; }
+.plan-control textarea, .plan-task input { box-sizing: border-box; width: 100%; color: var(--ink); background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-sm); }
+.plan-control textarea { resize: vertical; padding: .65rem; font: inherit; font-size: .78rem; line-height: 1.45; }
+.plan-control > .button { width: 100%; margin-top: .45rem; }
+.plan-task-list { display: grid; gap: .65rem; margin-top: 1rem; }
+.plan-task { padding: .75rem; background: var(--surface-strong); border: 1px solid var(--line); border-radius: var(--radius-sm); }
+.plan-task header { display: flex; align-items: flex-start; justify-content: space-between; gap: .6rem; }
+.plan-task strong { font-size: .78rem; line-height: 1.4; }
+.plan-task small, .plan-task p { color: var(--muted); font-size: .7rem; line-height: 1.45; }
+.plan-task p { margin: .45rem 0; }
+.plan-task-budget { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .35rem; }
+.plan-task-budget label { color: var(--muted); font-size: .62rem; }
+.plan-task-budget input { margin-top: .2rem; padding: .35rem; font-size: .7rem; }
+.plan-task-actions { display: flex; flex-wrap: wrap; gap: .35rem; margin-top: .55rem; }
+.plan-task-actions button { min-height: 1.9rem; padding: .25rem .5rem; font-size: .66rem; }
 .metric-list { display: grid; gap: var(--space-3); margin: var(--space-4) 0 0; }
 .metric-list div { display: flex; justify-content: space-between; gap: var(--space-4); }
 .metric-list dt { color: var(--muted); font-size: .82rem; }

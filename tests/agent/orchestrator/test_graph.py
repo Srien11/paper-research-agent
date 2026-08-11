@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 from collections import deque
+from collections.abc import Callable
 from datetime import UTC, datetime
 
 from paper_research_agent.agent.orchestrator.artifacts import ChatArtifact
+from paper_research_agent.agent.orchestrator.control import RunControlCommand
 from paper_research_agent.agent.orchestrator.graph import build_main_agent_graph
 from paper_research_agent.agent.orchestrator.models import (
     AgentContextEnvelope,
@@ -175,12 +178,23 @@ class FakePlanner:
 
 
 class FakeDispatcher:
-    def __init__(self, *results: ChildTaskResult) -> None:
+    def __init__(
+        self,
+        *results: ChildTaskResult,
+        on_dispatch: Callable[[int], None] | None = None,
+        delay_seconds: float = 0,
+    ) -> None:
         self.results = deque(results)
         self.calls: list[object] = []
+        self.on_dispatch = on_dispatch
+        self.delay_seconds = delay_seconds
 
     async def dispatch(self, request: object) -> ChildTaskResult:
         self.calls.append(request)
+        if self.on_dispatch is not None:
+            self.on_dispatch(len(self.calls))
+        if self.delay_seconds:
+            await asyncio.sleep(self.delay_seconds)
         if not self.results:
             raise AssertionError("dispatcher exhausted its results")
         return self.results.popleft()
@@ -195,10 +209,16 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
         plan_decisions: tuple[TaskPlanDecision, ...] = (),
         dispatch_results: tuple[ChildTaskResult, ...] = (),
         max_child_calls: int = 3,
+        on_dispatch: Callable[[int], None] | None = None,
+        dispatch_delay_seconds: float = 0,
     ) -> tuple[object, InMemoryConversationStore, FakeDispatcher, FakePlanner]:
         resolved_store = store or InMemoryConversationStore()
         planner = FakePlanner(*plan_decisions)
-        dispatcher = FakeDispatcher(*dispatch_results)
+        dispatcher = FakeDispatcher(
+            *dispatch_results,
+            on_dispatch=on_dispatch,
+            delay_seconds=dispatch_delay_seconds,
+        )
         graph = build_main_agent_graph(
             repository=resolved_store,
             hydrator=FakeHydrator(),
@@ -510,6 +530,153 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
         statuses = [task.status for task in workspace.task_plan.tasks]
         self.assertIn("failed", statuses)
         self.assertEqual(len(dispatcher.calls), 1)
+
+    async def test_pause_then_resume_keeps_completed_step_without_rerun(self) -> None:
+        store = InMemoryConversationStore()
+
+        def pause_after_first(call_count: int) -> None:
+            if call_count == 1:
+                store.command_agent_run(
+                    request_id="request-pause-1234",
+                    command=RunControlCommand(action="pause", expected_revision=0),
+                )
+
+        plan = _plan_decision(
+            (
+                _task(task_id="first", capability="local_rag"),
+                _task(
+                    task_id="second",
+                    capability="local_rag",
+                    depends_on=("first",),
+                ),
+            )
+        )
+        graph, _, dispatcher, planner = self._build(
+            store=store,
+            plan_decisions=(plan,),
+            dispatch_results=(
+                _result(task_id="first", source_id="chunk-1"),
+                _result(task_id="second", source_id="chunk-2"),
+            ),
+            on_dispatch=pause_after_first,
+        )
+        request = MainAgentRequest(
+            request_id="request-pause-1234",
+            conversation_id="conversation-pause",
+            message="执行两步计划",
+            rag_mode="preferred",
+        )
+
+        paused = await self._run(graph, request)
+        self.assertEqual(paused["termination_reason"], "paused")
+        self.assertEqual(len(dispatcher.calls), 1)
+        paused_workspace = store.load_workspace("conversation-pause")
+        self.assertEqual(
+            [task.status for task in paused_workspace.task_plan.tasks],
+            ["completed", "pending"],
+        )
+
+        store.command_agent_run(
+            request_id=request.request_id,
+            command=RunControlCommand(action="resume", expected_revision=1),
+        )
+        resumed = await self._run(graph, request)
+        self.assertEqual(resumed["termination_reason"], "completed")
+        self.assertEqual(len(dispatcher.calls), 2)
+        self.assertEqual(planner.calls, 1)
+        completed = store.load_workspace("conversation-pause")
+        self.assertEqual(
+            [task.status for task in completed.task_plan.tasks],
+            ["completed", "completed"],
+        )
+        self.assertEqual(
+            [task.usage.call_count for task in completed.task_plan.tasks],
+            [1, 1],
+        )
+
+    async def test_cancel_keeps_completed_step_and_cancels_only_open_steps(self) -> None:
+        store = InMemoryConversationStore()
+
+        def cancel_after_first(call_count: int) -> None:
+            if call_count == 1:
+                store.command_agent_run(
+                    request_id="request-cancel-1234",
+                    command=RunControlCommand(action="cancel", expected_revision=0),
+                )
+
+        plan = _plan_decision(
+            (
+                _task(task_id="first"),
+                _task(task_id="second", depends_on=("first",)),
+            )
+        )
+        graph, _, dispatcher, _ = self._build(
+            store=store,
+            plan_decisions=(plan,),
+            dispatch_results=(_result(task_id="first"),),
+            on_dispatch=cancel_after_first,
+        )
+        request = MainAgentRequest(
+            request_id="request-cancel-1234",
+            conversation_id="conversation-cancel",
+            message="执行两步计划",
+            rag_mode="preferred",
+        )
+        state = await self._run(graph, request)
+        self.assertEqual(state["termination_reason"], "cancelled")
+        self.assertEqual(len(dispatcher.calls), 1)
+        workspace = store.load_workspace("conversation-cancel")
+        self.assertEqual(
+            [task.status for task in workspace.task_plan.tasks],
+            ["completed", "cancelled"],
+        )
+
+    async def test_per_task_call_budget_fails_without_dispatch(self) -> None:
+        from paper_research_agent.agent.orchestrator.models import TaskBudget, TaskUsage
+
+        task = _task(
+            task_id="limited",
+            budget=TaskBudget(max_calls=1),
+            usage=TaskUsage(call_count=1),
+        )
+        graph, store, dispatcher, _ = self._build(
+            plan_decisions=(_plan_decision((task,)),),
+        )
+        request = MainAgentRequest(
+            request_id="request-budget-1234",
+            conversation_id="conversation-budget",
+            message="执行受限任务",
+            rag_mode="preferred",
+        )
+        await self._run(graph, request)
+        self.assertEqual(dispatcher.calls, [])
+        workspace = store.load_workspace("conversation-budget")
+        limited = workspace.task_plan.tasks[0]
+        self.assertEqual(limited.status, "failed")
+        self.assertEqual(limited.blocked_reason, "call_budget_exhausted")
+
+    async def test_per_task_time_budget_interrupts_only_that_step(self) -> None:
+        from paper_research_agent.agent.orchestrator.models import TaskBudget
+
+        task = _task(task_id="timed", budget=TaskBudget(max_seconds=0.001))
+        graph, store, dispatcher, _ = self._build(
+            plan_decisions=(_plan_decision((task,)),),
+            dispatch_results=(_result(task_id="timed"),),
+            dispatch_delay_seconds=0.05,
+        )
+        request = MainAgentRequest(
+            request_id="request-time-12345",
+            conversation_id="conversation-time",
+            message="执行限时任务",
+            rag_mode="preferred",
+        )
+        await self._run(graph, request)
+        self.assertEqual(len(dispatcher.calls), 1)
+        workspace = store.load_workspace("conversation-time")
+        timed = workspace.task_plan.tasks[0]
+        self.assertEqual(timed.status, "failed")
+        self.assertEqual(timed.usage.call_count, 1)
+        self.assertGreaterEqual(timed.usage.elapsed_seconds, 0.001)
 
     async def test_cached_request_returns_cached_answer(self) -> None:
         plan = _plan_decision((_task(task_id="local", capability="local_rag"),))

@@ -3,12 +3,25 @@ from __future__ import annotations
 import json
 import os
 import unittest
+from datetime import UTC, datetime
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
 from paper_research_agent.agent.orchestrator.artifacts import ChatArtifact, FileArtifact
-from paper_research_agent.agent.orchestrator.models import ChildTaskResult, MainAgentResult
+from paper_research_agent.agent.orchestrator.control import (
+    AgentRunControl,
+    apply_plan_edit,
+    transition_run_control,
+)
+from paper_research_agent.agent.orchestrator.models import (
+    AgentTask,
+    ChildTaskResult,
+    ConversationWorkspace,
+    GoalState,
+    MainAgentResult,
+    TaskPlan,
+)
 from paper_research_agent.conversation.store import InMemoryConversationStore
 from paper_research_agent.web.app import create_app
 from paper_research_agent.web.config import OwnerCredentials, WebConfig
@@ -48,6 +61,42 @@ class _MainRuntime:
         self.resume_calls: list[tuple[str, bool]] = []
         self.error: Exception | None = None
         self.clear_calls: list[str] = []
+        now = datetime(2026, 8, 11, tzinfo=UTC)
+        goal_id = "d" * 32
+        self.control = AgentRunControl(
+            request_id=REQUEST_ID,
+            run_id="a" * 32,
+            conversation_id="placeholder",
+            updated_at=now,
+        )
+        self.workspace = ConversationWorkspace(
+            conversation_id="placeholder",
+            active_goal=GoalState(
+                goal_id=goal_id,
+                objective="完成研究计划",
+                origin_turn_id="e" * 32,
+                created_at=now,
+                updated_at=now,
+            ),
+            task_plan=TaskPlan(
+                plan_id="f" * 32,
+                goal_id=goal_id,
+                tasks=(
+                    AgentTask(
+                        task_id="step-1",
+                        goal_id=goal_id,
+                        title="检索证据",
+                        objective="找到证据",
+                        success_criteria=("找到来源",),
+                        capability="local_rag",
+                        execution_reason="先建立证据基础",
+                    ),
+                ),
+                created_at=now,
+                updated_at=now,
+            ),
+            updated_at=now,
+        )
 
     async def run(self, request: object) -> MainAgentResult:
         self.requests.append(request)
@@ -105,6 +154,24 @@ class _MainRuntime:
     async def clear(self, conversation_id: str) -> None:
         self.clear_calls.append(conversation_id)
 
+    async def load_workspace_for_run(self, request_id: str):
+        if request_id != self.control.request_id:
+            return None
+        return self.control, self.workspace
+
+    async def load_control(self, request_id: str):
+        return self.control if request_id == self.control.request_id else None
+
+    async def command_run(self, *, request_id: str, command):
+        assert request_id == self.control.request_id
+        self.control = transition_run_control(self.control, command)
+        return self.control
+
+    async def edit_plan(self, *, request_id: str, edit):
+        assert request_id == self.control.request_id
+        self.workspace = apply_plan_edit(self.workspace, edit)
+        return self.workspace
+
 
 def _events(response: object) -> list[dict[str, object]]:
     text = str(response.text)
@@ -141,6 +208,13 @@ class MainAgentApiTests(unittest.TestCase):
             json={"username": "owner", "password": "correct-password"},
         )
         self.assertEqual(login.status_code, 200)
+        conversation_id = self._conversation_id()
+        self.main.control = self.main.control.model_copy(
+            update={"conversation_id": conversation_id}
+        )
+        self.main.workspace = self.main.workspace.model_copy(
+            update={"conversation_id": conversation_id}
+        )
 
     def tearDown(self) -> None:
         self.client_context.__exit__(None, None, None)
@@ -170,6 +244,46 @@ class MainAgentApiTests(unittest.TestCase):
         self.assertNotIn("内部摘要", response.text)
         request = self.main.requests[0]
         self.assertEqual(request.request_id, REQUEST_ID)
+
+    def test_plan_control_edit_and_explanation_endpoints(self) -> None:
+        plan = self.client.get(
+            f"/paper-research/api/agent/runs/{REQUEST_ID}/plan"
+        )
+        self.assertEqual(plan.status_code, 200, plan.text)
+        self.assertEqual(plan.json()["tasks"][0]["execution_reason"], "先建立证据基础")
+
+        paused = self.client.post(
+            f"/paper-research/api/agent/runs/{REQUEST_ID}/control",
+            headers={"Origin": ORIGIN},
+            json={"action": "pause", "expected_revision": 0},
+        )
+        self.assertEqual(paused.status_code, 200, paused.text)
+        self.assertEqual(paused.json()["status"], "pause_requested")
+        self.main.control = self.main.control.model_copy(update={"status": "paused"})
+
+        edited = self.client.patch(
+            f"/paper-research/api/agent/runs/{REQUEST_ID}/plan",
+            headers={"Origin": ORIGIN},
+            json={
+                "expected_revision": 1,
+                "objective": "调整后的研究计划",
+                "task_edits": [
+                    {
+                        "task_id": "step-1",
+                        "budget": {"max_seconds": 45, "max_calls": 2},
+                    }
+                ],
+            },
+        )
+        self.assertEqual(edited.status_code, 200, edited.text)
+        self.assertEqual(edited.json()["objective"], "调整后的研究计划")
+        self.assertEqual(edited.json()["tasks"][0]["max_calls"], 2)
+
+        explanation = self.client.get(
+            f"/paper-research/api/agent/runs/{REQUEST_ID}/tasks/step-1/explanation"
+        )
+        self.assertEqual(explanation.status_code, 200, explanation.text)
+        self.assertIn("先建立证据基础", explanation.json()["explanation"])
 
     def test_duplicate_request_is_projected_as_reused_and_status_is_queryable(self) -> None:
         payload = {

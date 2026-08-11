@@ -33,6 +33,7 @@ AgentStreamEventType = Literal[
 ]
 AgentPublicStatus = Literal[
     "running",
+    "paused",
     "waiting_user",
     "waiting_approval",
     "completed",

@@ -14,11 +14,21 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol, cast
 
+from paper_research_agent.agent.orchestrator.control import (
+    AgentRunControl,
+    PlanEdit,
+    RunControlCommand,
+    RunControlConflict,
+    RunControlStatus,
+    apply_plan_edit,
+    transition_run_control,
+)
 from paper_research_agent.agent.orchestrator.models import (
     AgentApprovalClaim,
     AgentRunStart,
     CommitOutcome,
     ConversationWorkspace,
+    MainAgentRequest,
     MainAgentResult,
 )
 from paper_research_agent.conversation.models import (
@@ -62,12 +72,31 @@ class ConversationStore(Protocol):
     ) -> tuple[ConversationEpisode, ...]: ...
 
     def begin_agent_run(
-        self, *, request_id: str, conversation_id: str, user_question: str
+        self,
+        *,
+        request_id: str,
+        conversation_id: str,
+        user_question: str,
+        request: MainAgentRequest | None = None,
     ) -> AgentRunStart: ...
 
     def load_workspace(self, conversation_id: str) -> ConversationWorkspace: ...
 
     def load_agent_run(self, request_id: str) -> MainAgentResult | None: ...
+
+    def load_agent_request(self, request_id: str) -> MainAgentRequest | None: ...
+
+    def load_agent_control(
+        self, *, request_id: str | None = None, run_id: str | None = None
+    ) -> AgentRunControl | None: ...
+
+    def command_agent_run(
+        self, *, request_id: str, command: RunControlCommand
+    ) -> AgentRunControl: ...
+
+    def edit_agent_plan(
+        self, *, request_id: str, edit: PlanEdit
+    ) -> ConversationWorkspace: ...
 
     def commit_agent_run(
         self,
@@ -139,7 +168,12 @@ class SQLiteConversationStore:
         )
 
     def begin_agent_run(
-        self, *, request_id: str, conversation_id: str, user_question: str
+        self,
+        *,
+        request_id: str,
+        conversation_id: str,
+        user_question: str,
+        request: MainAgentRequest | None = None,
     ) -> AgentRunStart:
         normalized_id = _conversation_id(conversation_id)
         normalized_question = _question(user_question)
@@ -203,6 +237,27 @@ class SQLiteConversationStore:
                         outcome="waiting_approval_cached",
                         result=result,
                     )
+                if existing_status in {"paused", "cancelled", "resuming"}:
+                    result = (
+                        MainAgentResult.model_validate_json(str(existing[3]))
+                        if existing[3] is not None
+                        else None
+                    )
+                    outcome = {
+                        "paused": "paused_cached",
+                        "cancelled": "cancelled_cached",
+                        "resuming": "resuming",
+                    }[existing_status]
+                    connection.commit()
+                    return AgentRunStart(
+                        run_id=run_id,
+                        request_id=normalized_request,
+                        conversation_id=normalized_id,
+                        turn_id=turn_id,
+                        workspace=workspace,
+                        outcome=outcome,  # type: ignore[arg-type]
+                        result=result,
+                    )
                 connection.commit()
                 return AgentRunStart(
                     run_id=run_id,
@@ -258,17 +313,24 @@ class SQLiteConversationStore:
             connection.execute(
                 """INSERT INTO main_agent_runs (
                        run_id, request_id, conversation_id, turn_id, base_workspace_version,
-                       status, created_at, updated_at
-                   ) VALUES (?, ?, ?, ?, ?, 'running', ?, ?)""",
+                       status, request_json, created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?)""",
                 (
                     run_id,
                     normalized_request,
                     normalized_id,
                     turn_id,
                     workspace.version,
+                    request.model_dump_json() if request is not None else None,
                     created.isoformat(),
                     created.isoformat(),
                 ),
+            )
+            connection.execute(
+                """INSERT INTO main_agent_controls (
+                       request_id, run_id, conversation_id, status, revision, updated_at
+                   ) VALUES (?, ?, ?, 'running', 0, ?)""",
+                (normalized_request, run_id, normalized_id, created.isoformat()),
             )
             connection.commit()
         return AgentRunStart(
@@ -298,9 +360,125 @@ class SQLiteConversationStore:
                 "SELECT status, result_json FROM main_agent_runs WHERE request_id = ?",
                 (normalized,),
             ).fetchone()
-        if row is None or str(row[0]) not in {"completed", "waiting_approval"} or row[1] is None:
+        if row is None or row[1] is None:
             return None
         return MainAgentResult.model_validate_json(str(row[1]))
+
+    def load_agent_request(self, request_id: str) -> MainAgentRequest | None:
+        normalized = _request_id(request_id)
+        with self._lock, closing(self._connect()) as connection:
+            row = connection.execute(
+                """SELECT r.request_json, r.conversation_id, t.user_question
+                   FROM main_agent_runs r
+                   JOIN conversation_turns t ON t.turn_id = r.turn_id
+                   WHERE r.request_id = ?""",
+                (normalized,),
+            ).fetchone()
+        if row is None:
+            return None
+        if row[0] is not None:
+            return MainAgentRequest.model_validate_json(str(row[0]))
+        return MainAgentRequest(
+            request_id=normalized,
+            conversation_id=str(row[1]),
+            message=str(row[2]),
+            rag_mode="preferred",
+        )
+
+    def load_agent_control(
+        self, *, request_id: str | None = None, run_id: str | None = None
+    ) -> AgentRunControl | None:
+        column, value = _control_lookup(request_id=request_id, run_id=run_id)
+        with self._lock, closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT request_id, run_id, conversation_id, status, revision, updated_at "
+                f"FROM main_agent_controls WHERE {column} = ?",
+                (value,),
+            ).fetchone()
+        return _control_row(row) if row is not None else None
+
+    def command_agent_run(
+        self, *, request_id: str, command: RunControlCommand
+    ) -> AgentRunControl:
+        normalized = _request_id(request_id)
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT request_id, run_id, conversation_id, status, revision, updated_at "
+                "FROM main_agent_controls WHERE request_id = ?",
+                (normalized,),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                raise RunControlConflict("run control not found")
+            updated = transition_run_control(_control_row(row), command)
+            cursor = connection.execute(
+                """UPDATE main_agent_controls
+                   SET status = ?, revision = ?, updated_at = ?
+                   WHERE request_id = ? AND revision = ?""",
+                (
+                    updated.status,
+                    updated.revision,
+                    updated.updated_at.isoformat(),
+                    normalized,
+                    command.expected_revision,
+                ),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                raise RunControlConflict("run control revision conflict")
+            if updated.status == "resuming" or (
+                updated.status == "cancel_requested"
+                and _control_row(row).status in {"paused", "waiting_approval"}
+            ):
+                connection.execute(
+                    "UPDATE main_agent_runs SET status = 'resuming', updated_at = ? "
+                    "WHERE request_id = ? AND status IN ('paused', 'waiting_approval')",
+                    (updated.updated_at.isoformat(), normalized),
+                )
+            connection.commit()
+        return updated
+
+    def edit_agent_plan(
+        self, *, request_id: str, edit: PlanEdit
+    ) -> ConversationWorkspace:
+        normalized = _request_id(request_id)
+        now = datetime.now(UTC)
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            run = connection.execute(
+                "SELECT conversation_id, status, result_json FROM main_agent_runs "
+                "WHERE request_id = ?",
+                (normalized,),
+            ).fetchone()
+            if run is None or str(run[1]) != "paused":
+                connection.rollback()
+                raise RunControlConflict("plan edits require a paused run")
+            workspace = self._workspace_row(connection, str(run[0]))
+            edited = apply_plan_edit(workspace, edit, now=now).model_copy(
+                update={"version": workspace.version + 1, "updated_at": now}
+            )
+            connection.execute(
+                "UPDATE conversation_workspaces SET version = ?, state_json = ?, updated_at = ? "
+                "WHERE conversation_id = ? AND version = ?",
+                (
+                    edited.version,
+                    edited.model_dump_json(),
+                    now.isoformat(),
+                    edited.conversation_id,
+                    workspace.version,
+                ),
+            )
+            if run[2] is not None:
+                result = MainAgentResult.model_validate_json(str(run[2])).model_copy(
+                    update={"workspace_version": edited.version}
+                )
+                connection.execute(
+                    "UPDATE main_agent_runs SET result_json = ?, updated_at = ? WHERE request_id = ?",
+                    (result.model_dump_json(), now.isoformat(), normalized),
+                )
+            connection.commit()
+        return edited
 
     def commit_agent_run(
         self,
@@ -401,6 +579,10 @@ class SQLiteConversationStore:
                 ),
             )
             connection.execute(
+                "UPDATE main_agent_controls SET status = ?, updated_at = ? WHERE run_id = ?",
+                (_control_status_for_result(result.status), completed.isoformat(), run_id),
+            )
+            connection.execute(
                 """UPDATE main_agent_runs
                    SET status = ?, committed_workspace_version = ?, result_json = ?,
                        updated_at = ?
@@ -494,6 +676,10 @@ class SQLiteConversationStore:
                    SET status = 'failed', failure_code = ?, updated_at = ?
                    WHERE run_id = ?""",
                 (failure_code, completed.isoformat(), run_id),
+            )
+            connection.execute(
+                "UPDATE main_agent_controls SET status = 'failed', updated_at = ? WHERE run_id = ?",
+                (completed.isoformat(), run_id),
             )
             connection.commit()
         return CommitOutcome(
@@ -622,6 +808,9 @@ class SQLiteConversationStore:
                 "DELETE FROM conversation_workspaces WHERE conversation_id = ?", (normalized,)
             )
             connection.execute(
+                "DELETE FROM main_agent_controls WHERE conversation_id = ?", (normalized,)
+            )
+            connection.execute(
                 "DELETE FROM main_agent_runs WHERE conversation_id = ?", (normalized,)
             )
         return int(cursor.rowcount)
@@ -739,12 +928,22 @@ class SQLiteConversationStore:
                     status TEXT NOT NULL,
                     failure_code TEXT,
                     result_json TEXT,
+                    request_json TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY(turn_id) REFERENCES conversation_turns(turn_id)
                 );
                 CREATE INDEX IF NOT EXISTS main_agent_runs_conversation_idx
                     ON main_agent_runs(conversation_id, created_at DESC);
+                CREATE TABLE IF NOT EXISTS main_agent_controls (
+                    request_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL UNIQUE,
+                    conversation_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(run_id) REFERENCES main_agent_runs(run_id)
+                );
                 """
             )
             columns = {
@@ -763,6 +962,10 @@ class SQLiteConversationStore:
             if "failure_code" not in run_columns:
                 connection.execute(
                     "ALTER TABLE main_agent_runs ADD COLUMN failure_code TEXT"
+                )
+            if "request_json" not in run_columns:
+                connection.execute(
+                    "ALTER TABLE main_agent_runs ADD COLUMN request_json TEXT"
                 )
 
     def _connect(self) -> sqlite3.Connection:
@@ -816,6 +1019,7 @@ class _AgentRunRecord:
     result: MainAgentResult | None = None
     committed_workspace_version: int | None = None
     failure_code: str | None = None
+    request: MainAgentRequest | None = None
 
 
 class InMemoryConversationStore:
@@ -826,6 +1030,7 @@ class InMemoryConversationStore:
         self._turns: dict[str, ConversationTurn] = {}
         self._workspaces: dict[str, ConversationWorkspace] = {}
         self._runs: dict[str, _AgentRunRecord] = {}
+        self._controls: dict[str, AgentRunControl] = {}
 
     def begin_turn(self, conversation_id: str, user_question: str) -> ConversationTurn:
         normalized_id = _conversation_id(conversation_id)
@@ -851,7 +1056,12 @@ class InMemoryConversationStore:
         return turn
 
     def begin_agent_run(
-        self, *, request_id: str, conversation_id: str, user_question: str
+        self,
+        *,
+        request_id: str,
+        conversation_id: str,
+        user_question: str,
+        request: MainAgentRequest | None = None,
     ) -> AgentRunStart:
         normalized_id = _conversation_id(conversation_id)
         normalized_question = _question(user_question)
@@ -892,6 +1102,21 @@ class InMemoryConversationStore:
                         turn_id=existing.turn_id,
                         workspace=workspace,
                         outcome="waiting_approval_cached",
+                        result=existing.result,
+                    )
+                if existing.status in {"paused", "cancelled", "resuming"}:
+                    outcome = {
+                        "paused": "paused_cached",
+                        "cancelled": "cancelled_cached",
+                        "resuming": "resuming",
+                    }[existing.status]
+                    return AgentRunStart(
+                        run_id=existing.run_id,
+                        request_id=normalized_request,
+                        conversation_id=normalized_id,
+                        turn_id=existing.turn_id,
+                        workspace=workspace,
+                        outcome=outcome,  # type: ignore[arg-type]
                         result=existing.result,
                     )
                 return AgentRunStart(
@@ -937,6 +1162,13 @@ class InMemoryConversationStore:
                 turn_id=turn_id,
                 status="running",
                 base_workspace_version=workspace.version,
+                request=request,
+            )
+            self._controls[normalized_request] = AgentRunControl(
+                request_id=normalized_request,
+                run_id=run_id,
+                conversation_id=normalized_id,
+                updated_at=created,
             )
         return AgentRunStart(
             run_id=run_id,
@@ -959,9 +1191,79 @@ class InMemoryConversationStore:
         normalized = _request_id(request_id)
         with self._lock:
             record = self._runs.get(normalized)
-        if record is None or record.status not in {"completed", "waiting_approval"}:
+        if record is None:
             return None
         return record.result
+
+    def load_agent_request(self, request_id: str) -> MainAgentRequest | None:
+        normalized = _request_id(request_id)
+        with self._lock:
+            record = self._runs.get(normalized)
+            if record is None:
+                return None
+            if record.request is not None:
+                return record.request
+            turn = self._turns.get(record.turn_id)
+            if turn is None:
+                return None
+            return MainAgentRequest(
+                request_id=record.request_id,
+                conversation_id=record.conversation_id,
+                message=turn.user_question,
+                rag_mode="preferred",
+            )
+
+    def load_agent_control(
+        self, *, request_id: str | None = None, run_id: str | None = None
+    ) -> AgentRunControl | None:
+        _, value = _control_lookup(request_id=request_id, run_id=run_id)
+        with self._lock:
+            if request_id is not None:
+                return self._controls.get(value)
+            return next(
+                (item for item in self._controls.values() if item.run_id == value), None
+            )
+
+    def command_agent_run(
+        self, *, request_id: str, command: RunControlCommand
+    ) -> AgentRunControl:
+        normalized = _request_id(request_id)
+        with self._lock:
+            current = self._controls.get(normalized)
+            if current is None:
+                raise RunControlConflict("run control not found")
+            updated = transition_run_control(current, command)
+            self._controls[normalized] = updated
+            if updated.status == "resuming":
+                record = self._runs[normalized]
+                if record.status == "paused":
+                    record.status = "resuming"
+            elif updated.status == "cancel_requested" and current.status in {
+                "paused",
+                "waiting_approval",
+            }:
+                self._runs[normalized].status = "resuming"
+            return updated
+
+    def edit_agent_plan(
+        self, *, request_id: str, edit: PlanEdit
+    ) -> ConversationWorkspace:
+        normalized = _request_id(request_id)
+        now = datetime.now(UTC)
+        with self._lock:
+            record = self._runs.get(normalized)
+            if record is None or record.status != "paused":
+                raise RunControlConflict("plan edits require a paused run")
+            workspace = self._workspaces[record.conversation_id]
+            edited = apply_plan_edit(workspace, edit, now=now).model_copy(
+                update={"version": workspace.version + 1, "updated_at": now}
+            )
+            self._workspaces[record.conversation_id] = edited
+            if record.result is not None:
+                record.result = record.result.model_copy(
+                    update={"workspace_version": edited.version}
+                )
+            return edited
 
     def commit_agent_run(
         self,
@@ -1037,6 +1339,14 @@ class InMemoryConversationStore:
             record.status = result.status
             record.result = result
             record.committed_workspace_version = next_version
+            control = self._controls.get(record.request_id)
+            if control is not None:
+                self._controls[record.request_id] = control.model_copy(
+                    update={
+                        "status": _control_status_for_result(result.status),
+                        "updated_at": created,
+                    }
+                )
         return CommitOutcome(committed=True, reason="committed", workspace_version=next_version)
 
     def fail_agent_run(
@@ -1091,6 +1401,11 @@ class InMemoryConversationStore:
             )
             record.status = "failed"
             record.failure_code = failure_code
+            control = self._controls.get(record.request_id)
+            if control is not None:
+                self._controls[record.request_id] = control.model_copy(
+                    update={"status": "failed", "updated_at": completed}
+                )
         return CommitOutcome(
             committed=True,
             reason="failed",
@@ -1188,6 +1503,7 @@ class InMemoryConversationStore:
                 if record.conversation_id == normalized
             ]:
                 self._runs.pop(request_id, None)
+                self._controls.pop(request_id, None)
         return len(targets)
 
     def agent_checkpoint_threads(
@@ -1244,6 +1560,34 @@ def _request_id(value: str) -> str:
     if not normalized or len(normalized) > 256 or any(char.isspace() for char in normalized):
         raise ValueError("request_id is invalid")
     return normalized
+
+
+def _control_lookup(
+    *, request_id: str | None, run_id: str | None
+) -> tuple[str, str]:
+    if (request_id is None) == (run_id is None):
+        raise ValueError("provide exactly one of request_id or run_id")
+    if request_id is not None:
+        return "request_id", _request_id(request_id)
+    assert run_id is not None
+    return "run_id", _request_id(run_id)
+
+
+def _control_row(row: Sequence[object]) -> AgentRunControl:
+    return AgentRunControl(
+        request_id=str(row[0]),
+        run_id=str(row[1]),
+        conversation_id=str(row[2]),
+        status=cast(RunControlStatus, str(row[3])),
+        revision=int(str(row[4])),
+        updated_at=datetime.fromisoformat(str(row[5])),
+    )
+
+
+def _control_status_for_result(status: str) -> RunControlStatus:
+    if status in {"paused", "cancelled", "completed", "failed", "waiting_approval"}:
+        return cast(RunControlStatus, status)
+    return "running"
 
 
 def _question(value: str) -> str:

@@ -216,6 +216,33 @@ class MainAgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(graph.calls, 1)
         self.assertEqual(first.run_id, second.run_id)
 
+    async def test_immediate_resume_waits_for_paused_inflight_release(self) -> None:
+        graph = _FakeGraph()
+        runtime = MainAgentRuntime(
+            graph=graph,
+            repository=InMemoryConversationStore(),
+            timeout_seconds=5,
+        )
+        request = _request(request_id="request-resume-race")
+
+        async def finishing_pause() -> MainAgentResult:
+            await asyncio.sleep(0.01)
+            return MainAgentResult(
+                run_id="p" * 32,
+                request_id=request.request_id,
+                conversation_id=request.conversation_id,
+                status="paused",
+            )
+
+        previous = asyncio.create_task(finishing_pause())
+        runtime._inflight[request.request_id] = previous
+        runtime._inflight_conversations[request.request_id] = request.conversation_id
+
+        result = await runtime._run_after_previous_release(request)
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(graph.calls, 1)
+
     async def test_cancelled_caller_does_not_cancel_shared_business_run(self) -> None:
         graph = _FakeGraph(delay=0.1)
         runtime = MainAgentRuntime(

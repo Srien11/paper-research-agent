@@ -20,8 +20,14 @@ from paper_research_agent.agent.observability import (
     emit_agent_event,
     safe_fingerprint,
 )
+from paper_research_agent.agent.orchestrator.control import (
+    AgentRunControl,
+    PlanEdit,
+    RunControlCommand,
+)
 from paper_research_agent.agent.orchestrator.models import (
     ChildTaskResult,
+    ConversationWorkspace,
     MainAgentRequest,
     MainAgentResult,
     MainAgentResumeRequest,
@@ -120,6 +126,7 @@ class MainAgentRuntime:
                 request_id=request.request_id,
                 conversation_id=request.conversation_id,
                 user_question=request.message,
+                request=request,
             )
             should_emit = start.outcome == "created"
             common = _EventContext(
@@ -206,6 +213,78 @@ class MainAgentRuntime:
                     started_at=started_at,
                 )
             return result
+
+    async def load_control(self, request_id: str) -> AgentRunControl | None:
+        """Read the durable control state for polling and optimistic commands."""
+
+        return await asyncio.to_thread(
+            self._repository.load_agent_control, request_id=request_id
+        )
+
+    async def command_run(
+        self, *, request_id: str, command: RunControlCommand
+    ) -> AgentRunControl:
+        """Pause/cancel cooperatively, or resume from the last committed step boundary."""
+
+        if self._closed:
+            raise RuntimeError("main agent runtime is closed")
+        previous = await self.load_control(request_id)
+        control = await asyncio.to_thread(
+            self._repository.command_agent_run,
+            request_id=request_id,
+            command=command,
+        )
+        restart_for_cancel = (
+            command.action == "cancel"
+            and previous is not None
+            and previous.status in {"paused", "waiting_approval"}
+        )
+        if command.action == "resume" or restart_for_cancel:
+            request = await asyncio.to_thread(
+                self._repository.load_agent_request, request_id
+            )
+            if request is None:
+                raise ValueError("main agent request not found")
+            resumed = asyncio.create_task(
+                self._run_after_previous_release(request),
+                name=f"main-agent-resume::{request_id}",
+            )
+            resumed.add_done_callback(_consume_background_result)
+        return control
+
+    async def _run_after_previous_release(
+        self, request: MainAgentRequest
+    ) -> MainAgentResult:
+        """Avoid reusing the just-finished paused task during an immediate resume."""
+
+        async with self._guard:
+            previous = self._inflight.get(request.request_id)
+        if previous is not None:
+            await asyncio.shield(previous)
+            await self._release_inflight(request.request_id, previous)
+        return await self.run(request)
+
+    async def edit_plan(
+        self, *, request_id: str, edit: PlanEdit
+    ) -> ConversationWorkspace:
+        """Edit a paused plan atomically while keeping completed task facts immutable."""
+
+        if self._closed:
+            raise RuntimeError("main agent runtime is closed")
+        return await asyncio.to_thread(
+            self._repository.edit_agent_plan, request_id=request_id, edit=edit
+        )
+
+    async def load_workspace_for_run(
+        self, request_id: str
+    ) -> tuple[AgentRunControl, ConversationWorkspace] | None:
+        control = await self.load_control(request_id)
+        if control is None:
+            return None
+        workspace = await asyncio.to_thread(
+            self._repository.load_workspace, control.conversation_id
+        )
+        return control, workspace
 
     async def resume_approval(
         self, *, request_id: str, approved: bool
@@ -437,6 +516,10 @@ def _result_from_state(
         "cached": "completed",
         "waiting_approval": "waiting_approval",
         "waiting_approval_cached": "waiting_approval",
+        "paused": "paused",
+        "paused_cached": "paused",
+        "cancelled": "cancelled",
+        "cancelled_cached": "cancelled",
         "running_reused": "running",
         "failed": "failed",
     }
@@ -444,8 +527,9 @@ def _result_from_state(
     base_workspace_version = int(state.get("base_workspace_version", 0))
     workspace_version = (
         base_workspace_version + 1
-        if status in {"completed", "waiting_approval"}
-        and reason not in {"cached", "waiting_approval_cached"}
+        if status in {"completed", "waiting_approval", "paused", "cancelled"}
+        and reason
+        not in {"cached", "waiting_approval_cached", "paused_cached", "cancelled_cached"}
         else base_workspace_version
     )
     return MainAgentResult(
@@ -466,6 +550,11 @@ def _result_from_state(
 
 def _elapsed_ms(started_at: float) -> float:
     return max(0.0, (time.perf_counter() - started_at) * 1000)
+
+
+def _consume_background_result(task: asyncio.Task[MainAgentResult]) -> None:
+    if not task.cancelled():
+        task.exception()
 
 
 def _observable_run_id(value: str) -> str:
