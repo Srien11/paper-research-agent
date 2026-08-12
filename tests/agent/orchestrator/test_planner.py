@@ -442,18 +442,57 @@ class TaskPlannerTests(unittest.TestCase):
         self.assertEqual(len(decision.plan.tasks), 1)
         self.assertEqual(decision.plan.tasks[0].goal_id, "a" * 32)
 
-    def test_keep_preserves_existing_plan(self) -> None:
+    def test_resume_after_approval_preserves_existing_plan(self) -> None:
         current = _plan(tasks=(_task(),))
         envelope = _envelope(workspace=_workspace(task_plan=current))
         decision = asyncio.run(
             TaskPlanner().plan(
                 envelope,
-                _interpretation("continue_goal"),
+                _interpretation("resume_after_approval"),
                 _goal_decision(action="keep"),  # type: ignore[arg-type]
             )
         )
         self.assertEqual(decision.action, "keep")
         self.assertIs(decision.plan, current)
+
+    def test_new_turn_replans_completed_plan_when_goal_is_kept(self) -> None:
+        current = _plan(tasks=(_task(task_id="answer", status="completed"),))
+        envelope = _envelope(
+            current_message="agent性能判断标准",
+            workspace=_workspace(task_plan=current),
+        )
+        fake = _FakeModel(
+            [
+                {
+                    "tasks": (
+                        {
+                            "task_id": "answer",
+                            "title": "重新回答本轮问题",
+                            "objective": "回答 agent 性能判断标准",
+                            "success_criteria": ("给出本轮答案",),
+                            "capability": "direct_chat",
+                        },
+                    )
+                }
+            ]
+        )
+
+        decision = asyncio.run(
+            TaskPlanner(model=fake).plan(
+                envelope,
+                _interpretation(
+                    "answer_within_goal",
+                    resolved_request="回答 agent 性能判断标准",
+                ),
+                _goal_decision(action="keep"),  # type: ignore[arg-type]
+            )
+        )
+
+        self.assertEqual(decision.action, "revise")
+        self.assertEqual(fake.calls, 1)
+        self.assertEqual(len(decision.plan.tasks), 1)
+        self.assertEqual(decision.plan.tasks[0].status, "pending")
+        self.assertEqual(decision.plan.revision, 2)
 
     def test_disabled_rag_fallback_uses_direct_chat(self) -> None:
         envelope = _envelope(

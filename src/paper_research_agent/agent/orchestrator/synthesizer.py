@@ -92,7 +92,7 @@ class AnswerSynthesizer:
     ) -> SynthesizedAnswer:
         results = _latest_results(child_results)
         if not results:
-            return _deterministic_answer(())
+            raise ValueError("cannot synthesize an answer with no child results")
         if len(results) == 1 and results[0].status == "completed":
             return _single_answer(results[0])
         if self._model is None:
@@ -143,12 +143,7 @@ def _deterministic_answer(
     results: tuple[ChildTaskResult, ...],
 ) -> SynthesizedAnswer:
     if not results:
-        section = SynthesizedSection(
-            task_id="main-agent",
-            source_kind="none",
-            text="已完成。",
-        )
-        return SynthesizedAnswer(text=section.text, sections=(section,))
+        raise ValueError("cannot synthesize an answer with no child results")
     sections = tuple(_section_from_result(result) for result in results)
     return SynthesizedAnswer(
         text=_render_sections(sections),

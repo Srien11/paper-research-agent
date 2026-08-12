@@ -648,8 +648,10 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
             message="执行受限任务",
             rag_mode="preferred",
         )
-        await self._run(graph, request)
+        state = await self._run(graph, request)
         self.assertEqual(dispatcher.calls, [])
+        self.assertNotEqual(state["final_answer"], "已完成。")
+        self.assertIn("call_budget_exhausted", state["final_answer"])
         workspace = store.load_workspace("conversation-budget")
         limited = workspace.task_plan.tasks[0]
         self.assertEqual(limited.status, "failed")

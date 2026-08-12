@@ -216,24 +216,47 @@ def build_main_agent_graph(
             return {"next_action": "clarify"}
         remaining = int(state.get("remaining_child_calls", max_child_calls))
         if remaining <= 0:
+            task_id = str(selection.task_id)
+            selected_task = _task_by_id(workspace, task_id)
             evaluation = TaskEvaluation(
-                task_id=str(selection.task_id),
+                task_id=task_id,
                 outcome="fail",
                 reason="整轮子图调用预算耗尽",
             )
             workspace = reduce_workspace(
-                workspace, task_id=str(selection.task_id), evaluation=evaluation
+                workspace, task_id=task_id, evaluation=evaluation
             )
-            return {"workspace_draft": workspace, "next_action": "synthesize"}
+            child_results = list(state.get("child_results", []))
+            child_results.append(
+                _budget_failure_result(
+                    selected_task,
+                    reason="run_call_budget_exhausted",
+                    summary="整轮子任务调用预算已耗尽，当前任务未执行。",
+                )
+            )
+            return {
+                "workspace_draft": workspace,
+                "child_results": child_results,
+                "next_action": "synthesize",
+            }
         if selection.task_id is None:
             raise ValueError("execute selection requires a task id")
         selected_task = _task_by_id(workspace, selection.task_id)
         budget_reason = task_budget_exhausted(selected_task)
         if budget_reason is not None:
+            child_results = list(state.get("child_results", []))
+            child_results.append(
+                _budget_failure_result(
+                    selected_task,
+                    reason=budget_reason,
+                    summary=f"任务因预算限制未执行：{budget_reason}。",
+                )
+            )
             return {
                 "workspace_draft": _fail_task_for_budget(
                     workspace, selected_task.task_id, budget_reason
                 ),
+                "child_results": child_results,
                 "next_action": "select_next_task",
             }
         return {"active_task_id": selection.task_id, "next_action": "route"}
@@ -840,6 +863,19 @@ def _fail_task_for_budget(
     task = _task_by_id(workspace, task_id)
     failed = task.model_copy(update={"status": "failed", "blocked_reason": reason})
     return _replace_task(workspace, task_id, failed)
+
+
+def _budget_failure_result(
+    task: AgentTask, *, reason: str, summary: str
+) -> ChildTaskResult:
+    return ChildTaskResult(
+        child_run_id=f"budget-{task.task_id}",
+        task_id=task.task_id,
+        capability=task.capability,
+        status="failed",
+        summary=summary,
+        error_code=reason,
+    )
 
 
 def _cancel_open_tasks(workspace: ConversationWorkspace) -> ConversationWorkspace:

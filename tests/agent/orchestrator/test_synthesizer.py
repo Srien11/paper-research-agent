@@ -115,6 +115,10 @@ def _dynamic_child() -> ChildTaskResult:
 
 
 class AnswerSynthesizerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_empty_child_results_cannot_be_reported_as_completed(self) -> None:
+        with self.assertRaisesRegex(ValueError, "no child results"):
+            await AnswerSynthesizer().synthesize(_context(), ())
+
     async def test_single_local_rag_result_is_not_rewritten(self) -> None:
         child = _local_child()
         synthesizer = AnswerSynthesizer()

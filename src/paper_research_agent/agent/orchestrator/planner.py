@@ -205,7 +205,10 @@ class TaskPlanner:
         goal_decision: GoalDecision,
     ) -> TaskPlanDecision:
         current = envelope.workspace.task_plan
-        if goal_decision.action == "keep":
+        if goal_decision.action == "keep" and (
+            interpretation.relation == "resume_after_approval"
+            or (goal_decision.goal is None and current is None)
+        ):
             return TaskPlanDecision(
                 action="keep", plan=current, rationale="目标未变，计划保持不变"
             )
@@ -242,7 +245,7 @@ class TaskPlanner:
         goal_id = _goal_id(goal_decision, current, envelope)
         completed = (
             tuple(task for task in current.tasks if task.status == "completed")
-            if current is not None
+            if current is not None and goal_decision.action == "revise"
             else ()
         )
         kept_ids = {task.task_id for task in completed}
