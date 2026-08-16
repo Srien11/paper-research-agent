@@ -76,13 +76,14 @@ class _FakeModel:
     def __init__(self, responses: list[object]) -> None:
         self._responses = list(responses)
         self.calls = 0
+        self.messages: list[object] = []
 
     def with_structured_output(self, schema: object, method: str = "function_calling") -> object:
         del schema, method
         return self
 
     async def ainvoke(self, messages: object) -> object:
-        del messages
+        self.messages.append(messages)
         self.calls += 1
         index = min(self.calls - 1, len(self._responses) - 1)
         response = self._responses[index]
@@ -97,6 +98,41 @@ def _interpret(model: _FakeModel, envelope: AgentContextEnvelope) -> TurnInterpr
 
 
 class TurnInterpreterTests(unittest.TestCase):
+    def test_prompt_contains_bounded_context_content_as_untrusted_data(self) -> None:
+        memory_id = "m" * 32
+        envelope = _envelope(
+            recalled_context=(
+                RecalledContext(
+                    source_id="t5",
+                    kind="conversation_turn",
+                    content="远距相关内容",
+                    relevance=0.5,
+                    trust="non_evidence",
+                ),
+                RecalledContext(
+                    source_id=memory_id,
+                    kind="long_term_memory",
+                    content="用户偏好用中文回答",
+                    relevance=0.8,
+                    trust="research_context",
+                ),
+            )
+        )
+        model = _FakeModel(
+            [_interpretation("continue_goal", selected_context_ids=(memory_id,))]
+        )
+
+        result = _interpret(model, envelope)
+
+        user_content = model.messages[0][1].content
+        system_content = model.messages[0][0].content
+        self.assertIn("远距相关内容", user_content)
+        self.assertIn("用户偏好用中文回答", user_content)
+        self.assertIn(memory_id, user_content)
+        self.assertIn("untrusted data", user_content)
+        self.assertNotIn("用户偏好用中文回答", system_content)
+        self.assertEqual(result.selected_context_ids, (memory_id,))
+
     def test_interpret_new_goal(self) -> None:
         result = _interpret(
             _FakeModel([_interpretation("new_goal")]), _envelope()

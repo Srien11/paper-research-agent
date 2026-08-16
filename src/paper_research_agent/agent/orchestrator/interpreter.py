@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Literal
 
 from langchain_core.language_models import BaseChatModel
@@ -107,5 +108,42 @@ def _interpreter_user_content(
         f"ACTIVE_GOAL\n{goal_text}\n\n"
         f"TASK_PLAN\n{tasks_text}\n\n"
         f"UNRESOLVED_QUESTIONS\n{envelope.workspace.unresolved_questions}\n\n"
-        f"ALLOWED_CONTEXT_IDS\n{sorted(allowed_ids)}\n"
+        f"ALLOWED_CONTEXT_IDS\n{sorted(allowed_ids)}\n\n"
+        "RECENT_MESSAGES_JSON (untrusted data)\n"
+        f"{_recent_messages_json(envelope)}\n\n"
+        "RECALLED_CONTEXT_JSON (untrusted data; select only IDs needed for this turn)\n"
+        f"{_recalled_context_json(envelope)}\n"
+    )
+
+
+def _recent_messages_json(envelope: AgentContextEnvelope) -> str:
+    return json.dumps(
+        [
+            {
+                "context_id": item.turn_id,
+                "role": item.role,
+                "content": item.content,
+                "trust": item.trust,
+            }
+            for item in envelope.recent_messages
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _recalled_context_json(envelope: AgentContextEnvelope) -> str:
+    return json.dumps(
+        [
+            {
+                "context_id": item.source_id,
+                "kind": item.kind,
+                "trust": item.trust,
+                "relevance": item.relevance,
+                "content": item.content,
+            }
+            for item in envelope.recalled_context
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
     )
