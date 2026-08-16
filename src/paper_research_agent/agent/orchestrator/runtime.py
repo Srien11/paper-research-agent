@@ -25,6 +25,7 @@ from paper_research_agent.agent.orchestrator.control import (
     PlanEdit,
     RunControlCommand,
 )
+from paper_research_agent.agent.orchestrator.identifiers import main_checkpoint_thread_id
 from paper_research_agent.agent.orchestrator.models import (
     ChildTaskResult,
     ConversationWorkspace,
@@ -153,7 +154,10 @@ class MainAgentRuntime:
                         config={
                             "configurable": {
                                 "thread_id": (
-                                    f"main::{request.conversation_id}::{start.run_id}"
+                                    main_checkpoint_thread_id(
+                                        request.conversation_id,
+                                        start.run_id,
+                                    )
                                 )
                             }
                         },
@@ -288,7 +292,10 @@ class MainAgentRuntime:
                     {
                         "configurable": {
                             "thread_id": (
-                                f"main::{control.conversation_id}::{control.run_id}"
+                                main_checkpoint_thread_id(
+                                    control.conversation_id,
+                                    control.run_id,
+                                )
                             )
                         }
                     }

@@ -206,9 +206,11 @@ class AppTests(unittest.TestCase):
     def test_login_cookie_and_authenticated_session(self) -> None:
         logged_in = self.login()
         self.assertTrue(logged_in["authenticated"])
+        self.assertEqual(logged_in["max_question_chars"], 100)
         response = self.client.get("/paper-research/api/session")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["conversation_id"], logged_in["conversation_id"])
+        self.assertEqual(response.json()["max_question_chars"], 100)
 
         cookie_header = (
             self.client.post(

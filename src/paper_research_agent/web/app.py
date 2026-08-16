@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Protocol, cast
 from urllib.parse import quote
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -212,7 +212,10 @@ def _runtime_error_response(error: Exception) -> HTTPException:
             detail="本地论文库尚未配置，请关闭‘仅使用本地论文库（RAG）’后继续交流",
         )
     if isinstance(error, ValueError):
-        return HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="问题无效")
+        return HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="问答服务内部契约校验失败",
+        )
     return HTTPException(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         detail="问答服务暂时不可用",
@@ -574,8 +577,8 @@ def _main_agent_runtime_error(error: Exception, *, approval: bool = False) -> HT
         )
     if isinstance(error, ValueError):
         return HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="主 Agent 请求无效",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="主 Agent 内部契约校验失败",
         )
     return HTTPException(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -1045,6 +1048,7 @@ def create_app(
         return SessionResponse(
             conversation_id=session.conversation_id,
             expires_at=session.expires_at,
+            max_question_chars=settings.max_question_chars,
         )
 
     @app.post(f"{API_PREFIX}/login", response_model=SessionResponse)
@@ -1060,6 +1064,7 @@ def create_app(
         return SessionResponse(
             conversation_id=session.conversation_id,
             expires_at=session.expires_at,
+            max_question_chars=settings.max_question_chars,
         )
 
     @app.get(
@@ -1109,7 +1114,11 @@ def create_app(
     async def list_conversations(
         session: OwnerSession = Depends(current_session),  # noqa: B008
     ) -> ConversationArchiveResponse:
-        dialogues = await asyncio.to_thread(conversation.store.conversations, limit=500)
+        dialogues = await asyncio.to_thread(
+            conversation.store.conversations,
+            limit=50,
+            include_messages=False,
+        )
         return ConversationArchiveResponse(
             current_conversation_id=session.conversation_id,
             conversations=tuple(
@@ -1118,18 +1127,49 @@ def create_app(
                     title=item.title,
                     created_at=item.created_at.isoformat(),
                     updated_at=item.updated_at.isoformat(),
-                    messages=tuple(
-                        ConversationMessageResponse(
-                            role=message.role,
-                            text=message.text,
-                            status=message.status,
-                            created_at=message.created_at.isoformat(),
-                        )
-                        for message in item.messages
-                    ),
+                    messages=(),
+                    messages_loaded=False,
                 )
                 for item in dialogues
             ),
+        )
+
+    @app.get(
+        f"{API_PREFIX}/conversations/{{conversation_id}}",
+        response_model=ConversationArchiveItemResponse,
+    )
+    async def get_conversation(
+        conversation_id: str,
+        message_limit: int = Query(default=24, ge=2, le=1_000),
+        _session: OwnerSession = Depends(current_session),  # noqa: B008
+    ) -> ConversationArchiveItemResponse:
+        dialogue = await asyncio.to_thread(
+            conversation.store.conversation,
+            conversation_id,
+        )
+        if dialogue is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="历史对话不存在",
+            )
+        selected = dialogue.messages[-message_limit:]
+        return ConversationArchiveItemResponse(
+            conversation_id=dialogue.conversation_id,
+            title=dialogue.title,
+            created_at=dialogue.created_at.isoformat(),
+            updated_at=dialogue.updated_at.isoformat(),
+            messages=tuple(
+                ConversationMessageResponse(
+                    role=message.role,
+                    text=message.text,
+                    status=message.status,
+                    created_at=message.created_at.isoformat(),
+                )
+                for message in selected
+            ),
+            messages_loaded=True,
+            has_more_messages=len(dialogue.messages) > len(selected),
+            message_count=len(dialogue.messages),
         )
 
     @app.post(
@@ -1143,8 +1183,8 @@ def create_app(
         _origin: None = Depends(require_origin),
         _session: OwnerSession = Depends(current_session),  # noqa: B008
     ) -> SessionResponse:
-        known = await asyncio.to_thread(conversation.store.conversations, limit=500)
-        if conversation_id not in {item.conversation_id for item in known}:
+        known = await asyncio.to_thread(conversation.store.conversation, conversation_id)
+        if known is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="历史对话不存在",
@@ -1159,6 +1199,7 @@ def create_app(
         return SessionResponse(
             conversation_id=selected.conversation_id,
             expires_at=selected.expires_at,
+            max_question_chars=settings.max_question_chars,
         )
 
     @app.delete(f"{API_PREFIX}/conversation", response_model=SessionResponse)
@@ -1177,6 +1218,7 @@ def create_app(
         return SessionResponse(
             conversation_id=selected.conversation_id,
             expires_at=selected.expires_at,
+            max_question_chars=settings.max_question_chars,
         )
 
     @app.post(f"{API_PREFIX}/ask", response_model=AskResponse)

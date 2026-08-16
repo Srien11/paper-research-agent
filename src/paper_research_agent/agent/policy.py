@@ -31,6 +31,7 @@ class ResearchRuntimePolicy(BaseModel):
     )
     max_followup_steps: int = Field(default=MAX_FOLLOWUP_STEPS, ge=0, le=MAX_FOLLOWUP_STEPS)
     max_dynamic_tool_steps: int = Field(default=6, ge=1, le=12)
+    comparison_search_concurrency: int = Field(default=2, ge=1, le=4)
     evidence_per_step: int = Field(default=4, ge=1, le=20)
     max_tool_calls: int = Field(
         default=ABSOLUTE_MAX_TOOL_CALLS,

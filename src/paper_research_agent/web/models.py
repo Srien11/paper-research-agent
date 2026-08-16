@@ -133,6 +133,7 @@ class SessionResponse(WebModel):
     authenticated: Literal[True] = True
     conversation_id: str = Field(min_length=16)
     expires_at: int = Field(gt=0)
+    max_question_chars: int = Field(ge=100, le=10_000)
 
 
 class AnonymousSessionResponse(WebModel):
@@ -156,6 +157,9 @@ class ConversationArchiveItemResponse(WebModel):
     created_at: str = Field(min_length=1, max_length=64)
     updated_at: str = Field(min_length=1, max_length=64)
     messages: tuple[ConversationMessageResponse, ...] = Field(max_length=1_000)
+    messages_loaded: bool = True
+    has_more_messages: bool = False
+    message_count: int | None = Field(default=None, ge=0, le=1_000)
 
 
 class ConversationArchiveResponse(WebModel):
@@ -191,7 +195,7 @@ class SafeEvidenceSource(WebModel):
     page_end: int = Field(ge=1)
     evidence_type: Literal["text", "figure_summary"]
     storage_class: StorageClass
-    excerpt: str = Field(min_length=1, max_length=1_200)
+    excerpt: str = Field(min_length=1, max_length=2_000)
     final_rank: int = Field(ge=1)
 
 
@@ -261,7 +265,7 @@ class AskResponse(WebModel):
 
 class SafeToolObservation(WebModel):
     sequence: int = Field(ge=1)
-    tool_name: str = Field(pattern=r"^[a-z][a-z0-9_]{1,63}$")
+    tool_name: str = Field(pattern=r"^[a-z][a-z0-9_-]{1,127}$")
     purpose: str = Field(min_length=1, max_length=500)
     status: Literal["ok", "not_found", "insufficient", "approval_required", "denied"]
     trust: Literal["citation_evidence", "research_context", "computed_result", "side_effect"]
@@ -269,7 +273,7 @@ class SafeToolObservation(WebModel):
 
 
 class SafePendingToolApproval(WebModel):
-    tool_name: str = Field(pattern=r"^[a-z][a-z0-9_]{1,63}$")
+    tool_name: str = Field(pattern=r"^[a-z][a-z0-9_-]{1,127}$")
     purpose: str = Field(min_length=1, max_length=500)
     arguments_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     expires_at_epoch: float = Field(gt=0)

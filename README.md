@@ -15,7 +15,7 @@
 - **状态、安全与审批**：SQLite Checkpoint 恢复 thread；笔记、报告和长期记忆写入使用与工具名、参数哈希绑定的一次性审批令牌，避免旧确认复用到新参数。
 - **后端智能路由**：前端提交问题、附件和明确的 `rag_mode`（`disabled` / `preferred` / `required`）；关闭时禁止本地检索，优先模式允许本地 RAG、普通聊天和联网研究动态分流，仅本地模式则强制使用论文库。策略层继续校验路由合法性，高风险覆盖、删除和外发仍要求确认。
 - **隐私可观测性**：事件日志仅记录指纹、耗时、计数、路由和原因码，不记录问题、证据正文或 Provider 原始载荷；论文原文、本地索引、密钥、运行数据库和内部资料均不进入 Git。
-- **资源受控部署**：针对 2 核 2G 环境采用单 worker、串行重任务和 850MB systemd 内存上限，将模型推理与重排交给外部服务；发布门禁要求自动测试不少于 596 项且全部通过。
+- **本机资源调度**：面向 16 逻辑线程的单用户工作站采用单进程共享索引、两路比较检索和有界本地模型线程池；远端模型 I/O 与本地检索分层限流，避免用多 worker 重复加载模型。发布门禁要求自动测试不少于 596 项且全部通过。
 
 ## 当前里程碑
 
@@ -396,17 +396,24 @@ JSON 均关闭失败。没有可用证据时在本地直接返回“证据不足
 提供公开导出模式。v1 审计只记录已验证回答和本地证据不足结果；Provider 超时、非法 JSON
 或引用校验失败不会写库，也不会伪装成“证据不足”。
 
-## 站长私有可视化研究台
+## 本机私有可视化研究台
 
 `paper_research_agent.web` 将现有 RAG 包装为常驻 FastAPI 服务：启动时只加载一次
-6,252 个 chunks、BM25、FAISS、BGE 和 Reranker，后续问题复用同一运行时。生产环境只
-运行一个 Uvicorn worker，并用单查询锁保护本地 CPU 模型；服务仅监听回环地址，由 Nginx
-在 `/paper-research/` 下同源代理。
+6,252 个 chunks、BM25、FAISS、BGE 和 Reranker，后续问题复用同一运行时。本机只运行
+一个 Uvicorn worker（工作进程），让所有请求共享索引和模型；完整 RAG 请求保持单通道，
+论文比较的检索阶段最多并发两路。服务只监听 `127.0.0.1:8092`，不依赖 Nginx 或公网域名。
+
+前端会话历史采用按需加载：登录后先返回最多 50 个会话的标题和更新时间，不携带历史消息；
+随后只为当前会话加载最近 24 条消息。存在更早内容时由“加载更早消息”每次追加 24 条，避免
+首屏一次解析全部会话、回答和 Agent 结果。这里优化的是界面历史记录的传输与渲染，不是主
+Agent 的上下文水合（Context Hydration）。`scripts/smoke_web_runtime.py --summary-only` 可执行
+不输出回答正文的真实运行时冒烟，并分别记录冷启动、请求和总耗时。
 
 因为完整索引包含 30 篇 `internal_research_only` 论文，首页项目卡可以公开，但真实问答、
 引用摘录、英文改写、短期记忆和上下文检查器全部要求站长登录。登录后由服务端生成不可猜测
-的 conversation ID，并通过 `HttpOnly + Secure + SameSite=Strict` 签名 Cookie 绑定；
-浏览器不能自选 session ID，也不会保存站长密码。POST 请求还会校验精确同源 Origin。
+的 conversation ID，并通过 `HttpOnly + SameSite=Strict` 签名 Cookie 绑定；本机 HTTP
+运行时关闭 `Secure`，如果将来改为 HTTPS 再重新启用。浏览器不能自选 session ID，也不会
+保存站长密码。POST 请求还会校验精确同源 Origin。
 
 安装 Web 依赖后，以环境变量提供私有路径与凭据并启动：
 
@@ -416,21 +423,20 @@ $env:PRA_MAIN_AGENT_MODE = 'primary'
 python scripts/serve_web.py --host 127.0.0.1 --port 8092
 ```
 
-启动日志必须显示 `主 Agent Web 启动模式：primary`。若统一入口出现数据撕裂、
-重复副作用、引用丢失或持续提交拒绝，执行以下回滚并重启同一服务：
+启动日志必须显示 `主 Agent Web 启动模式：primary`。若统一入口在本机调试时出现数据撕裂、
+重复副作用、引用丢失或持续提交拒绝，可切到兼容模式并重启同一服务：
 
 ```powershell
 $env:PRA_MAIN_AGENT_MODE = 'legacy'
 python scripts/serve_web.py --host 127.0.0.1 --port 8092
 ```
 
-回滚不删除主 Agent checkpoint、Conversation Store（会话存储）或事件库，也不得在
-生产 SQLite 中手工改状态。问题修复后复用原数据验证，再显式切回 `primary`。
+切换兼容模式不会删除主 Agent checkpoint、Conversation Store（会话存储）或事件库，也不要
+手工修改本机 SQLite 状态。问题修复后复用原数据验证，再显式切回 `primary`。
 
-生产凭据优先复用个人站现有 `ZHIMO_ADMIN_USER`、`ZHIMO_ADMIN_SALT`、
-`ZHIMO_ADMIN_HASH` 和 `ZHIMO_PBKDF2_ITERATIONS`；另需独立设置至少 32 字节的
-`PRA_WEB_SESSION_SECRET`。本地开发也可改用 `PRA_WEB_USER` 与 `PRA_WEB_PASSWORD`。
-这些变量、DashScope Key、论文派生数据、模型缓存与运行数据库均不得进入 Git 或部署代码包。
+本机登录使用 `.env` 中的 `PRA_WEB_USER`、`PRA_WEB_PASSWORD`，并单独设置至少 32 字节的
+`PRA_WEB_SESSION_SECRET`。这些变量、DashScope Key、论文派生数据、模型缓存与运行数据库
+均不得进入 Git。
 
 研究台返回安全字段白名单：中文回答与 claims、引用编号、论文标题、官方链接、页码、版权
 分类、短摘录，以及改写状态、入选证据/记忆数量和 Token 预算。它不会返回 PDF 路径、图片

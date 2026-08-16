@@ -142,6 +142,10 @@ class ExtendedResearchToolkit:
                 result = result.model_copy(
                     update={"tool_name": tool.public_name, "trust": effective_spec.trust}
                 )
+                if len(result.items) > effective_spec.max_result_items:
+                    raise ValueError(
+                        "tool provider returned more items than its registered contract"
+                    )
         except TimeoutError:
             self._event(
                 resolved_run_id,

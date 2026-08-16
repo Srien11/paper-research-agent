@@ -604,6 +604,8 @@ class RAGRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(policy.max_steps, 24)
         self.assertEqual(policy.max_followup_steps, 4)
+        self.assertEqual(policy.comparison_search_concurrency, 2)
+        self.assertEqual(policy.evidence_per_step, 4)
         self.assertEqual(policy.max_tool_calls, 48)
         self.assertEqual(policy.timeout_seconds, 180)
 
@@ -627,6 +629,7 @@ class RAGRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "PRA_ANSWER_AUDIT_PATH": "private/answer-audit.sqlite3",
             "PRA_SECTIONS_PATH": "private/sections.jsonl",
             "PRA_ELEMENTS_PATH": "private/elements.jsonl",
+            "PRA_LOCAL_RETRIEVAL_WORKERS": "3",
         }
         with (
             patch.dict("os.environ", environment, clear=True),
@@ -641,6 +644,7 @@ class RAGRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["answer_audit_path"], Path("private/answer-audit.sqlite3"))
         self.assertEqual(kwargs["sections_path"], Path("private/sections.jsonl"))
         self.assertEqual(kwargs["elements_path"], Path("private/elements.jsonl"))
+        self.assertEqual(kwargs["local_retrieval_workers"], 3)
 
     def test_agent_environment_flag_is_explicit_and_fail_closed(self) -> None:
         with patch.dict("os.environ", {}, clear=True):
@@ -674,6 +678,7 @@ class RAGRuntimeTests(unittest.IsolatedAsyncioTestCase):
         environment = {
             "PRA_PROJECT_ROOT": "project-root",
             "PRA_RESEARCH_AGENT_CHECKPOINT_PATH": "private/agent.sqlite3",
+            "PRA_COMPARISON_SEARCH_CONCURRENCY": "3",
             "PRA_RESEARCH_AGENT_EVIDENCE_PER_STEP": "3",
             "PRA_RESEARCH_AGENT_TIMEOUT_SECONDS": "45",
         }
@@ -696,6 +701,7 @@ class RAGRuntimeTests(unittest.IsolatedAsyncioTestCase):
             Path("project-root/private/agent.sqlite3"),
         )
         self.assertEqual(kwargs["policy"].max_steps, 24)
+        self.assertEqual(kwargs["policy"].comparison_search_concurrency, 3)
         self.assertEqual(kwargs["policy"].evidence_per_step, 3)
         self.assertEqual(kwargs["policy"].max_tool_calls, 48)
         self.assertEqual(kwargs["policy"].timeout_seconds, 45)

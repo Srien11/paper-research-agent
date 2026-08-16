@@ -15,6 +15,7 @@ from paper_research_agent.agent.orchestrator.artifacts import (
     LocalRAGArtifact,
     LocalRAGTrace,
 )
+from paper_research_agent.agent.orchestrator.identifiers import child_session_id
 from paper_research_agent.agent.orchestrator.models import ChildTaskRequest
 from paper_research_agent.answering.models import RAGAnswer
 from paper_research_agent.web.chat_runtime import DirectResponseRequest
@@ -62,7 +63,7 @@ class RAGRuntimeChildExecutor:
     async def answer(self, request: ChildTaskRequest) -> LocalRAGArtifact:
         result = await self._runtime.ask(
             request.objective,
-            session_id=_child_thread_id("research", request),
+            session_id=_child_session_id("research", request),
             research_mode=(
                 "planned" if requires_research_planning(request.objective) else "single"
             ),
@@ -114,7 +115,7 @@ class ConversationChildExecutor:
 
     async def answer(self, request: ChildTaskRequest) -> ChatArtifact:
         direct_request = DirectResponseRequest(
-            session_id=_child_thread_id("chat", request),
+            session_id=_child_session_id("chat", request),
             current_message=request.current_message,
             recent_messages=request.recent_messages,
             summary=request.conversation_summary,
@@ -136,7 +137,7 @@ class ConversationChildExecutor:
             self._runtime.stream_attachment_chat(
                 request.objective,
                 attachment_texts=attachment_texts,
-                session_id=_child_thread_id("attachment", request),
+                session_id=_child_session_id("attachment", request),
             )
         )
         return AttachmentArtifact(
@@ -155,7 +156,7 @@ class ConversationChildExecutor:
             self._runtime.stream_file_edit(
                 request.objective,
                 attachment_texts=attachment_texts,
-                session_id=_child_thread_id("file", request),
+                session_id=_child_session_id("file", request),
             )
         )
         attachment = await self._attachments.save_generated_text(
@@ -215,5 +216,10 @@ def _required_text(source: object, name: str) -> str:
     return value.strip()
 
 
-def _child_thread_id(kind: str, request: ChildTaskRequest) -> str:
-    return f"{kind}::{request.conversation_id}::{request.run_id}::{request.task_id}"
+def _child_session_id(kind: str, request: ChildTaskRequest) -> str:
+    return child_session_id(
+        kind,
+        request.conversation_id,
+        request.run_id,
+        request.task_id,
+    )

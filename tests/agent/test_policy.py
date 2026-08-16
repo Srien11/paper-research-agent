@@ -8,6 +8,8 @@ def test_default_policy_leaves_room_for_maximum_grid_and_followups() -> None:
 
     assert policy.max_steps == 24
     assert policy.max_followup_steps == 4
+    assert policy.comparison_search_concurrency == 2
+    assert policy.evidence_per_step == 4
     assert policy.max_tool_calls == 48
     assert policy.timeout_seconds == 180
     assert policy.freeze_invocation_budget(2) == (4, 8)

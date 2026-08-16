@@ -22,8 +22,8 @@ def _load_local_env(path: Path) -> None:
 
 def main() -> None:
     _load_local_env(PROJECT_ROOT / ".env")
-    # The production CLI now enters the unified main graph by default. Operators
-    # retain an explicit one-variable rollback with PRA_MAIN_AGENT_MODE=legacy.
+    # The local CLI enters the unified main graph by default and retains an
+    # explicit one-variable fallback with PRA_MAIN_AGENT_MODE=legacy.
     os.environ.setdefault("PRA_MAIN_AGENT_MODE", "primary")
     parser = argparse.ArgumentParser(
         description="Serve the owner-only paper research Web interface."
@@ -45,8 +45,8 @@ def main() -> None:
 
     mode = main_agent_mode_from_environment()
     print(f"主 Agent Web 启动模式：{mode}")
-    # One worker is intentional: the local embedding and reranking models are shared
-    # process state and must not be duplicated on the small personal server.
+    # One process owns the local indexes and model sessions. In-process retrieval
+    # concurrency is configured separately, avoiding one full model copy per worker.
     uvicorn.run(
         "paper_research_agent.web.app:create_app",
         factory=True,

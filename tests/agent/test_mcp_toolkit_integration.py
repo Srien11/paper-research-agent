@@ -105,6 +105,28 @@ def _toolkit(
 
 
 class McpToolkitIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_executes_registered_tool_name_longer_than_64_characters(self) -> None:
+        name = "local-zotero__" + "x" * 64
+        provider = FakeProvider("local-zotero")
+        tool = _tool(name=name, provider_id="local-zotero")
+
+        result = await _toolkit(provider, tool).execute(name, {"query": "agent"})
+
+        self.assertEqual(result.tool_name, name)
+
+    async def test_rejects_provider_result_exceeding_registered_item_limit(self) -> None:
+        provider = FakeProvider(
+            "zotero",
+            result=ToolExecutionResult(
+                tool_name="zotero__search_items",
+                items=tuple({"rank": rank} for rank in range(21)),
+            ),
+        )
+        tool = _tool()
+
+        with self.assertRaisesRegex(ValueError, "more items"):
+            await _toolkit(provider, tool).execute(tool.public_name, {"query": "agent"})
+
     async def test_network_read_http_failure_degrades_to_insufficient(self) -> None:
         request = httpx.Request("GET", "https://api.example.test/papers")
         response = httpx.Response(429, request=request)

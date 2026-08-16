@@ -30,7 +30,7 @@ class ConversationTurn(FrozenConversationModel):
     route: str | None = Field(default=None, max_length=64)
     status: ConversationStatus
     assistant_summary: str | None = Field(default=None, max_length=3_000)
-    source_ids: tuple[str, ...] = Field(default=(), max_length=100)
+    source_ids: tuple[str, ...] = Field(default=(), max_length=1_200)
     episode_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{16}$")
     selected_history_turn_ids: tuple[str, ...] = Field(default=(), max_length=10)
     selected_history_relevances: tuple[float, ...] = Field(default=(), max_length=10)

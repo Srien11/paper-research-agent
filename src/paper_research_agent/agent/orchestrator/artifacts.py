@@ -67,7 +67,7 @@ class LocalRAGArtifact(ChildArtifactBase):
 
 
 class PendingApprovalArtifact(FrozenArtifact):
-    tool_name: str = Field(pattern=r"^[a-z][a-z0-9_]{1,63}$")
+    tool_name: str = Field(pattern=r"^[a-z][a-z0-9_-]{1,127}$")
     purpose: str = Field(min_length=1, max_length=500)
     arguments_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     expires_at_epoch: float = Field(gt=0)

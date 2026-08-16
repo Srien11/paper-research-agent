@@ -110,6 +110,11 @@ class StaticWebContractTests(unittest.TestCase):
         ):
             self.assertIn(path, self.javascript)
         self.assertIn("restoreServerHistory", self.javascript)
+        self.assertIn("loadConversationMessages", self.javascript)
+        self.assertNotIn("hydrateConversation", self.javascript)
+        self.assertIn("loadEarlierMessages", self.javascript)
+        self.assertIn("message_limit", self.javascript)
+        self.assertIn("加载更早消息", self.javascript)
         self.assertIn("activatePersistedConversation", self.javascript)
         self.assertIn("pendingRequest.question", self.javascript)
         self.assertNotIn('chatStream: "api/chat/stream"', self.javascript)
@@ -117,6 +122,8 @@ class StaticWebContractTests(unittest.TestCase):
         self.assertNotIn('ask: "api/ask"', self.javascript)
         self.assertIn('method: "DELETE"', self.javascript)
         self.assertIn("JSON.stringify({ username, password })", self.javascript)
+        self.assertIn("session?.max_question_chars", self.javascript)
+        self.assertIn("elements.question.maxLength = maxQuestionChars", self.javascript)
 
     def test_frontend_submits_unified_request_and_displays_server_route(self) -> None:
         self.assertIn("使用本地论文知识库", self.html)

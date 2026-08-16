@@ -30,6 +30,11 @@ python -m pip install -e ".[agent,mcp]"
 填写任何 token。配置文件额外字段、相对 command、重复 ID/工具名、未知 transport 或非法
 命名空间都会让应用启动失败；这属于管理员配置错误，不会静默降级。
 
+`public_name` 默认保持 `<server_id>__<normalized_remote_name>`。如果两段合法名称组合后超过
+128 个字符，系统会要求使用确定性的有界别名；校验错误会给出应填写的完整别名，也可以用
+`paper_research_agent.agent.mcp.config.mcp_public_name` 根据原始 `server_id` 和 `remote_name`
+离线生成。原始两段名称仍分别保存在配置与注册表中，不会因别名而丢失。
+
 生产启用命令：
 
 ```powershell

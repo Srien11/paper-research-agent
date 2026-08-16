@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -23,6 +24,7 @@ from paper_research_agent.agent.models import (
     ResearchStep,
     ResearchTarget,
     SearchCorpusHit,
+    SearchCorpusInput,
     SearchCorpusResult,
 )
 from paper_research_agent.agent.observability import AgentEvent
@@ -326,16 +328,29 @@ class ResearchGraphTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         service = AsyncMock()
-        service.search_corpus.side_effect = tuple(
-            SearchCorpusResult(
+        active_searches = 0
+        max_active_searches = 0
+        search_timeline: list[tuple[str, str]] = []
+        step_by_query = {step.query: step for step in steps}
+
+        async def tracked_search(request: SearchCorpusInput) -> SearchCorpusResult:
+            nonlocal active_searches, max_active_searches
+            step = step_by_query[request.query]
+            active_searches += 1
+            max_active_searches = max(max_active_searches, active_searches)
+            search_timeline.append(("start", step.step_id))
+            await asyncio.sleep(0.01)
+            search_timeline.append(("finish", step.step_id))
+            active_searches -= 1
+            return SearchCorpusResult(
                 query=step.query,
                 corpus_id=step.corpus_id,
                 index_id="idx-test",
                 degraded=False,
                 hits=(_hit(f"chunk-{step.step_id}", str(step.corpus_id), 1),),
             )
-            for step in steps
-        )
+
+        service.search_corpus.side_effect = tracked_search
         service.get_evidence.side_effect = tuple(
             GetEvidenceResult(
                 records=(_record(f"chunk-{step.step_id}", str(step.corpus_id)),)
@@ -356,9 +371,123 @@ class ResearchGraphTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["tool_call_count"], 12)
         self.assertEqual(service.search_corpus.await_count, 6)
         self.assertEqual(service.get_evidence.await_count, 6)
+        self.assertEqual(max_active_searches, 2)
+        self.assertEqual(
+            [item["step_id"] for item in state["observations"]],
+            [step.step_id for step in steps],
+        )
+        self.assertEqual(
+            [
+                item["step_id"]
+                for item in state["action_history"]
+                if item["action"] == "search_corpus"
+            ],
+            [step.step_id for step in steps],
+        )
+        for offset in range(0, len(search_timeline), 4):
+            self.assertEqual(
+                [event for event, _step_id in search_timeline[offset : offset + 4]],
+                ["start", "start", "finish", "finish"],
+            )
         self.assertEqual(len(reasoner.calls), 1)
         self.assertEqual(len(reasoner.calls[0][2]), 6)
         self.assertTrue(state["evidence_sufficient"])
+
+    async def test_comparison_concurrency_one_keeps_searches_serial(self) -> None:
+        targets = (
+            ResearchTarget(target_id="a", label="Paper A", corpus_id="C001"),
+            ResearchTarget(target_id="b", label="Paper B", corpus_id="T001"),
+        )
+        dimension = ResearchDimension(dimension_id="method", label="Method")
+        requirements = tuple(
+            EvidenceRequirement(
+                requirement_id=f"{target.target_id}-method",
+                target_id=target.target_id,
+                dimension_id="method",
+                description=f"{target.label} method",
+            )
+            for target in targets
+        )
+        steps = tuple(
+            ResearchStep(
+                step_id=requirement.requirement_id,
+                objective=requirement.description,
+                query=f"query {requirement.target_id}",
+                corpus_id=("C001" if requirement.target_id == "a" else "T001"),
+                target_ids=(requirement.target_id,),
+                dimension_ids=("method",),
+            )
+            for requirement in requirements
+        )
+        planner = FakePlanner(
+            ResearchPlan(
+                task_type="comparison",
+                targets=targets,
+                dimensions=(dimension,),
+                requirements=requirements,
+                steps=steps,
+            )
+        )
+        reasoner = FakeReasoner(
+            EvidenceAssessment(
+                evidence_sufficient=True,
+                status="sufficient",
+                coverage=tuple(
+                    EvidenceCoverage(
+                        requirement_id=requirement.requirement_id,
+                        covered=True,
+                        chunk_ids=(f"chunk-{requirement.target_id}",),
+                    )
+                    for requirement in requirements
+                ),
+            )
+        )
+        service = AsyncMock()
+        active_searches = 0
+        max_active_searches = 0
+        step_by_query = {step.query: step for step in steps}
+
+        async def tracked_search(request: SearchCorpusInput) -> SearchCorpusResult:
+            nonlocal active_searches, max_active_searches
+            step = step_by_query[request.query]
+            active_searches += 1
+            max_active_searches = max(max_active_searches, active_searches)
+            await asyncio.sleep(0)
+            active_searches -= 1
+            return SearchCorpusResult(
+                query=step.query,
+                corpus_id=step.corpus_id,
+                index_id="idx-test",
+                degraded=False,
+                hits=(_hit(f"chunk-{step.target_ids[0]}", str(step.corpus_id), 1),),
+            )
+
+        service.search_corpus.side_effect = tracked_search
+        service.get_evidence.side_effect = tuple(
+            GetEvidenceResult(
+                records=(_record(f"chunk-{target.target_id}", str(target.corpus_id)),)
+            )
+            for target in targets
+        )
+        graph = build_research_graph(
+            planner=planner,
+            reasoner=reasoner,
+            service=service,
+            policy=ResearchRuntimePolicy(
+                max_steps=2,
+                max_tool_calls=4,
+                comparison_search_concurrency=1,
+            ),
+        )
+
+        state = await graph.ainvoke({"question": "Compare serially"})
+
+        self.assertEqual(max_active_searches, 1)
+        self.assertEqual(service.search_corpus.await_count, 2)
+        self.assertEqual(
+            [item["step_id"] for item in state["observations"]],
+            [step.step_id for step in steps],
+        )
 
     async def test_comparison_freezes_budget_from_ten_cell_grid(self) -> None:
         targets = (

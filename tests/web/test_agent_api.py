@@ -460,8 +460,18 @@ class MainAgentApiTests(unittest.TestCase):
             for item in archive.json()["conversations"]
             if item["conversation_id"] == previous
         )
-        self.assertEqual(saved["messages"][0]["text"], "持久化问题")
-        self.assertEqual(saved["messages"][1]["text"], "持久化回答")
+        self.assertEqual(saved["messages"], [])
+        self.assertFalse(saved["messages_loaded"])
+
+        detail = self.client.get(
+            f"/paper-research/api/conversations/{previous}?message_limit=2"
+        )
+        self.assertEqual(detail.status_code, 200, detail.text)
+        self.assertTrue(detail.json()["messages_loaded"])
+        self.assertFalse(detail.json()["has_more_messages"])
+        self.assertEqual(detail.json()["message_count"], 2)
+        self.assertEqual(detail.json()["messages"][0]["text"], "持久化问题")
+        self.assertEqual(detail.json()["messages"][1]["text"], "持久化回答")
 
         activated = self.client.post(
             f"/paper-research/api/conversations/{previous}/activate",
@@ -470,6 +480,39 @@ class MainAgentApiTests(unittest.TestCase):
         )
         self.assertEqual(activated.status_code, 200, activated.text)
         self.assertEqual(self._conversation_id(), previous)
+
+    def test_conversation_messages_are_hydrated_in_bounded_pages(self) -> None:
+        conversation_id = self._conversation_id()
+        for index in range(13):
+            question = f"问题 {index}"
+            turn = self.store.begin_turn(conversation_id, question)
+            self.store.complete_turn(
+                turn.turn_id,
+                route="normal_chat",
+                status="completed",
+                resolution=ConversationResolution(
+                    original_question=question,
+                    standalone_question=question,
+                    chinese_query=question,
+                    confidence=1,
+                ),
+                assistant_summary=f"回答 {index}",
+            )
+
+        initial = self.client.get(
+            f"/paper-research/api/conversations/{conversation_id}"
+        )
+        expanded = self.client.get(
+            f"/paper-research/api/conversations/{conversation_id}?message_limit=48"
+        )
+
+        self.assertEqual(initial.status_code, 200, initial.text)
+        self.assertEqual(len(initial.json()["messages"]), 24)
+        self.assertEqual(initial.json()["message_count"], 26)
+        self.assertTrue(initial.json()["has_more_messages"])
+        self.assertEqual(expanded.status_code, 200, expanded.text)
+        self.assertEqual(len(expanded.json()["messages"]), 26)
+        self.assertFalse(expanded.json()["has_more_messages"])
 
     def test_auth_origin_request_id_and_runtime_errors_fail_closed(self) -> None:
         payload = {"request_id": REQUEST_ID, "message": "hello"}
@@ -500,6 +543,19 @@ class MainAgentApiTests(unittest.TestCase):
             json=payload,
         )
         self.assertEqual(anonymous.status_code, 401)
+
+    def test_internal_value_error_is_not_reported_as_invalid_user_request(self) -> None:
+        self.main.error = ValueError("session_id contains unsafe private detail")
+
+        response = self.client.post(
+            "/paper-research/api/agent/runs",
+            headers={"Origin": ORIGIN},
+            json={"request_id": REQUEST_ID, "message": "hello"},
+        )
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json()["detail"], "主 Agent 内部契约校验失败")
+        self.assertNotIn("session_id", response.text)
 
     def _conversation_id(self) -> str:
         response = self.client.get("/paper-research/api/session")

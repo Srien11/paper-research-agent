@@ -22,6 +22,9 @@ from paper_research_agent.agent.observability import (
     SQLiteAgentEventLogger,
     emit_agent_event,
 )
+from paper_research_agent.agent.orchestrator.identifiers import (
+    dynamic_checkpoint_thread_id,
+)
 from paper_research_agent.agent.planner import (
     ComparisonQueryResolver,
     LangChainComparisonTargetResolver,
@@ -275,7 +278,7 @@ async def create_research_agent_runtime(
 
         async def clear(thread_id: str) -> None:
             await checkpointer.adelete_thread(thread_id)
-            await checkpointer.adelete_thread(f"dynamic::{thread_id}")
+            await checkpointer.adelete_thread(dynamic_checkpoint_thread_id(thread_id))
 
         return ResearchAgentRuntime(
             graph=graph,

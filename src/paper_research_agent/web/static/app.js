@@ -6,6 +6,7 @@ const API = Object.freeze({
   logout: "api/logout",
   conversation: "api/conversation",
   conversations: "api/conversations",
+  conversationDetail: (conversationId, messageLimit = 24) => `api/conversations/${encodeURIComponent(conversationId)}?message_limit=${messageLimit}`,
   activateConversation: (conversationId) => `api/conversations/${encodeURIComponent(conversationId)}/activate`,
   agentRuns: "api/agent/runs",
   agentApproval: (requestId) => `api/agent/runs/${encodeURIComponent(requestId)}/approval`,
@@ -37,6 +38,8 @@ const state = {
   runMetrics: {},
   currentConversationId: null,
   serverConversations: [],
+  historyHasMore: false,
+  historyMessageCount: 0,
 };
 
 const elements = {
@@ -200,6 +203,10 @@ function setAuthenticated(authenticated, session = null) {
   elements.appView.hidden = !authenticated;
   if (authenticated) {
     if (session?.conversation_id) state.currentConversationId = session.conversation_id;
+    const maxQuestionChars = Number(session?.max_question_chars);
+    if (Number.isInteger(maxQuestionChars) && maxQuestionChars >= 100 && maxQuestionChars <= 10000) {
+      elements.question.maxLength = maxQuestionChars;
+    }
     restoreServerHistory();
     window.requestAnimationFrame(() => elements.question.focus());
   } else {
@@ -305,6 +312,11 @@ async function handleAsk(event) {
   const question = elements.question.value.trim();
   if (!question) {
     showNotice("请输入一个研究问题。", "error");
+    elements.question.focus();
+    return;
+  }
+  if (question.length > elements.question.maxLength) {
+    showNotice(`问题不能超过 ${elements.question.maxLength} 个字符。`, "error");
     elements.question.focus();
     return;
   }
@@ -1274,23 +1286,17 @@ async function restoreServerHistory(renderCurrent = true) {
     const current = state.serverConversations.find(
       (item) => item.conversation_id === state.currentConversationId,
     );
-    if (current) {
-      state.history = current.messages.map((item) => ({
-        role: item.role,
-        text: item.text,
-        status: item.status,
-      }));
-      try {
-        sessionStorage.setItem(STORAGE_KEY, JSON.stringify(state.history));
-      } catch (_error) {
-        // The server remains authoritative when browser caching is unavailable.
-      }
-      if (renderCurrent && !state.viewingArchive) showCurrentDialogue();
-    } else if (renderCurrent && !state.viewingArchive) {
+    renderHistoryList();
+    if (current && renderCurrent && !state.viewingArchive) {
+      renderDialogueMessages([], "正在恢复当前对话…");
+      await loadConversationMessages(current.conversation_id);
+      showCurrentDialogue();
+    } else if (!current && renderCurrent && !state.viewingArchive) {
       state.history = [];
+      state.historyHasMore = false;
+      state.historyMessageCount = 0;
       renderDialogueMessages([], "新研究会话");
     }
-    renderHistoryList();
     const pendingRequest = loadPendingRequest();
     if (pendingRequest) {
       elements.question.value = pendingRequest.question;
@@ -1298,6 +1304,42 @@ async function restoreServerHistory(renderCurrent = true) {
     }
   } catch (_error) {
     restoreHistory();
+  }
+}
+
+async function loadConversationMessages(conversationId, messageLimit = 24) {
+  const detail = await request(API.conversationDetail(conversationId, messageLimit));
+  const messages = Array.isArray(detail.messages) ? detail.messages : [];
+  state.history = messages.map((item) => ({
+    role: item.role,
+    text: item.text,
+    status: item.status,
+  }));
+  state.historyHasMore = detail.has_more_messages === true;
+  state.historyMessageCount = Number.isInteger(detail.message_count)
+    ? detail.message_count
+    : state.history.length;
+  const index = state.serverConversations.findIndex(
+    (item) => item.conversation_id === conversationId,
+  );
+  if (index >= 0) state.serverConversations[index] = detail;
+  else state.serverConversations.unshift(detail);
+  try {
+    sessionStorage.setItem(STORAGE_KEY, JSON.stringify(state.history.slice(-24)));
+  } catch (_error) {
+    // The server remains authoritative when browser caching is unavailable.
+  }
+  return detail;
+}
+
+async function loadEarlierMessages() {
+  if (!state.currentConversationId || !state.historyHasMore || state.busy) return;
+  const nextLimit = Math.min(1000, Math.max(48, state.history.length + 24));
+  try {
+    await loadConversationMessages(state.currentConversationId, nextLimit);
+    showCurrentDialogue();
+  } catch (error) {
+    showNotice(error.message, "error");
   }
 }
 
@@ -1309,11 +1351,8 @@ async function activatePersistedConversation(dialogue) {
       body: "{}",
     });
     state.currentConversationId = session.conversation_id;
-    state.history = dialogue.messages.map((item) => ({
-      role: item.role,
-      text: item.text,
-      status: item.status,
-    }));
+    renderDialogueMessages([], "正在加载历史对话…");
+    await loadConversationMessages(session.conversation_id);
     const pendingRequest = loadPendingRequest();
     if (pendingRequest?.conversationId && pendingRequest.conversationId !== session.conversation_id) {
       elements.question.value = "";
@@ -1359,6 +1398,8 @@ function resetWorkspace() {
   state.planPollTimer = null;
   state.activeRunId = null;
   state.activePlan = null;
+  state.historyHasMore = false;
+  state.historyMessageCount = 0;
   state.controlRevision = 0;
   elements.planControl.hidden = true;
   elements.conversationLabel.textContent = "新研究会话";
@@ -1379,6 +1420,9 @@ function saveHistoryItem(item) {
       created_at: now,
       updated_at: now,
       messages: state.history.map((entry) => ({ ...entry, created_at: now })),
+      messages_loaded: true,
+      has_more_messages: state.historyHasMore,
+      message_count: state.historyMessageCount || state.history.length,
     };
     const index = state.serverConversations.findIndex(
       (entry) => entry.conversation_id === state.currentConversationId,
@@ -1460,7 +1504,7 @@ function renderHistoryList() {
 }
 
 function showCurrentDialogue() {
-  renderDialogueMessages(state.history, "当前对话");
+  renderDialogueMessages(state.history, "当前对话", true);
   state.viewingArchive = false;
   hideNotice();
   scrollMessages();
@@ -1474,7 +1518,7 @@ function showArchivedDialogue(archive) {
   scrollMessages();
 }
 
-function renderDialogueMessages(items, label) {
+function renderDialogueMessages(items, label, allowLoadEarlier = false) {
   elements.messages.replaceChildren();
   if (!items.length) {
     elements.messages.append(elements.emptyState);
@@ -1483,6 +1527,12 @@ function renderDialogueMessages(items, label) {
     return;
   }
   elements.emptyState.hidden = true;
+  if (allowLoadEarlier && state.historyHasMore) {
+    const loadEarlier = createElement("button", "download-file", "加载更早消息");
+    loadEarlier.type = "button";
+    loadEarlier.addEventListener("click", loadEarlierMessages);
+    elements.messages.append(loadEarlier);
+  }
   items.forEach((item) => {
     if (item.role === "user") appendUserMessage(item.text, false);
     else appendRestoredAssistant(item.text, item.status);
@@ -1500,6 +1550,8 @@ function appendRestoredAssistant(text, status) {
 
 function clearLocalDialogue() {
   state.history = [];
+  state.historyHasMore = false;
+  state.historyMessageCount = 0;
   try {
     sessionStorage.removeItem(STORAGE_KEY);
   } catch (_error) {

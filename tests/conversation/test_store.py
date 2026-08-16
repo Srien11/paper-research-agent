@@ -77,6 +77,15 @@ class ConversationStoreTests(unittest.TestCase):
                 self.assertEqual(completed.messages[-1].text, "The complete persisted answer.")
                 self.assertEqual(pending.messages[0].text, "Resume this exact question")
                 self.assertEqual(pending.messages[0].status, "pending")
+                summaries = store.conversations(include_messages=False)
+                self.assertTrue(all(not item.messages for item in summaries))
+                selected = store.conversation("conversation-archive")
+                self.assertIsNotNone(selected)
+                assert selected is not None
+                self.assertEqual(
+                    selected.messages[-1].text,
+                    "The complete persisted answer.",
+                )
 
     def test_agent_request_id_cannot_cross_conversations(self) -> None:
         stores = [InMemoryConversationStore()]

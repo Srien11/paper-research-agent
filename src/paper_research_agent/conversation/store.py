@@ -23,6 +23,10 @@ from paper_research_agent.agent.orchestrator.control import (
     apply_plan_edit,
     transition_run_control,
 )
+from paper_research_agent.agent.orchestrator.identifiers import (
+    dynamic_thread_id,
+    main_checkpoint_thread_id,
+)
 from paper_research_agent.agent.orchestrator.models import (
     AgentApprovalClaim,
     AgentRunStart,
@@ -69,7 +73,11 @@ class ConversationStore(Protocol):
         self, conversation_id: str, *, limit: int = 500
     ) -> tuple[ConversationTurn, ...]: ...
 
-    def conversations(self, *, limit: int = 100) -> tuple[PersistedConversation, ...]: ...
+    def conversations(
+        self, *, limit: int = 100, include_messages: bool = True
+    ) -> tuple[PersistedConversation, ...]: ...
+
+    def conversation(self, conversation_id: str) -> PersistedConversation | None: ...
 
     def episodes(
         self, conversation_id: str, *, limit: int = 100
@@ -799,7 +807,9 @@ class SQLiteConversationStore:
         rows = self._rows(conversation_id, limit=limit)
         return tuple(reversed(tuple(self._row(row) for row in rows)))
 
-    def conversations(self, *, limit: int = 100) -> tuple[PersistedConversation, ...]:
+    def conversations(
+        self, *, limit: int = 100, include_messages: bool = True
+    ) -> tuple[PersistedConversation, ...]:
         if limit <= 0 or limit > 500:
             raise ValueError("conversation list limit must be between 1 and 500")
         with self._lock, closing(self._connect()) as connection:
@@ -813,18 +823,56 @@ class SQLiteConversationStore:
             )
             dialogues: list[PersistedConversation] = []
             for conversation_id in conversation_ids:
-                rows = connection.execute(
-                    "SELECT t.user_question, t.status, t.assistant_summary, "
-                    "t.created_at, t.completed_at, r.result_json "
-                    "FROM conversation_turns AS t "
-                    "LEFT JOIN main_agent_runs AS r ON r.turn_id = t.turn_id "
-                    "WHERE t.conversation_id = ? ORDER BY t.sequence",
-                    (conversation_id,),
-                ).fetchall()
-                dialogue = _persisted_dialogue(conversation_id, rows)
+                dialogue = self._conversation_row(
+                    connection,
+                    conversation_id,
+                    include_messages=include_messages,
+                )
                 if dialogue is not None:
                     dialogues.append(dialogue)
         return tuple(dialogues)
+
+    def conversation(self, conversation_id: str) -> PersistedConversation | None:
+        normalized = _conversation_id(conversation_id)
+        with self._lock, closing(self._connect()) as connection:
+            return self._conversation_row(connection, normalized, include_messages=True)
+
+    def _conversation_row(
+        self,
+        connection: sqlite3.Connection,
+        conversation_id: str,
+        *,
+        include_messages: bool,
+    ) -> PersistedConversation | None:
+        if not include_messages:
+            summary = connection.execute(
+                "SELECT t.user_question, t.created_at, "
+                "(SELECT MAX(COALESCE(latest.completed_at, latest.created_at)) "
+                " FROM conversation_turns AS latest "
+                " WHERE latest.conversation_id = t.conversation_id) "
+                "FROM conversation_turns AS t WHERE t.conversation_id = ? "
+                "ORDER BY t.sequence LIMIT 1",
+                (conversation_id,),
+            ).fetchone()
+            if summary is None:
+                return None
+            title = str(summary[0]).strip()[:200] or "未命名对话"
+            return PersistedConversation(
+                conversation_id=conversation_id,
+                title=title,
+                created_at=datetime.fromisoformat(str(summary[1])),
+                updated_at=datetime.fromisoformat(str(summary[2])),
+                messages=(),
+            )
+        rows = connection.execute(
+            "SELECT t.user_question, t.status, t.assistant_summary, "
+            "t.created_at, t.completed_at, r.result_json "
+            "FROM conversation_turns AS t "
+            "LEFT JOIN main_agent_runs AS r ON r.turn_id = t.turn_id "
+            "WHERE t.conversation_id = ? ORDER BY t.sequence",
+            (conversation_id,),
+        ).fetchall()
+        return _persisted_dialogue(conversation_id, rows)
 
     def clear(self, conversation_id: str) -> int:
         normalized = _conversation_id(conversation_id)
@@ -856,14 +904,14 @@ class SQLiteConversationStore:
                 "WHERE conversation_id = ? ORDER BY created_at, run_id",
                 (normalized,),
             ).fetchall()
-        main = tuple(f"main::{normalized}::{row[0]!s}" for row in rows)
+        main = tuple(main_checkpoint_thread_id(normalized, str(row[0])) for row in rows)
         research: list[str] = []
         for run_id, result_json in rows:
             if result_json is None:
                 continue
             result = MainAgentResult.model_validate_json(str(result_json))
             research.extend(
-                f"{normalized}::{run_id!s}::{child.task_id}"
+                dynamic_thread_id(normalized, str(run_id), child.task_id)
                 for child in result.child_results
                 if child.capability == "dynamic_tools"
             )
@@ -1517,7 +1565,9 @@ class InMemoryConversationStore:
             )
         return tuple(values[-limit:])
 
-    def conversations(self, *, limit: int = 100) -> tuple[PersistedConversation, ...]:
+    def conversations(
+        self, *, limit: int = 100, include_messages: bool = True
+    ) -> tuple[PersistedConversation, ...]:
         if limit <= 0 or limit > 500:
             raise ValueError("conversation list limit must be between 1 and 500")
         with self._lock:
@@ -1544,8 +1594,22 @@ class InMemoryConversationStore:
             for conversation_id, rows in grouped.items()
             if (dialogue := _persisted_dialogue(conversation_id, rows)) is not None
         )
-        return tuple(
+        selected = tuple(
             sorted(dialogues, key=lambda item: item.updated_at, reverse=True)[:limit]
+        )
+        if include_messages:
+            return selected
+        return tuple(item.model_copy(update={"messages": ()}) for item in selected)
+
+    def conversation(self, conversation_id: str) -> PersistedConversation | None:
+        normalized = _conversation_id(conversation_id)
+        return next(
+            (
+                item
+                for item in self.conversations(limit=500)
+                if item.conversation_id == normalized
+            ),
+            None,
         )
 
     def clear(self, conversation_id: str) -> int:
@@ -1582,10 +1646,10 @@ class InMemoryConversationStore:
                 key=lambda record: record.run_id,
             )
             main = tuple(
-                f"main::{normalized}::{record.run_id}" for record in records
+                main_checkpoint_thread_id(normalized, record.run_id) for record in records
             )
             research = tuple(
-                f"{normalized}::{record.run_id}::{child.task_id}"
+                dynamic_thread_id(normalized, record.run_id, child.task_id)
                 for record in records
                 if record.result is not None
                 for child in record.result.child_results

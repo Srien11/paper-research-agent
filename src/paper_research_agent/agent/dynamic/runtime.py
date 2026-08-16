@@ -15,6 +15,9 @@ from paper_research_agent.agent.dynamic.models import (
     PendingApproval,
     ToolObservation,
 )
+from paper_research_agent.agent.orchestrator.identifiers import (
+    dynamic_checkpoint_thread_id,
+)
 
 
 class AsyncDynamicGraph(Protocol):
@@ -89,7 +92,7 @@ class DynamicResearchRuntime:
 
     async def _invoke(self, value: Any, thread_id: str) -> Mapping[str, Any]:
         config: dict[str, Any] = {
-            "configurable": {"thread_id": f"dynamic::{thread_id}"},
+            "configurable": {"thread_id": dynamic_checkpoint_thread_id(thread_id)},
             "recursion_limit": max(30, self._max_steps * 5 + 10),
         }
         async with asyncio.timeout(self._timeout_seconds):

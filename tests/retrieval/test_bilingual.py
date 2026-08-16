@@ -4,6 +4,7 @@ import asyncio
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
@@ -44,9 +45,11 @@ class StaticIndex:
 class RecordingReranker:
     def __init__(self):
         self.calls = []
+        self.thread_names = []
 
     def score(self, query, texts):
         self.calls.append((query, list(texts)))
+        self.thread_names.append(threading.current_thread().name)
         return [10.0 if "english winner" in text else 0.0 for text in texts]
 
 
@@ -149,7 +152,7 @@ class BilingualRetrievalTests(unittest.IsolatedAsyncioTestCase):
             service.close()
         self.temp.cleanup()
 
-    def service(self, rewriter, *, timeout=2.0):
+    def service(self, rewriter, *, timeout=2.0, local_workers=2):
         service = BilingualRetrievalService(
             self.sparse,
             self.vector,
@@ -161,6 +164,7 @@ class BilingualRetrievalTests(unittest.IsolatedAsyncioTestCase):
             bilingual_config(self.directory, timeout=timeout),
             index_id="idx",
             rights=CorpusRightsMap({"C001": "redistributable", "T001": "internal_research_only"}),
+            local_workers=local_workers,
         )
         self.services.append(service)
         return service
@@ -177,12 +181,24 @@ class BilingualRetrievalTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("en.route_rrf", run.hits[1].ranks)
         self.assertEqual(self.reranker.calls[0][0], "English query")
         self.assertEqual(len(self.reranker.calls), 1)
+        self.assertTrue(self.reranker.thread_names[0].startswith("paper-retrieval-local-ml"))
         self.assertTrue(run.audit_persisted)
         self.assertEqual(run.storage_classes["C001"], "redistributable")
 
         with closing(sqlite3.connect(self.directory / "audit.sqlite3")) as connection:
             stages = {row[0] for row in connection.execute("SELECT DISTINCT stage FROM rankings")}
         self.assertTrue({"zh.bm25", "en.vector", "cross_route_rrf", "final"} <= stages)
+
+    def test_local_worker_count_rejects_unsafe_values(self) -> None:
+        for workers in (0, 9):
+            with (
+                self.subTest(workers=workers),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "local retrieval workers must be between 1 and 8",
+                ),
+            ):
+                self.service(FakeRewriter(), local_workers=workers)
 
     async def test_resolve_query_exposes_cached_rewrite_without_running_chunk_recall(self) -> None:
         service = self.service(FakeRewriter())

@@ -11,6 +11,7 @@ from paper_research_agent.agent.orchestrator.artifacts import (
     FileArtifact,
     LocalRAGArtifact,
 )
+from paper_research_agent.agent.orchestrator.identifiers import dynamic_thread_id
 from paper_research_agent.agent.orchestrator.models import ChildTaskRequest, ChildTaskResult
 
 if TYPE_CHECKING:
@@ -250,9 +251,9 @@ def _failed(request: ChildTaskRequest, error_code: str) -> ChildTaskResult:
     )
 
 
-def _child_thread_id(kind: str, request: ChildTaskRequest) -> str:
-    return f"{kind}::{request.conversation_id}::{request.run_id}::{request.task_id}"
-
-
 def _dynamic_thread_id(request: ChildTaskRequest) -> str:
-    return f"{request.conversation_id}::{request.run_id}::{request.task_id}"
+    return dynamic_thread_id(
+        request.conversation_id,
+        request.run_id,
+        request.task_id,
+    )

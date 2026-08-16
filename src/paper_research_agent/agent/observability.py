@@ -60,7 +60,7 @@ class AgentEvent(BaseModel):
     event_type: AgentEventType
     status: AgentEventStatus
     component: AgentEventComponent
-    name: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")
+    name: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,127}$")
     duration_ms: float | None = Field(default=None, ge=0)
     question_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     thread_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")

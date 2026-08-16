@@ -77,6 +77,26 @@ class WorkspaceTests(unittest.TestCase):
             )
             self.assertEqual(found.items[0]["memory_id"], added.items[0]["memory_id"])
 
+    def test_report_with_maximum_filename_uses_short_atomic_temporary_name(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            approvals = ApprovalManager(secret=b"x" * 32)
+            tools = WorkspaceResearchTools(Path(directory), approvals=approvals)
+            request = ExportResearchReportInput(
+                relative_path="r" * 237 + ".md",
+                format="markdown",
+                content="# Report",
+            )
+            pending = tools.export_research_report(request)
+            token = approvals.approve(str(pending.summary["approval_request_id"]))
+
+            result = tools.export_research_report(
+                request.model_copy(update={"approval_token": token})
+            )
+
+            exported = Path(directory) / str(result.items[0]["relative_path"])
+            self.assertTrue(exported.exists())
+            self.assertEqual(len(exported.name), 240)
+
     def test_memory_update_list_soft_delete_expiry_and_deduplication(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             approvals = ApprovalManager(secret=b"x" * 32)

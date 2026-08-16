@@ -8,7 +8,11 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from paper_research_agent.agent.mcp.config import McpHostConfig, load_mcp_host_config
+from paper_research_agent.agent.mcp.config import (
+    McpHostConfig,
+    load_mcp_host_config,
+    mcp_public_name,
+)
 
 
 def _valid_payload() -> dict[str, object]:
@@ -81,6 +85,36 @@ class McpConfigTests(unittest.TestCase):
         payload["servers"][0]["tools"][0]["public_name"] = "search_items"
         with self.assertRaisesRegex(ValidationError, "server namespace"):
             McpHostConfig.model_validate(payload)
+
+    def test_accepts_bounded_alias_for_overlong_composite_name(self) -> None:
+        payload = _valid_payload()
+        server_id = "s" * 64
+        remote_name = "Remote." + "x" * 120
+        public_name = mcp_public_name(server_id, remote_name)
+        payload["servers"][0]["server_id"] = server_id
+        payload["servers"][0]["tools"][0]["remote_name"] = remote_name
+        payload["servers"][0]["tools"][0]["public_name"] = public_name
+
+        config = McpHostConfig.model_validate(payload)
+
+        self.assertEqual(config.servers[0].tools[0].remote_name, remote_name)
+        self.assertEqual(config.servers[0].tools[0].public_name, public_name)
+        self.assertLessEqual(len(public_name), 128)
+        self.assertTrue(public_name.startswith(f"{server_id}__h1_"))
+
+    def test_server_id_with_hyphen_remains_routable_in_public_name(self) -> None:
+        payload = _valid_payload()
+        payload["servers"][0]["server_id"] = "local-zotero"
+        payload["servers"][0]["tools"][0]["public_name"] = (
+            "local-zotero__search_items"
+        )
+
+        config = McpHostConfig.model_validate(payload)
+
+        self.assertEqual(
+            config.servers[0].tools[0].public_name,
+            "local-zotero__search_items",
+        )
 
     def test_rejects_citation_trust_and_write_risk(self) -> None:
         for field, value in (("trust", "citation_evidence"), ("risk", "network_write")):

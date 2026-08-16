@@ -36,6 +36,11 @@ def _event(**overrides: object) -> AgentEvent:
 
 
 class AgentEventTests(unittest.TestCase):
+    def test_tool_event_name_accepts_full_registered_name_boundary(self) -> None:
+        self.assertEqual(_event(name="t" * 128).name, "t" * 128)
+        with self.assertRaises(ValidationError):
+            _event(name="t" * 129)
+
     def test_main_entry_event_kinds_accept_only_fixed_width_summaries(self) -> None:
         kinds = (
             ("main_runtime_built", "succeeded"),

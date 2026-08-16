@@ -68,7 +68,7 @@ class RewriteResolution:
 
 
 class BilingualRetrievalService:
-    """Keep local ML serialized while overlapping Chinese recall with the API call."""
+    """Bound local ML concurrency while overlapping recall with provider I/O."""
 
     def __init__(
         self,
@@ -84,11 +84,14 @@ class BilingualRetrievalService:
         index_id: str,
         rights: CorpusRightsMap | None = None,
         local_executor: Executor | None = None,
+        local_workers: int = 2,
     ):
         if rewriter.model_id != bilingual_config.rewrite_model:
             raise ValueError("rewriter model does not match bilingual configuration")
         if rewriter.prompt_version != bilingual_config.rewrite_prompt_version:
             raise ValueError("rewriter prompt version does not match bilingual configuration")
+        if local_workers <= 0 or local_workers > 8:
+            raise ValueError("local retrieval workers must be between 1 and 8")
         self.sparse = sparse
         self.vector = vector
         self.reranker = reranker
@@ -101,7 +104,7 @@ class BilingualRetrievalService:
         self.rights = rights
         self._owns_executor = local_executor is None
         self._local_executor = local_executor or ThreadPoolExecutor(
-            max_workers=1,
+            max_workers=local_workers,
             thread_name_prefix="paper-retrieval-local-ml",
         )
         self._flight_lock = asyncio.Lock()
@@ -231,10 +234,14 @@ class BilingualRetrievalService:
 
         if rewrite.trace.english_query is not None and rerank:
             rerank_started = time.perf_counter()
-            final_candidates = rerank_candidates(
-                rewrite.trace.english_query,
-                fused,
-                self.reranker,
+            final_candidates = await loop.run_in_executor(
+                self._local_executor,
+                functools.partial(
+                    rerank_candidates,
+                    rewrite.trace.english_query,
+                    fused,
+                    self.reranker,
+                ),
             )
             route_latencies["rerank"] = _elapsed_ms(rerank_started)
         else:

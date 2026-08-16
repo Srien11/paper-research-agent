@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -101,6 +102,16 @@ class ResearchGraphState(TypedDict, total=False):
     evidence_sufficient: bool
     termination_reason: str | None
     started_at_epoch_seconds: float
+
+
+class _StepExecutionResult(BaseModel):
+    """One independently executed comparison step, returned in plan order."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
+
+    step: ResearchStep
+    search: SearchCorpusResult
+    evidence: GetEvidenceResult
 
 
 def build_research_graph(
@@ -398,15 +409,12 @@ def build_research_graph(
             "termination_reason": None,
         }
 
-    async def execute_tools(state: ResearchGraphState) -> ResearchGraphState:
-        step = ResearchStep.model_validate(state.get("active_step"))
-        tool_call_count = _consume_tool(
-            state,
-            event_sink,
-            runtime_policy,
-            "search_corpus",
-            state["tool_call_count"],
-        )
+    async def run_search(
+        state: ResearchGraphState,
+        step: ResearchStep,
+        *,
+        tool_call_count: int,
+    ) -> SearchCorpusResult:
         search_started = time.perf_counter()
         _emit_graph_event(
             state,
@@ -466,104 +474,189 @@ def build_research_graph(
             returned_count=len(search.hits),
             tool_call_count=tool_call_count,
         )
-        action_history = _append_action(
-            state,
-            action="search_corpus",
-            step_id=step.step_id,
-            query=step.query,
-        )
+        return search
 
+    async def run_evidence(
+        state: ResearchGraphState,
+        step: ResearchStep,
+        search: SearchCorpusResult,
+        *,
+        tool_call_count: int,
+    ) -> GetEvidenceResult:
         selected_ids = tuple(hit.chunk_id for hit in search.hits[:evidence_per_step])
-        if selected_ids:
-            tool_call_count = _consume_tool(
-                state,
-                event_sink,
-                runtime_policy,
-                "get_evidence",
-                tool_call_count,
-            )
-            evidence_started = time.perf_counter()
+        if not selected_ids:
+            return GetEvidenceResult(records=())
+        evidence_started = time.perf_counter()
+        _emit_graph_event(
+            state,
+            event_sink,
+            event_type="tool_started",
+            status="started",
+            component="tool",
+            name="get_evidence",
+            step_id=step.step_id,
+            requested_count=len(selected_ids),
+            tool_call_count=tool_call_count,
+        )
+        try:
+            raw_evidence = await evidence_tool.ainvoke({"chunk_ids": selected_ids})
+            evidence = GetEvidenceResult.model_validate(raw_evidence)
+            returned_ids = tuple(record.chunk_id for record in evidence.records)
+            resolved_ids = set(returned_ids) | set(evidence.missing_chunk_ids)
+            if resolved_ids != set(selected_ids):
+                raise ValueError("evidence tool result does not match requested chunk IDs")
+        except Exception as exc:
             _emit_graph_event(
                 state,
                 event_sink,
-                event_type="tool_started",
-                status="started",
-                component="tool",
-                name="get_evidence",
-                step_id=step.step_id,
-                requested_count=len(selected_ids),
-                tool_call_count=tool_call_count,
-            )
-            try:
-                raw_evidence = await evidence_tool.ainvoke({"chunk_ids": selected_ids})
-                evidence = GetEvidenceResult.model_validate(raw_evidence)
-                returned_ids = tuple(record.chunk_id for record in evidence.records)
-                resolved_ids = set(returned_ids) | set(evidence.missing_chunk_ids)
-                if resolved_ids != set(selected_ids):
-                    raise ValueError("evidence tool result does not match requested chunk IDs")
-            except Exception as exc:
-                _emit_graph_event(
-                    state,
-                    event_sink,
-                    event_type="tool_failed",
-                    status="failed",
-                    component="tool",
-                    name="get_evidence",
-                    duration_ms=_elapsed_ms(evidence_started),
-                    step_id=step.step_id,
-                    error_type=type(exc).__name__,
-                    reason_code="tool_execution_failed",
-                    requested_count=len(selected_ids),
-                    tool_call_count=tool_call_count,
-                )
-                raise
-            _emit_graph_event(
-                state,
-                event_sink,
-                event_type="tool_completed",
-                status="succeeded",
+                event_type="tool_failed",
+                status="failed",
                 component="tool",
                 name="get_evidence",
                 duration_ms=_elapsed_ms(evidence_started),
                 step_id=step.step_id,
+                error_type=type(exc).__name__,
+                reason_code="tool_execution_failed",
                 requested_count=len(selected_ids),
-                returned_count=len(evidence.records),
                 tool_call_count=tool_call_count,
             )
+            raise
+        _emit_graph_event(
+            state,
+            event_sink,
+            event_type="tool_completed",
+            status="succeeded",
+            component="tool",
+            name="get_evidence",
+            duration_ms=_elapsed_ms(evidence_started),
+            step_id=step.step_id,
+            requested_count=len(selected_ids),
+            returned_count=len(evidence.records),
+            tool_call_count=tool_call_count,
+        )
+        return evidence
+
+    async def execute_tools(state: ResearchGraphState) -> ResearchGraphState:
+        plan = ResearchPlan.model_validate(state["plan"])
+        first_step = ResearchStep.model_validate(state.get("active_step"))
+        current_step = state["current_step"]
+        batch_size = 1
+        if plan.task_type == "comparison" and not state["assessments"]:
+            batch_size = min(
+                runtime_policy.comparison_search_concurrency,
+                len(plan.steps) - current_step,
+            )
+        steps = plan.steps[current_step : current_step + batch_size]
+        if not steps or steps[0].step_id != first_step.step_id:
+            raise ValueError("active research step does not match the planned batch")
+        executed_keys = {
+            _query_scope_key(item["search"]["query"], item["search"].get("corpus_id"))
+            for item in state["observations"]
+        }
+        batch_keys = tuple(_step_query_key(step) for step in steps)
+        if len(set(batch_keys)) != len(batch_keys) or any(
+            key in executed_keys for key in batch_keys
+        ):
+            raise ValueError("comparison search batch contains a repeated scoped query")
+
+        tool_call_count = state["tool_call_count"]
+        search_call_counts: list[int] = []
+        for _step in steps:
+            tool_call_count = _consume_tool(
+                state,
+                event_sink,
+                runtime_policy,
+                "search_corpus",
+                tool_call_count,
+            )
+            search_call_counts.append(tool_call_count)
+        searches = await asyncio.gather(
+            *(
+                run_search(state, step, tool_call_count=call_count)
+                for step, call_count in zip(steps, search_call_counts, strict=True)
+            )
+        )
+
+        evidence_call_counts: list[int | None] = []
+        for search in searches:
+            if search.hits:
+                tool_call_count = _consume_tool(
+                    state,
+                    event_sink,
+                    runtime_policy,
+                    "get_evidence",
+                    tool_call_count,
+                )
+                evidence_call_counts.append(tool_call_count)
+            else:
+                evidence_call_counts.append(None)
+        evidence_results = await asyncio.gather(
+            *(
+                run_evidence(
+                    state,
+                    step,
+                    search,
+                    tool_call_count=call_count or tool_call_count,
+                )
+                for step, search, call_count in zip(
+                    steps, searches, evidence_call_counts, strict=True
+                )
+            )
+        )
+
+        batch_results = tuple(
+            _StepExecutionResult(step=step, search=search, evidence=evidence)
+            for step, search, evidence in zip(
+                steps, searches, evidence_results, strict=True
+            )
+        )
+        action_history = list(state["action_history"])
+        for result in batch_results:
             action_history = _append_action_from_history(
                 action_history,
-                action="get_evidence",
-                step_id=step.step_id,
-                chunk_ids=selected_ids,
+                action="search_corpus",
+                step_id=result.step.step_id,
+                query=result.step.query,
             )
-        else:
-            evidence = GetEvidenceResult(records=())
+            selected_ids = tuple(
+                hit.chunk_id for hit in result.search.hits[:evidence_per_step]
+            )
+            if selected_ids:
+                action_history = _append_action_from_history(
+                    action_history,
+                    action="get_evidence",
+                    step_id=result.step.step_id,
+                    chunk_ids=selected_ids,
+                )
 
-        observation = ResearchObservation(
-            step_id=step.step_id,
-            objective=step.objective,
-            search=search,
-            evidence=evidence,
-        )
         merged = list(state["evidence_records"])
         seen = {str(record["chunk_id"]) for record in merged}
         previous_evidence_count = len(seen)
-        for record in evidence.records:
-            if record.chunk_id not in seen:
-                merged.append(record.model_dump(mode="json"))
-                seen.add(record.chunk_id)
+        for result in batch_results:
+            for record in result.evidence.records:
+                if record.chunk_id not in seen:
+                    merged.append(record.model_dump(mode="json"))
+                    seen.add(record.chunk_id)
         consecutive_no_new_evidence = (
             0
             if len(seen) > previous_evidence_count
             else state["consecutive_no_new_evidence"] + 1
         )
         return {
-            "current_step": state["current_step"] + 1,
+            "current_step": current_step + len(batch_results),
             "active_step": None,
             "tool_call_count": tool_call_count,
             "observations": [
                 *state["observations"],
-                observation.model_dump(mode="json"),
+                *(
+                    ResearchObservation(
+                        step_id=result.step.step_id,
+                        objective=result.step.objective,
+                        search=result.search,
+                        evidence=result.evidence,
+                    ).model_dump(mode="json")
+                    for result in batch_results
+                ),
             ],
             "evidence_records": merged,
             "consecutive_no_new_evidence": consecutive_no_new_evidence,

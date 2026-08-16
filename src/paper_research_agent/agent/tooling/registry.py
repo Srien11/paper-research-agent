@@ -13,7 +13,7 @@ from paper_research_agent.agent.tooling.catalog import EXTENDED_TOOL_SPECS, Tool
 from paper_research_agent.agent.tooling.contracts import TOOL_INPUT_SCHEMAS, ToolExecutionResult
 
 ToolProviderKind = Literal["builtin", "mcp"]
-_PUBLIC_NAME = re.compile(r"^[a-z][a-z0-9_]{1,127}$")
+_PUBLIC_NAME = re.compile(r"^[a-z][a-z0-9_-]{1,127}$")
 
 
 def _deep_freeze(value: Any) -> Any:

@@ -359,8 +359,9 @@ class RAGRuntime:
         token_budget: int = 8192,
         output_reserve_tokens: int = 1200,
         excerpt_chars: int = 360,
+        local_retrieval_workers: int = 2,
     ) -> RAGRuntime:
-        """Construct production dependencies once from project-local artifacts.
+        """Construct local runtime dependencies once from project-local artifacts.
 
         Provider credentials are resolved by the existing DashScope adapters from
         environment variables.  This method deliberately does not load ``.env``.
@@ -483,6 +484,7 @@ class RAGRuntime:
             bilingual_config,
             index_id=manifest.index_id,
             rights=rights,
+            local_workers=local_retrieval_workers,
         )
         generator = DashScopeAnswerGenerator(answer_config)
         memory_store = SQLiteShortTermMemory(
@@ -517,7 +519,7 @@ class RAGRuntime:
 
     @classmethod
     def from_environment(cls) -> RAGRuntime:
-        """Load production paths from environment without reading a dotenv file."""
+        """Load local paths from environment without reading a dotenv file."""
         project_root = Path(os.getenv("PRA_PROJECT_ROOT", str(Path(__file__).resolve().parents[3])))
         corpus_value = os.getenv("PRA_CORPUS_DIR", "").strip()
         if not corpus_value:
@@ -535,6 +537,7 @@ class RAGRuntime:
             answer_audit_path=_optional_env_path("PRA_ANSWER_AUDIT_PATH"),
             sections_path=_optional_env_path("PRA_SECTIONS_PATH"),
             elements_path=_optional_env_path("PRA_ELEMENTS_PATH"),
+            local_retrieval_workers=_environment_int("PRA_LOCAL_RETRIEVAL_WORKERS", 2),
         )
 
     @classmethod
@@ -1350,9 +1353,13 @@ def _research_policy_from_environment() -> object:
             "PRA_RESEARCH_AGENT_MAX_FOLLOWUP_STEPS",
             4,
         ),
+        comparison_search_concurrency=_environment_int(
+            "PRA_COMPARISON_SEARCH_CONCURRENCY",
+            2,
+        ),
         evidence_per_step=_environment_int(
             "PRA_RESEARCH_AGENT_EVIDENCE_PER_STEP",
-            3,
+            4,
         ),
         max_tool_calls=_environment_int("PRA_RESEARCH_AGENT_MAX_TOOL_CALLS", 48),
         timeout_seconds=_environment_float(

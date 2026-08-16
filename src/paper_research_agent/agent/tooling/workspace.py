@@ -407,7 +407,7 @@ def _atomic_write(path: Path, content: str, *, overwrite: bool) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() and not overwrite:
         raise FileExistsError("workspace target already exists")
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    temporary = path.with_name(f".tmp-{uuid.uuid4().hex}")
     temporary.write_text(content, encoding="utf-8")
     if path.exists() and not overwrite:
         temporary.unlink(missing_ok=True)

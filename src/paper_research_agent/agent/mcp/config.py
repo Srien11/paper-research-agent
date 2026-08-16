@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import re
@@ -30,13 +32,29 @@ _SHELL_LAUNCHERS = {
 }
 
 
+def mcp_public_name(server_id: str, remote_name: str) -> str:
+    """Derive a stable public name without discarding the remote identity."""
+
+    normalized = re.sub(r"[.-]", "_", remote_name.lower())
+    raw = f"{server_id}__{normalized}"
+    if len(raw) <= 128:
+        return raw
+    payload = json.dumps(
+        [server_id, remote_name],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest = base64.b32encode(hashlib.sha256(payload).digest()).decode("ascii")
+    return f"{server_id}__h1_{digest.rstrip('=').lower()}"
+
+
 class FrozenModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
 class McpToolAdmission(FrozenModel):
     remote_name: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
-    public_name: str = Field(pattern=r"^[a-z][a-z0-9_]{1,127}$")
+    public_name: str = Field(pattern=r"^[a-z][a-z0-9_-]{1,127}$")
     description: str = Field(min_length=1, max_length=500)
     risk: Literal["local_read", "network_read"]
     trust: Literal["research_context", "computed_result"] = "research_context"
@@ -93,10 +111,11 @@ class McpStdioServerConfig(FrozenModel):
         public_names: set[str] = set()
         remote_names: set[str] = set()
         for tool in self.tools:
-            normalized = re.sub(r"[.-]", "_", tool.remote_name.lower())
-            expected = f"{self.server_id}__{normalized}"
+            expected = mcp_public_name(self.server_id, tool.remote_name)
             if tool.public_name != expected:
-                raise ValueError("MCP public name must use the exact server namespace")
+                raise ValueError(
+                    f"MCP public name must use the exact server namespace: {expected}"
+                )
             if tool.public_name in public_names or tool.remote_name in remote_names:
                 raise ValueError("MCP tool names must be unique within a server")
             public_names.add(tool.public_name)
