@@ -96,6 +96,24 @@ class AgentEventTests(unittest.TestCase):
                     }
                 )
 
+    def test_hydration_counters_are_body_free_fixed_width_fields(self) -> None:
+        event = _event(
+            event_type="node_completed",
+            component="node",
+            name="main_hydrate_context",
+            recent_message_count=6,
+            recalled_conversation_count=2,
+            recalled_memory_count=1,
+            context_char_count=1800,
+            estimated_context_tokens=600,
+        )
+
+        rendered = event.model_dump_json()
+        self.assertIn('"recalled_memory_count":1', rendered)
+        self.assertNotIn("private prompt", rendered)
+        self.assertNotIn("memory_id", rendered)
+        self.assertNotIn("database", rendered)
+
     def test_contract_rejects_unknown_payload_and_raw_identifiers(self) -> None:
         with self.assertRaises(ValidationError):
             AgentEvent.model_validate(
@@ -185,7 +203,7 @@ class AgentEventTests(unittest.TestCase):
                 ).fetchone()
                 version = connection.execute("PRAGMA user_version").fetchone()
             self.assertEqual(row, ("ask",))
-            self.assertEqual(version, (2,))
+            self.assertEqual(version, (3,))
 
     def test_best_effort_emit_never_breaks_the_agent(self) -> None:
         class BrokenSink:

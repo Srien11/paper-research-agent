@@ -4,6 +4,7 @@ import asyncio
 import unittest
 from datetime import UTC, datetime
 
+from paper_research_agent.agent.observability import AgentEvent
 from paper_research_agent.agent.orchestrator.hydrator import ContextHydrator
 from paper_research_agent.agent.orchestrator.models import (
     AgentTask,
@@ -81,6 +82,15 @@ class _RecordingProvider:
         if self.fail:
             raise OSError("memory backend unavailable")
         return tuple(self.memories[:limit])
+
+
+class _RecordingEventSink:
+    def __init__(self) -> None:
+        self.events: list[AgentEvent] = []
+
+    def write(self, event: AgentEvent) -> bool:
+        self.events.append(event)
+        return True
 
 
 class ContextHydratorTests(unittest.TestCase):
@@ -174,6 +184,68 @@ class ContextHydratorTests(unittest.TestCase):
         self.assertEqual(memory_items[0].trust, "research_context")
         self.assertEqual(memory_items[0].source_id, "a" * 32)
         self.assertEqual(memory_items[0].memory_kind, "preference")
+
+    def test_hydration_emits_timing_counts_without_private_content(self) -> None:
+        sink = _RecordingEventSink()
+        provider = _RecordingProvider(
+            [],
+            memories=(
+                {
+                    "memory_id": "b" * 32,
+                    "content": "PRIVATE_MEMORY_BODY",
+                    "kind": "project_context",
+                    "relevance": 0.8,
+                },
+            ),
+        )
+        hydrator = ContextHydrator(
+            self.store,
+            memory_provider=provider,
+            event_sink=sink,
+        )
+        self._populate("conversation-1", ["PRIVATE_QUESTION"])
+
+        envelope = self._hydrate(self._request("PRIVATE_CURRENT"), self._workspace(), hydrator=hydrator)
+
+        self.assertEqual(
+            [event.name for event in sink.events],
+            [
+                "main_hydrate_recent",
+                "main_hydrate_history",
+                "main_hydrate_memory",
+                "main_hydrate_context",
+            ],
+        )
+        self.assertTrue(all(event.duration_ms is not None for event in sink.events))
+        context_event = sink.events[-1]
+        self.assertEqual(context_event.recent_message_count, len(envelope.recent_messages))
+        self.assertEqual(context_event.recalled_memory_count, 1)
+        self.assertGreater(context_event.context_char_count or 0, 0)
+        self.assertGreater(context_event.estimated_context_tokens or 0, 0)
+        rendered = "".join(event.model_dump_json() for event in sink.events)
+        self.assertNotIn("PRIVATE_MEMORY_BODY", rendered)
+        self.assertNotIn("PRIVATE_QUESTION", rendered)
+        self.assertNotIn("PRIVATE_CURRENT", rendered)
+        self.assertNotIn("b" * 32, rendered)
+
+    def test_memory_failure_is_observable_and_degrades_to_empty(self) -> None:
+        sink = _RecordingEventSink()
+        hydrator = ContextHydrator(
+            self.store,
+            memory_provider=_RecordingProvider([], fail=True),
+            event_sink=sink,
+        )
+
+        envelope = self._hydrate(self._request(), self._workspace(), hydrator=hydrator)
+
+        self.assertFalse(
+            [item for item in envelope.recalled_context if item.kind == "long_term_memory"]
+        )
+        memory_event = next(
+            event for event in sink.events if event.name == "main_hydrate_memory"
+        )
+        self.assertTrue(memory_event.degraded)
+        self.assertEqual(memory_event.returned_count, 0)
 
     def test_remote_recall_across_short_and_long_histories(self) -> None:
         for total in (5, 20, 100):

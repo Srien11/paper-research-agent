@@ -11,6 +11,7 @@ from paper_research_agent.agent.orchestrator.factory import (
 class MainAgentFactoryTests(unittest.TestCase):
     def test_model_factory_passes_memory_provider_to_hydrator(self) -> None:
         provider = Mock()
+        event_sink = Mock()
         with patch(
             "paper_research_agent.agent.orchestrator.factory.build_main_agent_runtime",
             return_value=Mock(),
@@ -20,9 +21,11 @@ class MainAgentFactoryTests(unittest.TestCase):
                 model=Mock(),
                 dispatcher=Mock(),
                 memory_provider=provider,
+                event_sink=event_sink,
             )
 
         self.assertIs(build.call_args.kwargs["hydrator"].memory_provider, provider)
+        self.assertIs(build.call_args.kwargs["hydrator"].event_sink, event_sink)
 
 
 if __name__ == "__main__":

@@ -4,10 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Protocol
 
+from paper_research_agent.agent.observability import (
+    AgentEvent,
+    AgentEventSink,
+    emit_agent_event,
+)
 from paper_research_agent.agent.orchestrator.models import (
     AgentContextEnvelope,
     ContextMessage,
@@ -47,6 +53,7 @@ class ContextHydrator:
         recalled_turns: int = MAX_RECALLED_TURNS,
         recalled_memories: int = MAX_LONG_TERM_MEMORIES,
         history_limit: int = 500,
+        event_sink: AgentEventSink | None = None,
     ) -> None:
         if recent_turns <= 0 or recent_turns > 12:
             raise ValueError("recent_turns must be between 1 and 12")
@@ -62,6 +69,7 @@ class ContextHydrator:
         self.recalled_turns = recalled_turns
         self.recalled_memories = recalled_memories
         self.history_limit = history_limit
+        self.event_sink = event_sink
 
     async def hydrate(
         self,
@@ -70,11 +78,28 @@ class ContextHydrator:
         *,
         turn_id: str,
     ) -> AgentContextEnvelope:
+        hydration_started = time.perf_counter()
+        recent_started = time.perf_counter()
         recent_turns = await asyncio.to_thread(
             self.store.recent, request.conversation_id, limit=self.recent_turns
         )
+        self._emit_hydration_event(
+            run_id=turn_id,
+            name="main_hydrate_recent",
+            started=recent_started,
+            requested_count=self.recent_turns,
+            returned_count=len(recent_turns),
+        )
+        history_started = time.perf_counter()
         history = await asyncio.to_thread(
             self.store.history, request.conversation_id, limit=self.history_limit
+        )
+        self._emit_hydration_event(
+            run_id=turn_id,
+            name="main_hydrate_history",
+            started=history_started,
+            requested_count=self.history_limit,
+            returned_count=len(history),
         )
         recall_query = self._recall_query(request.message, workspace)
         ranked = _rank_history(recall_query, history)
@@ -84,7 +109,16 @@ class ContextHydrator:
             for turn, score in ranked
             if turn.turn_id not in recent_ids
         )[: self.recalled_turns]
-        memories = await self._recall_memories(recall_query)
+        memory_started = time.perf_counter()
+        memories, memory_degraded = await self._recall_memories(recall_query)
+        self._emit_hydration_event(
+            run_id=turn_id,
+            name="main_hydrate_memory",
+            started=memory_started,
+            requested_count=self.recalled_memories,
+            returned_count=len(memories),
+            degraded=memory_degraded,
+        )
         recent_messages = _context_messages(recent_turns)
         recalled_context = _recalled_contexts(recalled_turns, memories)
         recent_messages, recalled_context = _apply_budgets(
@@ -93,7 +127,7 @@ class ContextHydrator:
             recalled_turns_limit=self.recalled_turns,
             memories_limit=self.recalled_memories,
         )
-        return AgentContextEnvelope(
+        envelope = AgentContextEnvelope(
             conversation_id=request.conversation_id,
             request_id=request.request_id,
             turn_id=turn_id,
@@ -104,6 +138,59 @@ class ContextHydrator:
             recent_messages=recent_messages,
             recalled_context=recalled_context,
             prepared_at=datetime.now(UTC),
+        )
+        context_char_count = len(envelope.model_dump_json())
+        self._emit_hydration_event(
+            run_id=turn_id,
+            name="main_hydrate_context",
+            started=hydration_started,
+            recent_message_count=len(recent_messages),
+            recalled_conversation_count=sum(
+                item.kind != "long_term_memory" for item in recalled_context
+            ),
+            recalled_memory_count=sum(
+                item.kind == "long_term_memory" for item in recalled_context
+            ),
+            context_char_count=context_char_count,
+            estimated_context_tokens=(context_char_count + 2) // 3,
+            degraded=memory_degraded,
+        )
+        return envelope
+
+    def _emit_hydration_event(
+        self,
+        *,
+        run_id: str,
+        name: str,
+        started: float,
+        requested_count: int | None = None,
+        returned_count: int | None = None,
+        recent_message_count: int | None = None,
+        recalled_conversation_count: int | None = None,
+        recalled_memory_count: int | None = None,
+        context_char_count: int | None = None,
+        estimated_context_tokens: int | None = None,
+        degraded: bool | None = None,
+    ) -> None:
+        emit_agent_event(
+            self.event_sink,
+            AgentEvent(
+                run_id=run_id,
+                occurred_at=datetime.now(UTC),
+                event_type="node_completed",
+                status="succeeded",
+                component="node",
+                name=name,
+                duration_ms=max(0.0, (time.perf_counter() - started) * 1000),
+                requested_count=requested_count,
+                returned_count=returned_count,
+                recent_message_count=recent_message_count,
+                recalled_conversation_count=recalled_conversation_count,
+                recalled_memory_count=recalled_memory_count,
+                context_char_count=context_char_count,
+                estimated_context_tokens=estimated_context_tokens,
+                degraded=degraded,
+            ),
         )
 
     def _recall_query(self, message: str, workspace: ConversationWorkspace) -> str:
@@ -122,16 +209,18 @@ class ContextHydrator:
         parts.extend(workspace.unresolved_questions)
         return " ".join(part for part in parts if part)
 
-    async def _recall_memories(self, query: str) -> tuple[dict[str, object], ...]:
+    async def _recall_memories(
+        self, query: str
+    ) -> tuple[tuple[dict[str, object], ...], bool]:
         if self.memory_provider is None:
-            return ()
+            return (), False
         try:
             memories = await self.memory_provider.search(query, limit=self.recalled_memories)
         except Exception:  # noqa: BLE001 - memory is recall-only; any failure degrades to empty
-            return ()
+            return (), True
         if not isinstance(memories, tuple):
-            return ()
-        return memories
+            return (), True
+        return memories, False
 
 
 def _tokens(value: str) -> set[str]:

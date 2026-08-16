@@ -88,6 +88,11 @@ class AgentEvent(BaseModel):
     endpoint: DeprecatedEndpoint | None = None
     workspace_version: int | None = Field(default=None, ge=0)
     validation_error_count: int | None = Field(default=None, ge=0)
+    recent_message_count: int | None = Field(default=None, ge=0)
+    recalled_conversation_count: int | None = Field(default=None, ge=0)
+    recalled_memory_count: int | None = Field(default=None, ge=0)
+    context_char_count: int | None = Field(default=None, ge=0)
+    estimated_context_tokens: int | None = Field(default=None, ge=0)
 
     @field_validator("occurred_at")
     @classmethod
@@ -187,6 +192,11 @@ class SQLiteAgentEventLogger:
         "endpoint",
         "workspace_version",
         "validation_error_count",
+        "recent_message_count",
+        "recalled_conversation_count",
+        "recalled_memory_count",
+        "context_char_count",
+        "estimated_context_tokens",
     )
 
     def __init__(self, path: Path):
@@ -249,6 +259,11 @@ class SQLiteAgentEventLogger:
                     endpoint TEXT,
                     workspace_version INTEGER,
                     validation_error_count INTEGER
+                    ,recent_message_count INTEGER
+                    ,recalled_conversation_count INTEGER
+                    ,recalled_memory_count INTEGER
+                    ,context_char_count INTEGER
+                    ,estimated_context_tokens INTEGER
                 );
                 CREATE INDEX IF NOT EXISTS agent_events_run
                     ON agent_events(run_id, event_id);
@@ -266,13 +281,18 @@ class SQLiteAgentEventLogger:
                 "endpoint": "TEXT",
                 "workspace_version": "INTEGER",
                 "validation_error_count": "INTEGER",
+                "recent_message_count": "INTEGER",
+                "recalled_conversation_count": "INTEGER",
+                "recalled_memory_count": "INTEGER",
+                "context_char_count": "INTEGER",
+                "estimated_context_tokens": "INTEGER",
             }
             for column, sql_type in additions.items():
                 if column not in existing:
                     connection.execute(
                         f"ALTER TABLE agent_events ADD COLUMN {column} {sql_type}"
                     )
-            connection.execute("PRAGMA user_version = 2")
+            connection.execute("PRAGMA user_version = 3")
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=5.0)

@@ -98,7 +98,11 @@ def build_main_agent_runtime_from_model(
     """Build production stages while sharing one lifecycle-managed model client."""
     return build_main_agent_runtime(
         store=store,
-        hydrator=ContextHydrator(store, memory_provider=memory_provider),
+        hydrator=ContextHydrator(
+            store,
+            memory_provider=memory_provider,
+            event_sink=event_sink,
+        ),
         interpreter=TurnInterpreter(model),
         goal_reconciler=GoalReconciler(model),
         task_planner=TaskPlanner(model),
