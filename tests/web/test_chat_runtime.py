@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 
 import httpx
 
-from paper_research_agent.agent.orchestrator.models import ContextMessage
+from paper_research_agent.agent.orchestrator.models import ContextMessage, RecalledContext
 from paper_research_agent.conversation.models import (
     ConversationCandidate,
     ConversationContextSnapshot,
@@ -318,6 +318,15 @@ class ConversationRuntimeTests(unittest.IsolatedAsyncioTestCase):
             summary="讨论模型评测",
             active_goal="比较 RAG 与 GraphRAG",
             active_task="收集论文证据",
+            recalled_context=(
+                RecalledContext(
+                    source_id="m" * 32,
+                    kind="long_term_memory",
+                    content="用户偏好中文回答",
+                    relevance=0.8,
+                    trust="research_context",
+                ),
+            ),
         )
         events: list[dict[str, object]] = []
         async for event in runtime.stream_contextual_chat(request):
@@ -329,6 +338,9 @@ class ConversationRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("store 中的旧问题", contents)
         self.assertIn("活动目标：比较 RAG 与 GraphRAG", contents)
         self.assertIn("当前任务：收集论文证据", contents)
+        self.assertTrue(any("用户偏好中文回答" in item for item in contents))
+        self.assertNotIn("用户偏好中文回答", contents[0])
+        self.assertEqual(contents[-1], "继续")
         await client.aclose()
 
     async def test_contextual_chat_rejects_blank_message(self) -> None:
