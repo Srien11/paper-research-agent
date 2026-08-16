@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import unittest
+from datetime import UTC, datetime
 from typing import cast
 from unittest.mock import patch
 
@@ -18,9 +20,13 @@ from paper_research_agent.agent.orchestrator.artifacts import (
     LocalRAGArtifact,
     LocalRAGTrace,
 )
+from paper_research_agent.agent.orchestrator.graph import _selected_recalled_context
+from paper_research_agent.agent.orchestrator.hydrator import ContextHydrator
+from paper_research_agent.agent.orchestrator.interpreter import TurnInterpreter
 from paper_research_agent.agent.orchestrator.models import (
     Capability,
     ChildTaskResult,
+    ConversationWorkspace,
     MainAgentRequest,
     MainAgentResult,
     RunStatus,
@@ -28,9 +34,166 @@ from paper_research_agent.agent.orchestrator.models import (
 from paper_research_agent.answering.models import AnswerCitation, AnswerClaim, RAGAnswer
 from paper_research_agent.conversation.store import InMemoryConversationStore
 from paper_research_agent.web.app import create_app
+from paper_research_agent.web.chat_runtime import ConversationRuntime, DirectResponseRequest
 from paper_research_agent.web.config import OwnerCredentials, WebConfig
 
 ORIGIN = "https://main-agent-e2e.test"
+
+
+class _MemoryProvider:
+    def __init__(self, memories: tuple[dict[str, object], ...]) -> None:
+        self.memories = memories
+        self.calls = 0
+
+    async def search(self, query: str, *, limit: int = 5) -> tuple[dict[str, object], ...]:
+        del query
+        self.calls += 1
+        return self.memories[:limit]
+
+
+class _InterpreterModel:
+    def __init__(self, response: dict[str, object]) -> None:
+        self.response = response
+        self.messages: list[object] = []
+
+    def with_structured_output(self, schema: object, method: str = "function_calling") -> object:
+        del schema, method
+        return self
+
+    async def ainvoke(self, messages: object) -> object:
+        self.messages.append(messages)
+        return self.response
+
+
+def _empty_workspace() -> ConversationWorkspace:
+    return ConversationWorkspace(
+        conversation_id="memory-e2e",
+        version=0,
+        updated_at=datetime(2026, 8, 16, tzinfo=UTC),
+    )
+
+
+class LongTermMemoryConsumptionIntegrationTests(unittest.TestCase):
+    def test_greeting_with_no_memory_keeps_empty_selection(self) -> None:
+        provider = _MemoryProvider(())
+        envelope = asyncio.run(
+            ContextHydrator(
+                InMemoryConversationStore(), memory_provider=provider
+            ).hydrate(
+                MainAgentRequest(
+                    request_id="request-greeting",
+                    conversation_id="memory-e2e",
+                    message="你好",
+                    rag_mode="disabled",
+                ),
+                _empty_workspace(),
+                turn_id="a" * 32,
+            )
+        )
+        model = _InterpreterModel(
+            {
+                "relation": "meta_conversation",
+                "resolved_request": "你好",
+                "selected_context_ids": (),
+                "confidence": 0.9,
+            }
+        )
+        interpretation = asyncio.run(TurnInterpreter(model).interpret(envelope))
+
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(_selected_recalled_context(envelope, interpretation), ())
+
+    def test_selected_preference_reaches_direct_chat_as_untrusted_data(self) -> None:
+        memory_id = "b" * 32
+        provider = _MemoryProvider(
+            (
+                {
+                    "memory_id": memory_id,
+                    "kind": "preference",
+                    "content": "用户偏好中文回答",
+                    "relevance": 0.9,
+                },
+            )
+        )
+        envelope = asyncio.run(
+            ContextHydrator(
+                InMemoryConversationStore(), memory_provider=provider
+            ).hydrate(
+                MainAgentRequest(
+                    request_id="request-preference",
+                    conversation_id="memory-e2e",
+                    message="继续",
+                    rag_mode="disabled",
+                ),
+                _empty_workspace(),
+                turn_id="b" * 32,
+            )
+        )
+        model = _InterpreterModel(
+            {
+                "relation": "new_goal",
+                "resolved_request": "继续",
+                "selected_context_ids": (memory_id,),
+                "confidence": 0.9,
+            }
+        )
+        interpretation = asyncio.run(TurnInterpreter(model).interpret(envelope))
+        selected = _selected_recalled_context(envelope, interpretation)
+        request = DirectResponseRequest(
+            session_id="memory-e2e",
+            current_message="继续",
+            recalled_context=selected,
+        )
+        runtime = ConversationRuntime.__new__(ConversationRuntime)
+        messages = runtime._contextual_messages(request, "继续")
+
+        self.assertEqual(selected[0].memory_kind, "preference")
+        self.assertIn("用户偏好中文回答", messages[-2]["content"])
+        self.assertEqual(messages[-2]["role"], "user")
+        self.assertNotIn("用户偏好中文回答", messages[0]["content"])
+
+    def test_project_context_guides_resolved_continuation(self) -> None:
+        memory_id = "c" * 32
+        provider = _MemoryProvider(
+            (
+                {
+                    "memory_id": memory_id,
+                    "kind": "project_context",
+                    "content": "项目正在比较 RAG 与 GraphRAG 的评测指标",
+                    "relevance": 0.95,
+                },
+            )
+        )
+        envelope = asyncio.run(
+            ContextHydrator(
+                InMemoryConversationStore(), memory_provider=provider
+            ).hydrate(
+                MainAgentRequest(
+                    request_id="request-project",
+                    conversation_id="memory-e2e",
+                    message="继续这个项目",
+                    rag_mode="preferred",
+                ),
+                _empty_workspace(),
+                turn_id="c" * 32,
+            )
+        )
+        model = _InterpreterModel(
+            {
+                "relation": "new_goal",
+                "resolved_request": "继续比较 RAG 与 GraphRAG 的评测指标",
+                "selected_context_ids": (memory_id,),
+                "confidence": 0.95,
+            }
+        )
+
+        interpretation = asyncio.run(TurnInterpreter(model).interpret(envelope))
+
+        self.assertIn("RAG 与 GraphRAG", interpretation.resolved_request)
+        self.assertEqual(
+            _selected_recalled_context(envelope, interpretation)[0].memory_kind,
+            "project_context",
+        )
 
 
 class _LegacyRuntime:

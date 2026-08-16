@@ -92,6 +92,45 @@ class MemoryProposalTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "unrecalled"):
             await proposer.propose("更新这条记忆", (), ())
 
+    async def test_sensitive_or_transient_content_policy_returns_none(self) -> None:
+        model = Mock()
+        structured = AsyncMock()
+        structured.ainvoke.return_value = MemoryProposal(
+            action="none",
+            rationale="Secrets, full papers, and transient chat must not be stored.",
+        )
+        model.with_structured_output.return_value = structured
+        proposer = LangChainMemoryProposer(model)
+
+        proposal = await proposer.propose(
+            "请记住我的 API 密钥、整篇论文原文和这句临时闲聊",
+            (),
+            (),
+        )
+
+        self.assertEqual(proposal.action, "none")
+        system = structured.ainvoke.await_args.args[0][0].content
+        self.assertIn("Never include secrets", system)
+        self.assertIn("credentials", system)
+        self.assertIn("full papers", system)
+        self.assertIn("transient chat", system)
+
+    async def test_confirmed_conclusion_cannot_cite_unavailable_chunk(self) -> None:
+        model = Mock()
+        structured = AsyncMock()
+        structured.ainvoke.return_value = MemoryProposal(
+            action="add",
+            kind="confirmed_conclusion",
+            content="Unsupported conclusion",
+            source_chunk_ids=("chunk-not-observed",),
+            rationale="Remember it",
+        )
+        model.with_structured_output.return_value = structured
+        proposer = LangChainMemoryProposer(model)
+
+        with self.assertRaisesRegex(ValueError, "unavailable evidence"):
+            await proposer.propose("请记住这个结论", (), (_citation_observation(),))
+
 
 if __name__ == "__main__":
     unittest.main()
