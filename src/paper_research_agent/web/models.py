@@ -239,6 +239,8 @@ class SafeContextTrace(WebModel):
     output_reserve_tokens: int = Field(ge=0)
     included_memory_turn_count: int = Field(ge=0)
     omitted_memory_turn_count: int = Field(ge=0)
+    included_long_term_memory_count: int = Field(default=0, ge=0)
+    omitted_long_term_memory_count: int = Field(default=0, ge=0)
     included_evidence_count: int = Field(ge=0)
     omitted_evidence_count: int = Field(ge=0)
     evidence_insufficient: bool

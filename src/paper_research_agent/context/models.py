@@ -122,6 +122,23 @@ class ContextMemoryTurn(FrozenContract):
         return self
 
 
+class ContextLongTermMemory(FrozenContract):
+    """Selected low-trust durable memory that can guide, but never prove, an answer."""
+
+    memory_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    kind: Literal["preference", "project_context", "confirmed_conclusion"]
+    content: str = Field(min_length=1, max_length=3000)
+    relevance: float = Field(ge=0, le=1)
+
+    @field_validator("content")
+    @classmethod
+    def normalize_content(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("long-term memory content must not be blank")
+        return normalized
+
+
 class ContextRequest(FrozenContract):
     """Inputs to deterministic context assembly."""
 
@@ -134,6 +151,8 @@ class ContextRequest(FrozenContract):
     conversation_history: tuple[PromptMessage, ...] = ()
     short_term_memory: tuple[ContextMemoryTurn, ...] = ()
     memory_token_budget: int = Field(default=0, ge=0)
+    long_term_memory: tuple[ContextLongTermMemory, ...] = ()
+    long_term_memory_token_budget: int = Field(default=0, ge=0)
     protected_evidence_count: int = Field(default=1, gt=0, le=10)
     token_budget: int = Field(gt=0)
     output_reserve_tokens: int = Field(default=0, ge=0)
@@ -165,10 +184,17 @@ class ContextRequest(FrozenContract):
         memory_ids = [turn.turn_id for turn in self.short_term_memory]
         if len(set(memory_ids)) != len(memory_ids):
             raise ValueError("short-term memory turn IDs must be unique")
+        long_term_memory_ids = [item.memory_id for item in self.long_term_memory]
+        if len(set(long_term_memory_ids)) != len(long_term_memory_ids):
+            raise ValueError("long-term memory IDs must be unique")
         if self.output_reserve_tokens >= self.token_budget:
             raise ValueError("output reserve must be smaller than token budget")
         if self.memory_token_budget >= self.token_budget:
             raise ValueError("memory token budget must be smaller than total token budget")
+        if self.long_term_memory_token_budget >= self.token_budget:
+            raise ValueError(
+                "long-term memory token budget must be smaller than total token budget"
+            )
         return self
 
 
@@ -183,6 +209,8 @@ class AssembledContext(FrozenContract):
     omitted_evidence_count: int = Field(ge=0)
     included_memory_turn_ids: tuple[str, ...] = ()
     omitted_memory_turn_count: int = Field(default=0, ge=0)
+    included_long_term_memory_ids: tuple[str, ...] = ()
+    omitted_long_term_memory_count: int = Field(default=0, ge=0)
     evidence_insufficient: bool = False
 
     @model_validator(mode="after")

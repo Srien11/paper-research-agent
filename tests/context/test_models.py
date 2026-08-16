@@ -14,6 +14,7 @@ from paper_research_agent.context.models import (
     AssembledContext,
     CitationRef,
     ContextEvidence,
+    ContextLongTermMemory,
     ContextMemoryTurn,
     ContextRequest,
     PromptMessage,
@@ -49,6 +50,53 @@ def citation(citation_id: str = "E1", chunk_id: str = "chunk-1") -> CitationRef:
 
 
 class ContextModelTests(unittest.TestCase):
+    def test_long_term_memory_contract_and_budget_are_strict(self) -> None:
+        valid = ContextLongTermMemory(
+            memory_id="a" * 32,
+            kind="preference",
+            content=" 用户偏好中文回答 ",
+            relevance=0.8,
+        )
+        self.assertEqual(valid.content, "用户偏好中文回答")
+        with self.assertRaises(ValidationError):
+            ContextLongTermMemory(
+                memory_id="bad-id",
+                kind="preference",
+                content="valid",
+                relevance=0.5,
+            )
+        with self.assertRaises(ValidationError):
+            ContextLongTermMemory(
+                memory_id="b" * 32,
+                kind="episode",  # type: ignore[arg-type]
+                content="valid",
+                relevance=0.5,
+            )
+        with self.assertRaises(ValidationError):
+            ContextLongTermMemory(
+                memory_id="b" * 32,
+                kind="project_context",
+                content="   ",
+                relevance=0.5,
+            )
+        with self.assertRaises(ValidationError):
+            ContextRequest(
+                system_rules="Use evidence.",
+                user_question="current",
+                evidence=(),
+                long_term_memory=(valid, valid),
+                long_term_memory_token_budget=10,
+                token_budget=100,
+            )
+        with self.assertRaises(ValidationError):
+            ContextRequest(
+                system_rules="Use evidence.",
+                user_question="current",
+                evidence=(),
+                long_term_memory_token_budget=100,
+                token_budget=100,
+            )
+
     def test_illegal_message_role_is_rejected(self) -> None:
         with self.assertRaises(ValidationError):
             PromptMessage(role="tool", content="result")  # type: ignore[arg-type]

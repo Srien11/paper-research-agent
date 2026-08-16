@@ -205,9 +205,12 @@ def _recalled_contexts(
     for memory in memories:
         memory_id = memory.get("memory_id")
         memory_content = memory.get("content")
+        memory_kind = memory.get("kind")
         if not isinstance(memory_id, str) or not memory_id:
             continue
         if not isinstance(memory_content, str) or not memory_content.strip():
+            continue
+        if memory_kind not in {"preference", "project_context", "confirmed_conclusion"}:
             continue
         raw_relevance = memory.get("relevance", 0.5)
         relevance = float(raw_relevance) if isinstance(raw_relevance, (int, float)) else 0.5
@@ -218,6 +221,7 @@ def _recalled_contexts(
                 content=memory_content,
                 relevance=min(max(relevance, 0.0), 1.0),
                 trust="research_context",
+                memory_kind=memory_kind,
             )
         )
     return tuple(items)

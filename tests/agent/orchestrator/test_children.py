@@ -96,7 +96,7 @@ class _FakeLocalResult:
 class _FakeLocalRuntime:
     def __init__(self, result: object) -> None:
         self.result = result
-        self.calls: list[tuple[str, str, bool]] = []
+        self.calls: list[tuple[str, str, bool, tuple[object, ...]]] = []
 
     async def ask(
         self,
@@ -104,8 +104,11 @@ class _FakeLocalRuntime:
         *,
         session_id: str,
         research_mode: str = "single",
+        long_term_memory: tuple[object, ...] = (),
     ) -> object:
-        self.calls.append((question, session_id, research_mode == "planned"))
+        self.calls.append(
+            (question, session_id, research_mode == "planned", long_term_memory)
+        )
         return self.result
 
 
@@ -214,6 +217,37 @@ class ChildGraphDispatcherTests(unittest.TestCase):
         self.assertEqual(result.status, "insufficient_evidence")
         self.assertEqual(result.citation_kind, "local_paper")
         self.assertEqual(result.source_ids, ())
+
+    def test_local_receives_only_typed_selected_long_term_memory(self) -> None:
+        fake = _FakeLocalRuntime(_FakeLocalResult(sufficient=True))
+        dispatcher = ChildGraphDispatcher(local_rag=RAGRuntimeChildExecutor(fake))
+        request = _request(
+            capability="local_rag",
+            selected_context=(
+                RecalledContext(
+                    source_id="e" * 32,
+                    kind="long_term_memory",
+                    memory_kind="preference",
+                    content="用户偏好中文回答",
+                    relevance=0.8,
+                    trust="research_context",
+                ),
+                RecalledContext(
+                    source_id="c" * 32,
+                    kind="conversation_turn",
+                    content="以前的问题",
+                    relevance=0.7,
+                    trust="non_evidence",
+                ),
+            ),
+        )
+
+        asyncio.run(dispatcher.dispatch(request))
+
+        projected = fake.calls[0][3]
+        self.assertEqual(len(projected), 1)
+        self.assertEqual(projected[0].memory_id, "e" * 32)
+        self.assertEqual(projected[0].kind, "preference")
 
     def test_single_paper_local_question_does_not_force_comparison_plan(self) -> None:
         fake = _FakeLocalRuntime(_FakeLocalResult(sufficient=True))

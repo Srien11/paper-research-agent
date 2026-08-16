@@ -232,6 +232,9 @@ class RecalledContext(FrozenModel):
     content: str = Field(min_length=1, max_length=3000)
     relevance: float = Field(ge=0, le=1)
     trust: Literal["non_evidence", "research_context"]
+    memory_kind: Literal[
+        "preference", "project_context", "confirmed_conclusion"
+    ] | None = None
 
     @field_validator("content")
     @classmethod

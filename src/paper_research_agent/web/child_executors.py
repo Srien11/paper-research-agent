@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import Any, Literal, Protocol
 
+from pydantic import ValidationError
+
 from paper_research_agent.agent.intent import requires_research_planning
 from paper_research_agent.agent.observability import safe_fingerprint
 from paper_research_agent.agent.orchestrator.artifacts import (
@@ -18,6 +20,7 @@ from paper_research_agent.agent.orchestrator.artifacts import (
 from paper_research_agent.agent.orchestrator.identifiers import child_session_id
 from paper_research_agent.agent.orchestrator.models import ChildTaskRequest
 from paper_research_agent.answering.models import RAGAnswer
+from paper_research_agent.context.models import ContextLongTermMemory
 from paper_research_agent.web.chat_runtime import DirectResponseRequest
 from paper_research_agent.web.files import AttachmentStore
 
@@ -29,6 +32,7 @@ class RAGRuntimeLike(Protocol):
         *,
         session_id: str,
         research_mode: Literal["single", "planned"] = "single",
+        long_term_memory: tuple[ContextLongTermMemory, ...] = (),
     ) -> object: ...
 
 
@@ -61,12 +65,28 @@ class RAGRuntimeChildExecutor:
         self._runtime = runtime
 
     async def answer(self, request: ChildTaskRequest) -> LocalRAGArtifact:
+        long_term_memory: list[ContextLongTermMemory] = []
+        for item in request.selected_context:
+            if item.kind != "long_term_memory" or item.memory_kind is None:
+                continue
+            try:
+                long_term_memory.append(
+                    ContextLongTermMemory(
+                        memory_id=item.source_id,
+                        kind=item.memory_kind,
+                        content=item.content,
+                        relevance=item.relevance,
+                    )
+                )
+            except ValidationError:
+                continue
         result = await self._runtime.ask(
             request.objective,
             session_id=_child_session_id("research", request),
             research_mode=(
                 "planned" if requires_research_planning(request.objective) else "single"
             ),
+            long_term_memory=tuple(long_term_memory),
         )
         answer = RAGAnswer.model_validate(_value(result, "answer"))
         retrieval = _value(result, "retrieval")

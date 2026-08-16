@@ -32,7 +32,7 @@ from paper_research_agent.agent.runtime import ResearchRuntimeResult
 from paper_research_agent.agent.tooling.contracts import ToolExecutionResult
 from paper_research_agent.answering.models import AnswerRequest, GenerationResult
 from paper_research_agent.chunking.models import EvidenceChunk
-from paper_research_agent.context.models import ContextEvidence
+from paper_research_agent.context.models import ContextEvidence, ContextLongTermMemory
 from paper_research_agent.conversation.models import (
     ConversationCandidate,
     ConversationResolution,
@@ -748,6 +748,30 @@ class RAGRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("local_pdf_path", rendered)
         self.assertNotIn("image_path", rendered)
         self.assertNotIn("scores", rendered)
+
+    async def test_selected_long_term_memory_reaches_prompt_but_not_citations(self) -> None:
+        runtime, _, generator = _runtime()
+        memory = ContextLongTermMemory(
+            memory_id="f" * 32,
+            kind="project_context",
+            content="项目正在比较本地 RAG 的证据边界",
+            relevance=0.9,
+        )
+
+        result = await runtime.ask(
+            "RAG 如何改善事实性？",
+            session_id="f" * 32,
+            long_term_memory=(memory,),
+        )
+
+        prompt = "\n".join(
+            message.content for message in generator.requests[0].context.messages
+        )
+        self.assertIn("UNTRUSTED LONG-TERM MEMORY", prompt)
+        self.assertIn(memory.content, prompt)
+        self.assertEqual(result.context.included_long_term_memory_count, 1)
+        self.assertEqual([item.chunk_id for item in result.answer.citations], ["chunk-1"])
+        self.assertNotIn(memory.memory_id, {item.chunk_id for item in result.answer.citations})
 
     async def test_uses_agent_evidence_with_existing_answer_validation(self) -> None:
         chunk = _chunk()

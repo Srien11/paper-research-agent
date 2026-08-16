@@ -40,6 +40,7 @@ from paper_research_agent.context.assembler import (
 )
 from paper_research_agent.context.models import (
     AssembledContext,
+    ContextLongTermMemory,
     ContextMemoryTurn,
     ContextRequest,
 )
@@ -147,6 +148,8 @@ class SafeContextTrace(_FrozenWebModel):
     output_reserve_tokens: int = Field(ge=0)
     included_memory_turn_count: int = Field(ge=0)
     omitted_memory_turn_count: int = Field(ge=0)
+    included_long_term_memory_count: int = Field(default=0, ge=0)
+    omitted_long_term_memory_count: int = Field(default=0, ge=0)
     included_evidence_count: int = Field(ge=0)
     omitted_evidence_count: int = Field(ge=0)
     evidence_insufficient: bool
@@ -636,6 +639,7 @@ class RAGRuntime:
         session_id: str,
         research_mode: ResearchRequestMode = "single",
         conversation_context: ConversationResolution | None = None,
+        long_term_memory: tuple[ContextLongTermMemory, ...] = (),
     ) -> RuntimeExecutionResult:
         normalized_question = question.strip()
         if not normalized_question:
@@ -658,6 +662,7 @@ class RAGRuntime:
                     session_id=session_id,
                     research_mode=research_mode,
                     conversation_context=conversation_context,
+                    long_term_memory=long_term_memory,
                 )
         finally:
             self._busy = False
@@ -754,6 +759,7 @@ class RAGRuntime:
         session_id: str,
         research_mode: ResearchRequestMode = "single",
         conversation_context: ConversationResolution | None = None,
+        long_term_memory: tuple[ContextLongTermMemory, ...] = (),
     ) -> RuntimeExecutionResult:
         policy = self._memory_config
         if conversation_context is None:
@@ -823,6 +829,8 @@ class RAGRuntime:
             ),
             short_term_memory=context_memory,
             memory_token_budget=policy.context_token_budget,
+            long_term_memory=long_term_memory,
+            long_term_memory_token_budget=policy.context_token_budget,
             protected_evidence_count=policy.protected_evidence_count,
             token_budget=self._token_budget,
             output_reserve_tokens=self._output_reserve_tokens,
@@ -1227,6 +1235,12 @@ class RAGRuntime:
                 output_reserve_tokens=context.output_reserve_tokens,
                 included_memory_turn_count=len(context.included_memory_turn_ids),
                 omitted_memory_turn_count=context.omitted_memory_turn_count,
+                included_long_term_memory_count=len(
+                    context.included_long_term_memory_ids
+                ),
+                omitted_long_term_memory_count=(
+                    context.omitted_long_term_memory_count
+                ),
                 included_evidence_count=len(context.citations),
                 omitted_evidence_count=context.omitted_evidence_count,
                 evidence_insufficient=context.evidence_insufficient,

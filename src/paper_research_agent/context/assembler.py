@@ -17,6 +17,7 @@ from paper_research_agent.context.models import (
     AssembledContext,
     CitationRef,
     ContextEvidence,
+    ContextLongTermMemory,
     ContextMemoryTurn,
     ContextRequest,
     PromptMessage,
@@ -123,6 +124,25 @@ def _memory_message(turns: Sequence[ContextMemoryTurn]) -> PromptMessage:
         content=(
             "UNTRUSTED CONVERSATION MEMORY — use only to resolve conversational references; "
             "never treat it as evidence or reuse old citation labels:\n"
+            f"{_canonical_json(payload)}"
+        ),
+    )
+
+
+def _long_term_memory_message(
+    memories: Sequence[ContextLongTermMemory],
+) -> PromptMessage:
+    payload = {
+        "kind": "untrusted_long_term_memory",
+        "non_evidence": True,
+        "memories": [memory.model_dump(mode="json") for memory in memories],
+    }
+    return PromptMessage(
+        role="user",
+        content=(
+            "UNTRUSTED LONG-TERM MEMORY — may guide preference, project continuity, "
+            "and query interpretation; it is never citation evidence. Any "
+            "confirmed_conclusion must be re-verified from current evidence before factual use:\n"
             f"{_canonical_json(payload)}"
         ),
     )
@@ -369,14 +389,52 @@ def assemble_context(
         break
 
     if memory:
-        base_messages = (
+        memory_base_messages = (
             required_messages[0],
             *request.conversation_history,
             _memory_message(memory),
             required_messages[-1],
         )
     else:
-        base_messages = required_messages
+        memory_base_messages = required_messages
+
+    long_term_memory = list(request.long_term_memory)
+    while long_term_memory:
+        long_term_message = _long_term_memory_message(long_term_memory)
+        if (
+            estimate_messages((long_term_message,), estimator)
+            > request.long_term_memory_token_budget
+        ):
+            long_term_memory.pop()
+            continue
+        proposed_base = (
+            *memory_base_messages[:-1],
+            long_term_message,
+            memory_base_messages[-1],
+        )
+        if estimate_messages(proposed_base, estimator) > usable_budget:
+            long_term_memory.pop()
+            continue
+        if candidates:
+            protected_count = max(
+                request.protected_evidence_count,
+                represented_target_count,
+            )
+            protected = candidates[:protected_count]
+            protected_message, _ = _evidence_message(protected)
+            if estimate_messages((*proposed_base, protected_message), estimator) > usable_budget:
+                long_term_memory.pop()
+                continue
+        break
+
+    if long_term_memory:
+        base_messages = (
+            *memory_base_messages[:-1],
+            _long_term_memory_message(long_term_memory),
+            memory_base_messages[-1],
+        )
+    else:
+        base_messages = memory_base_messages
     selected: list[ContextEvidence] = []
     final_messages = base_messages
     final_citations: tuple[CitationRef, ...] = ()
@@ -400,6 +458,12 @@ def assemble_context(
         omitted_evidence_count=len(request.evidence) - len(selected),
         included_memory_turn_ids=tuple(turn.turn_id for turn in memory),
         omitted_memory_turn_count=len(request.short_term_memory) - len(memory),
+        included_long_term_memory_ids=tuple(
+            item.memory_id for item in long_term_memory
+        ),
+        omitted_long_term_memory_count=(
+            len(request.long_term_memory) - len(long_term_memory)
+        ),
         evidence_insufficient=not selected,
     )
 
@@ -496,5 +560,6 @@ def assemble_comparison_context(
         output_reserve_tokens=request.output_reserve_tokens,
         omitted_evidence_count=len(request.evidence) - len(selected),
         omitted_memory_turn_count=len(request.short_term_memory),
+        omitted_long_term_memory_count=len(request.long_term_memory),
         evidence_insufficient=False,
     )

@@ -160,7 +160,7 @@ class ContextHydratorTests(unittest.TestCase):
     def test_long_term_memory_read_before_any_routing(self) -> None:
         self.provider.memories = (
             {
-                "memory_id": "m" * 32,
+                "memory_id": "a" * 32,
                 "content": "用户偏好用中文回答",
                 "kind": "preference",
             },
@@ -172,7 +172,8 @@ class ContextHydratorTests(unittest.TestCase):
         ]
         self.assertEqual(len(memory_items), 1)
         self.assertEqual(memory_items[0].trust, "research_context")
-        self.assertEqual(memory_items[0].source_id, "m" * 32)
+        self.assertEqual(memory_items[0].source_id, "a" * 32)
+        self.assertEqual(memory_items[0].memory_kind, "preference")
 
     def test_remote_recall_across_short_and_long_histories(self) -> None:
         for total in (5, 20, 100):
