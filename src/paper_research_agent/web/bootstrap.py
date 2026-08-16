@@ -19,6 +19,7 @@ from paper_research_agent.agent.factory import (
 )
 from paper_research_agent.agent.observability import SQLiteAgentEventLogger
 from paper_research_agent.agent.orchestrator.children import ChildGraphDispatcher
+from paper_research_agent.agent.orchestrator.memory import ToolkitLongTermMemoryProvider
 from paper_research_agent.agent.orchestrator.runtime import MainAgentRuntime
 from paper_research_agent.conversation.store import ConversationStore, SQLiteConversationStore
 from paper_research_agent.web.chat_runtime import ConversationRuntime
@@ -238,6 +239,12 @@ async def create_application_services(
                 runtime=cast(Any, chat), attachments=attachments
             )
             research_agent = getattr(rag, "research_agent", None)
+            memory_provider = (
+                ToolkitLongTermMemoryProvider(research_agent)
+                if research_agent is not None
+                and bool(getattr(research_agent, "extended_tools_enabled", False))
+                else None
+            )
 
             async def clear_main_state(conversation_id: str) -> None:
                 threads = await asyncio.to_thread(
@@ -267,6 +274,7 @@ async def create_application_services(
                 checkpointer=checkpoint.checkpointer,
                 clear=clear_main_state,
                 event_sink=event_sink,
+                memory_provider=memory_provider,
             )
             own(main)
         return ApplicationServices(

@@ -349,6 +349,7 @@ def create_main_agent_runtime_from_model(
     close: Any = None,
     clear: Any = None,
     event_sink: AgentEventSink | None = None,
+    memory_provider: Any = None,
 ) -> Any:
     """Assemble all model-backed main-Agent stages from one shared client."""
     from paper_research_agent.agent.orchestrator.factory import (
@@ -364,4 +365,5 @@ def create_main_agent_runtime_from_model(
         close=close,
         clear=clear,
         event_sink=event_sink,
+        memory_provider=memory_provider,
     )

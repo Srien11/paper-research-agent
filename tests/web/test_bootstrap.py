@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from fastapi.testclient import TestClient
 
 from paper_research_agent.agent.observability import SQLiteAgentEventLogger
+from paper_research_agent.agent.orchestrator.memory import ToolkitLongTermMemoryProvider
 from paper_research_agent.conversation.store import SQLiteConversationStore
 from paper_research_agent.web.app import create_app
 from paper_research_agent.web.bootstrap import (
@@ -25,6 +26,20 @@ class _ClosableRuntime:
 
     async def aclose(self) -> None:
         self.close_count += 1
+
+
+class _ResearchRuntime:
+    extended_tools_enabled = True
+
+    def __init__(self) -> None:
+        self.cleared: list[str] = []
+
+    async def clear(self, thread_id: str) -> None:
+        self.cleared.append(thread_id)
+
+    async def execute_tool(self, tool_name, arguments, *, run_id=None):
+        del tool_name, arguments, run_id
+        raise AssertionError("bootstrap must not search memory while building")
 
 
 class _Checkpoint:
@@ -99,6 +114,7 @@ class ApplicationBootstrapTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsInstance(
                 build_main.call_args.kwargs["event_sink"], SQLiteAgentEventLogger
             )
+            self.assertIsNone(build_main.call_args.kwargs["memory_provider"])
             started = services.conversation_store.begin_agent_run(
                 request_id="request-checkpoint",
                 conversation_id="conversation-a",
@@ -117,6 +133,48 @@ class ApplicationBootstrapTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(chat.close_count, 1)
             self.assertEqual(checkpoint.close_count, 1)
             model.root_async_client.close.assert_awaited_once()
+
+    async def test_primary_mode_injects_long_term_memory_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            chat = _ClosableRuntime()
+            rag = _ClosableRuntime()
+            rag.research_agent = _ResearchRuntime()
+            main = _ClosableRuntime()
+            checkpoint = _Checkpoint()
+            model = Mock()
+            model.root_async_client = Mock(close=AsyncMock())
+            with (
+                patch(
+                    "paper_research_agent.web.bootstrap._create_chat_runtime",
+                    return_value=chat,
+                ),
+                patch(
+                    "paper_research_agent.web.bootstrap._create_rag_runtime",
+                    new=AsyncMock(return_value=rag),
+                ),
+                patch(
+                    "paper_research_agent.web.bootstrap._create_main_model",
+                    return_value=model,
+                ),
+                patch(
+                    "paper_research_agent.web.bootstrap._open_main_checkpoint",
+                    new=AsyncMock(return_value=checkpoint),
+                ),
+                patch(
+                    "paper_research_agent.web.bootstrap.create_main_agent_runtime_from_model",
+                    return_value=main,
+                ) as build_main,
+            ):
+                services = await create_application_services(
+                    _environment(root, mode="primary")
+                )
+
+            self.assertIsInstance(
+                build_main.call_args.kwargs["memory_provider"],
+                ToolkitLongTermMemoryProvider,
+            )
+            await services.aclose()
 
     async def test_legacy_mode_does_not_construct_main_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

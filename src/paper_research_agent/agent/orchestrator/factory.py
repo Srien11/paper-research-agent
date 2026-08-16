@@ -16,7 +16,10 @@ from paper_research_agent.agent.orchestrator.graph import (
     MainAgentApprovalResumer,
     build_main_agent_graph,
 )
-from paper_research_agent.agent.orchestrator.hydrator import ContextHydrator
+from paper_research_agent.agent.orchestrator.hydrator import (
+    ContextHydrator,
+    LongTermMemoryProvider,
+)
 from paper_research_agent.agent.orchestrator.interpreter import TurnInterpreter
 from paper_research_agent.agent.orchestrator.models import MainAgentResult
 from paper_research_agent.agent.orchestrator.planner import GoalReconciler, TaskPlanner
@@ -90,11 +93,12 @@ def build_main_agent_runtime_from_model(
     close: Closer | None = None,
     clear: ConversationClearer | None = None,
     event_sink: AgentEventSink | None = None,
+    memory_provider: LongTermMemoryProvider | None = None,
 ) -> MainAgentRuntime:
     """Build production stages while sharing one lifecycle-managed model client."""
     return build_main_agent_runtime(
         store=store,
-        hydrator=ContextHydrator(store),
+        hydrator=ContextHydrator(store, memory_provider=memory_provider),
         interpreter=TurnInterpreter(model),
         goal_reconciler=GoalReconciler(model),
         task_planner=TaskPlanner(model),
