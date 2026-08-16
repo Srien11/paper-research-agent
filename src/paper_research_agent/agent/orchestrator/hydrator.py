@@ -77,14 +77,16 @@ class ContextHydrator:
         workspace: ConversationWorkspace,
         *,
         turn_id: str,
+        run_id: str | None = None,
     ) -> AgentContextEnvelope:
+        event_run_id = run_id or turn_id
         hydration_started = time.perf_counter()
         recent_started = time.perf_counter()
         recent_turns = await asyncio.to_thread(
             self.store.recent, request.conversation_id, limit=self.recent_turns
         )
         self._emit_hydration_event(
-            run_id=turn_id,
+            run_id=event_run_id,
             name="main_hydrate_recent",
             started=recent_started,
             requested_count=self.recent_turns,
@@ -95,7 +97,7 @@ class ContextHydrator:
             self.store.history, request.conversation_id, limit=self.history_limit
         )
         self._emit_hydration_event(
-            run_id=turn_id,
+            run_id=event_run_id,
             name="main_hydrate_history",
             started=history_started,
             requested_count=self.history_limit,
@@ -112,7 +114,7 @@ class ContextHydrator:
         memory_started = time.perf_counter()
         memories, memory_degraded = await self._recall_memories(recall_query)
         self._emit_hydration_event(
-            run_id=turn_id,
+            run_id=event_run_id,
             name="main_hydrate_memory",
             started=memory_started,
             requested_count=self.recalled_memories,
@@ -141,7 +143,7 @@ class ContextHydrator:
         )
         context_char_count = len(envelope.model_dump_json())
         self._emit_hydration_event(
-            run_id=turn_id,
+            run_id=event_run_id,
             name="main_hydrate_context",
             started=hydration_started,
             recent_message_count=len(recent_messages),

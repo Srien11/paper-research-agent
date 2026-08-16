@@ -161,7 +161,10 @@ def build_main_agent_graph(
         request = MainAgentRequest.model_validate(state["request"])
         workspace = ConversationWorkspace.model_validate(state["workspace_draft"])
         envelope = await hydrator.hydrate(
-            request, workspace, turn_id=str(state["turn_id"])
+            request,
+            workspace,
+            turn_id=str(state["turn_id"]),
+            run_id=str(state["run_id"]),
         )
         return {"context": envelope}
 

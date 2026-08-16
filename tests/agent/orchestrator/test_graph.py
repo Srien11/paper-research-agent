@@ -127,8 +127,14 @@ class FakeHydrator:
         self.recalled_context = recalled_context
 
     async def hydrate(
-        self, request: MainAgentRequest, workspace: ConversationWorkspace, *, turn_id: str
+        self,
+        request: MainAgentRequest,
+        workspace: ConversationWorkspace,
+        *,
+        turn_id: str,
+        run_id: str | None = None,
     ) -> AgentContextEnvelope:
+        del run_id
         return AgentContextEnvelope(
             conversation_id=request.conversation_id,
             request_id=request.request_id,
