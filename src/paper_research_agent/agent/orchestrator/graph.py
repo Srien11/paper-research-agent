@@ -35,6 +35,7 @@ from paper_research_agent.agent.orchestrator.models import (
     MainAgentRequest,
     MainAgentResult,
     MainAgentResumeRequest,
+    RecalledContext,
     TurnInterpretationV2,
 )
 from paper_research_agent.agent.orchestrator.planner import GoalReconciler, TaskPlanner
@@ -903,6 +904,12 @@ def _child_request(state: MainAgentGraphState) -> ChildTaskRequest:
     request = MainAgentRequest.model_validate(state["request"])
     workspace = ConversationWorkspace.model_validate(state["workspace_draft"])
     envelope = AgentContextEnvelope.model_validate(state["context"])
+    raw_interpretation = state.get("interpretation")
+    interpretation = (
+        TurnInterpretationV2.model_validate(raw_interpretation)
+        if raw_interpretation is not None
+        else None
+    )
     task = _task_by_id(workspace, str(state["active_task_id"]))
     goal_constraints = (
         workspace.active_goal.constraints if workspace.active_goal is not None else ()
@@ -926,9 +933,21 @@ def _child_request(state: MainAgentGraphState) -> ChildTaskRequest:
         if hasattr(task, "constraints")
         else goal_constraints,
         recent_messages=envelope.recent_messages,
-        selected_context=envelope.recalled_context,
+        selected_context=_selected_recalled_context(envelope, interpretation),
         rag_mode=request.rag_mode,
         attachment_ids=request.attachment_ids,
+    )
+
+
+def _selected_recalled_context(
+    envelope: AgentContextEnvelope,
+    interpretation: TurnInterpretationV2 | None,
+) -> tuple[RecalledContext, ...]:
+    if interpretation is None:
+        return ()
+    selected = set(interpretation.selected_context_ids)
+    return tuple(
+        item for item in envelope.recalled_context if item.source_id in selected
     )
 
 

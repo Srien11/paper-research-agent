@@ -17,6 +17,7 @@ from paper_research_agent.agent.orchestrator.models import (
     GoalDecision,
     GoalState,
     MainAgentRequest,
+    RecalledContext,
     TaskPlan,
     TaskPlanDecision,
     TurnInterpretationV2,
@@ -122,6 +123,9 @@ def _goal_decision(goal: GoalState | None = None) -> GoalDecision:
 
 
 class FakeHydrator:
+    def __init__(self, recalled_context: tuple[RecalledContext, ...] = ()) -> None:
+        self.recalled_context = recalled_context
+
     async def hydrate(
         self, request: MainAgentRequest, workspace: ConversationWorkspace, *, turn_id: str
     ) -> AgentContextEnvelope:
@@ -134,7 +138,7 @@ class FakeHydrator:
             attachment_ids=request.attachment_ids,
             workspace=workspace,
             recent_messages=(),
-            recalled_context=(),
+            recalled_context=self.recalled_context,
             prepared_at=_utc(),
         )
 
@@ -211,6 +215,7 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
         max_child_calls: int = 3,
         on_dispatch: Callable[[int], None] | None = None,
         dispatch_delay_seconds: float = 0,
+        recalled_context: tuple[RecalledContext, ...] = (),
     ) -> tuple[object, InMemoryConversationStore, FakeDispatcher, FakePlanner]:
         resolved_store = store or InMemoryConversationStore()
         planner = FakePlanner(*plan_decisions)
@@ -221,7 +226,7 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
         )
         graph = build_main_agent_graph(
             repository=resolved_store,
-            hydrator=FakeHydrator(),
+            hydrator=FakeHydrator(recalled_context),
             interpreter=FakeInterpreter(
                 interpretation or _interpretation()
             ),
@@ -262,6 +267,56 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(dispatcher.calls), 1)
         self.assertEqual(dispatcher.calls[0].capability, "direct_chat")
         self.assertEqual(store.load_agent_run("request-1").status, "completed")
+
+    async def test_child_receives_only_interpreter_selected_context(self) -> None:
+        selected_id = "m" * 32
+        recalled = (
+            RecalledContext(
+                source_id=selected_id,
+                kind="long_term_memory",
+                content="用户偏好中文回答",
+                relevance=0.9,
+                trust="research_context",
+            ),
+            RecalledContext(
+                source_id="n" * 32,
+                kind="long_term_memory",
+                content="无关记忆",
+                relevance=0.2,
+                trust="research_context",
+            ),
+        )
+        graph, _store, dispatcher, _planner = self._build(
+            interpretation=_interpretation(selected_context_ids=(selected_id,)),
+            recalled_context=recalled,
+            plan_decisions=(
+                _plan_decision((_task(task_id="chat", capability="direct_chat"),)),
+            ),
+            dispatch_results=(
+                _result(
+                    capability="direct_chat",
+                    task_id="chat",
+                    summary="完成",
+                    citation_kind="none",
+                    artifact=ChatArtifact(text="完成"),
+                ),
+            ),
+        )
+
+        await self._run(
+            graph,
+            MainAgentRequest(
+                request_id="request-selected-context",
+                conversation_id="conversation-1",
+                message="继续",
+                rag_mode="preferred",
+            ),
+        )
+
+        self.assertEqual(
+            tuple(item.source_id for item in dispatcher.calls[0].selected_context),
+            (selected_id,),
+        )
 
     async def test_attachment_qa_flow_uses_attachment_dispatch(self) -> None:
         plan = _plan_decision((_task(task_id="attachment", capability="attachment_qa"),))
