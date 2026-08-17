@@ -216,6 +216,7 @@ def build_dynamic_tool_graph(
                 "kind": "tool_approval_v1",
                 "tool_name": pending.tool_name,
                 "purpose": pending.purpose,
+                "arguments": pending.arguments,
                 "arguments_sha256": pending.arguments_sha256,
                 "expires_at_epoch": pending.expires_at_epoch,
             }
@@ -235,7 +236,12 @@ def build_dynamic_tool_graph(
                 summary={"reason": "user_denied"},
             )
             update = _record_result(state, tool_decision, denied)
-            update.update(_finished("Sensitive tool request was denied.", "approval_denied"))
+            update.update(
+                _finished(
+                    _existing_summary(state, "Sensitive tool request was denied."),
+                    "approval_denied",
+                )
+            )
             return update
         if pending.expires_at_epoch <= time.time():
             update = _record_result(
@@ -248,7 +254,12 @@ def build_dynamic_tool_graph(
                     summary={"reason": "approval_expired"},
                 ),
             )
-            update.update(_finished("Sensitive tool approval expired.", "approval_expired"))
+            update.update(
+                _finished(
+                    _existing_summary(state, "Sensitive tool approval expired."),
+                    "approval_expired",
+                )
+            )
             return update
         try:
             approval_token = toolkit.approve(pending.approval_request_id)
@@ -263,7 +274,12 @@ def build_dynamic_tool_graph(
                     summary={"reason": "approval_expired"},
                 ),
             )
-            update.update(_finished("Sensitive tool approval expired.", "approval_expired"))
+            update.update(
+                _finished(
+                    _existing_summary(state, "Sensitive tool approval expired."),
+                    "approval_expired",
+                )
+            )
             return update
         approved_arguments = {**pending.arguments, "approval_token": approval_token}
         result = await toolkit.execute(
@@ -389,6 +405,11 @@ def _finished(summary: str, reason: str) -> DynamicToolState:
         "pending_approval": None,
         "next_action": "finalize",
     }
+
+
+def _existing_summary(state: DynamicToolState, fallback: str) -> str:
+    summary = state.get("final_summary")
+    return summary if isinstance(summary, str) and summary.strip() else fallback
 
 
 def _has_explicit_write_intent(question: str, tool_name: str) -> bool:

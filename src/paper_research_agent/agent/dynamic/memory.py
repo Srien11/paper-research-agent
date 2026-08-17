@@ -129,6 +129,20 @@ class LangChainMemoryProposer:
             raise ValueError("memory proposal targets an unrecalled memory")
         if not set(proposal.source_chunk_ids).issubset(allowed_source_ids):
             raise ValueError("memory proposal cites unavailable evidence")
+        if proposal.action == "update":
+            recalled = next(
+                (
+                    item
+                    for item in memories
+                    if item.get("memory_id") == proposal.memory_id
+                ),
+                None,
+            )
+            if (
+                proposal.kind == "confirmed_conclusion"
+                or (recalled is not None and recalled.get("kind") == "confirmed_conclusion")
+            ) and not proposal.source_chunk_ids:
+                raise ValueError("confirmed conclusion update requires citation evidence")
         return proposal
 
 
