@@ -54,6 +54,7 @@ class AgentRunRequest(WebModel):
 
 class AgentApprovalRequest(WebModel):
     approved: bool
+    after_event_id: int = Field(default=0, ge=0)
 
 
 class AgentRunControlRequest(WebModel):
@@ -149,6 +150,10 @@ class ConversationMessageResponse(WebModel):
     text: str = Field(min_length=1, max_length=20_000)
     status: str = Field(min_length=1, max_length=64)
     created_at: str = Field(min_length=1, max_length=64)
+    turn_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+    request_id: str | None = Field(default=None, max_length=256)
+    run_id: str | None = Field(default=None, max_length=256)
+    events: tuple[dict[str, object], ...] = Field(default=(), max_length=10_000)
 
 
 class ConversationArchiveItemResponse(WebModel):

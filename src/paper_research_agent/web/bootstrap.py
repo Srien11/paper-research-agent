@@ -6,7 +6,9 @@ import asyncio
 import os
 import warnings
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 
@@ -17,9 +19,11 @@ from paper_research_agent.agent.factory import (
     create_main_agent_model,
     create_main_agent_runtime_from_model,
 )
-from paper_research_agent.agent.observability import SQLiteAgentEventLogger
+from paper_research_agent.agent.observability import AgentEvent, SQLiteAgentEventLogger
 from paper_research_agent.agent.orchestrator.children import ChildGraphDispatcher
+from paper_research_agent.agent.orchestrator.identifiers import dynamic_thread_id
 from paper_research_agent.agent.orchestrator.memory import ToolkitLongTermMemoryProvider
+from paper_research_agent.agent.orchestrator.models import ChildTaskRequest
 from paper_research_agent.agent.orchestrator.runtime import MainAgentRuntime
 from paper_research_agent.conversation.store import ConversationStore, SQLiteConversationStore
 from paper_research_agent.web.chat_runtime import ConversationRuntime
@@ -27,7 +31,14 @@ from paper_research_agent.web.child_executors import (
     ConversationChildExecutor,
     RAGRuntimeChildExecutor,
 )
+from paper_research_agent.web.events import (
+    AgentStreamEventDraft,
+    AgentStreamEventType,
+    RunNodeStatus,
+    SafeRunEventDetail,
+)
 from paper_research_agent.web.files import AttachmentStore
+from paper_research_agent.web.run_event_bus import RunEventBus, RunEventPublisher
 
 MainAgentMode = Literal["legacy", "primary"]
 
@@ -40,6 +51,10 @@ class DynamicResearchRuntimeLike(Protocol):
     async def run_dynamic_tools(self, question: str, *, thread_id: str) -> object: ...
 
     async def resume_dynamic_tools(self, *, thread_id: str, approved: bool) -> object: ...
+
+    def capture_agent_events(
+        self, observer: Callable[[AgentEvent], None]
+    ) -> AbstractContextManager[None]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +117,7 @@ class ApplicationServices:
     rag_runtime: ClosableRuntime | None
     chat_runtime: ClosableRuntime
     attachment_store: AttachmentStore
+    run_event_bus: RunEventBus
     main_agent_runtime: MainAgentRuntime | None
     mode: MainAgentMode
     _closers: tuple[Callable[[], Awaitable[None]], ...] = field(
@@ -150,8 +166,14 @@ class _MainCheckpoint:
 
 
 class _DynamicChildAdapter:
-    def __init__(self, runtime: DynamicResearchRuntimeLike) -> None:
+    def __init__(
+        self,
+        runtime: DynamicResearchRuntimeLike,
+        *,
+        run_event_publisher: RunEventPublisher | None = None,
+    ) -> None:
         self._runtime = runtime
+        self._run_event_publisher = run_event_publisher
 
     async def run(
         self,
@@ -167,6 +189,142 @@ class _DynamicChildAdapter:
     async def resume(self, *, thread_id: str, approved: bool) -> object:
         return await self._runtime.resume_dynamic_tools(
             thread_id=thread_id, approved=approved
+        )
+
+    async def run_task(self, request: ChildTaskRequest) -> object:
+        return await self._run_with_product_events(
+            request,
+            self._runtime.run_dynamic_tools(
+                request.objective or request.current_message,
+                thread_id=dynamic_thread_id(
+                    request.conversation_id, request.run_id, request.task_id
+                ),
+            ),
+        )
+
+    async def resume_task(
+        self, request: ChildTaskRequest, *, approved: bool
+    ) -> object:
+        return await self._run_with_product_events(
+            request,
+            self._runtime.resume_dynamic_tools(
+                thread_id=dynamic_thread_id(
+                    request.conversation_id, request.run_id, request.task_id
+                ),
+                approved=approved,
+            ),
+        )
+
+    async def _run_with_product_events(
+        self, request: ChildTaskRequest, operation: Awaitable[object]
+    ) -> object:
+        publisher = self._run_event_publisher
+        if publisher is None:
+            return await operation
+        queue: asyncio.Queue[AgentEvent | None] = asyncio.Queue()
+        forwarder = asyncio.create_task(
+            _forward_dynamic_tool_events(queue, publisher, request)
+        )
+        try:
+            with self._runtime.capture_agent_events(queue.put_nowait):
+                return await operation
+        finally:
+            queue.put_nowait(None)
+            await forwarder
+
+
+async def _forward_dynamic_tool_events(
+    queue: asyncio.Queue[AgentEvent | None],
+    publisher: RunEventPublisher,
+    request: ChildTaskRequest,
+) -> None:
+    sequence = 0
+    active: dict[str, tuple[str, int]] = {}
+    while True:
+        event = await queue.get()
+        if event is None:
+            return
+        if event.component != "tool" or event.event_type not in {
+            "tool_started",
+            "tool_completed",
+            "tool_failed",
+            "runtime_intercepted",
+        }:
+            continue
+        node_id: str
+        call_sequence: int
+        event_type: AgentStreamEventType
+        status: RunNodeStatus
+        if event.event_type == "tool_started":
+            sequence += 1
+            call_sequence = sequence
+            node_id = f"tool:{request.task_id}:{event.name}:{call_sequence}"
+            active[event.name] = (node_id, call_sequence)
+            event_type = "tool_started"
+            status = "running"
+            title = f"调用工具 {event.name}"
+            summary = "工具正在执行"
+        else:
+            current = active.pop(event.name, None)
+            if current is None:
+                sequence += 1
+                current = (
+                    f"tool:{request.task_id}:{event.name}:{sequence}",
+                    sequence,
+                )
+            node_id, call_sequence = current
+            if event.event_type == "tool_completed":
+                event_type = "tool_completed"
+                status = "completed"
+                title = f"工具 {event.name} 已完成"
+                summary = (
+                    f"返回 {event.returned_count} 项结果"
+                    if event.returned_count is not None
+                    else "工具执行完成"
+                )
+            elif (
+                event.event_type == "runtime_intercepted"
+                and event.reason_code == "approval_required"
+            ):
+                event_type = "tool_completed"
+                status = "waiting_approval"
+                title = f"工具 {event.name} 等待审批"
+                summary = "敏感工具已暂停，等待批准或拒绝"
+            else:
+                event_type = "tool_failed"
+                status = "failed"
+                title = f"工具 {event.name} 未完成"
+                summary = "工具执行失败或被策略拦截"
+        await publisher.publish(
+            AgentStreamEventDraft(
+                type=event_type,
+                occurred_at=datetime.now(UTC),
+                request_id=request.request_id,
+                run_id=request.run_id,
+                turn_id=request.turn_id,
+                node_id=node_id,
+                parent_node_id=f"task:{request.task_id}",
+                task_id=request.task_id,
+                status=status,
+                title=title,
+                summary=summary,
+                duration_ms=(
+                    max(0, round(event.duration_ms))
+                    if event.duration_ms is not None
+                    else None
+                ),
+                detail=SafeRunEventDetail(
+                    tool_name=event.name,
+                    returned_count=event.returned_count,
+                    reason_code=event.reason_code,
+                    delivery_mode="event_only",
+                ),
+            ),
+            idempotency_key=(
+                f"task:{request.task_id}:attempt:{request.attempt_count}:"
+                f"tool:{call_sequence}:{event_type}:"
+                f"{int(event.occurred_at.timestamp() * 1_000_000)}"
+            ),
         )
 
 
@@ -205,6 +363,7 @@ async def create_application_services(
         raise RuntimeError("main agent credentials are unavailable")
     store = conversation_store or SQLiteConversationStore(environment.conversation_path)
     attachments = attachment_store or AttachmentStore(environment.attachment_path)
+    run_events = RunEventBus(store)
     closers: list[Callable[[], Awaitable[None]]] = []
     owned_ids: set[int] = set()
 
@@ -218,6 +377,7 @@ async def create_application_services(
         closers.append(cast(Callable[[], Awaitable[None]], resolved))
 
     try:
+        own(run_events)
         chat = _create_chat_runtime(environment, store)
         own(chat)
         rag = await _create_rag_runtime(environment)
@@ -236,7 +396,9 @@ async def create_application_services(
                 environment.main_checkpoint_path.with_name("agent-events-v1.sqlite3")
             )
             conversation_executor = ConversationChildExecutor(
-                runtime=cast(Any, chat), attachments=attachments
+                runtime=cast(Any, chat),
+                attachments=attachments,
+                run_event_publisher=run_events.publisher,
             )
             research_agent = getattr(rag, "research_agent", None)
             memory_provider = (
@@ -257,9 +419,21 @@ async def create_application_services(
 
             dispatcher = ChildGraphDispatcher(
                 direct_chat=conversation_executor,
-                local_rag=(RAGRuntimeChildExecutor(cast(Any, rag)) if rag else None),
+                local_rag=(
+                    RAGRuntimeChildExecutor(
+                        cast(Any, rag), run_event_publisher=run_events.publisher
+                    )
+                    if rag
+                    else None
+                ),
                 dynamic_tools=(
-                    cast(Any, _DynamicChildAdapter(research_agent))
+                    cast(
+                        Any,
+                        _DynamicChildAdapter(
+                            research_agent,
+                            run_event_publisher=run_events.publisher,
+                        ),
+                    )
                     if research_agent is not None
                     else None
                 ),
@@ -275,6 +449,7 @@ async def create_application_services(
                 clear=clear_main_state,
                 event_sink=event_sink,
                 memory_provider=memory_provider,
+                run_event_publisher=run_events.publisher,
             )
             own(main)
         return ApplicationServices(
@@ -282,6 +457,7 @@ async def create_application_services(
             rag_runtime=rag,
             chat_runtime=chat,
             attachment_store=attachments,
+            run_event_bus=run_events,
             main_agent_runtime=main,
             mode=environment.mode,
             _closers=tuple(closers),

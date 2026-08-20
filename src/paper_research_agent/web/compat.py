@@ -15,7 +15,7 @@ from paper_research_agent.agent.observability import (
     emit_agent_event,
 )
 from paper_research_agent.agent.orchestrator.models import MainAgentRequest, MainAgentResult
-from paper_research_agent.web.events import AgentEventProjector, AgentStreamEvent
+from paper_research_agent.web.events import AgentEventProjector, LegacyAgentStreamEvent
 from paper_research_agent.web.models import (
     QuestionRequest,
     SafePendingToolApproval,
@@ -78,7 +78,9 @@ class CompatibilityAdapter:
             attachment_ids=payload.attachment_ids,
         )
 
-    def stream_events(self, result: MainAgentResult) -> tuple[AgentStreamEvent, ...]:
+    def stream_events(
+        self, result: MainAgentResult
+    ) -> tuple[LegacyAgentStreamEvent, ...]:
         projector = AgentEventProjector(
             request_id=result.request_id,
             run_id=result.run_id,

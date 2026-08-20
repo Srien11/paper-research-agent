@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import sqlite3
 import threading
-from contextlib import closing
+from collections.abc import Callable, Iterator
+from contextlib import closing, contextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, Protocol
@@ -139,6 +141,31 @@ class AgentEvent(BaseModel):
 
 class AgentEventSink(Protocol):
     def write(self, event: AgentEvent) -> bool: ...
+
+
+class AgentEventTap:
+    """Mirror safe telemetry to one task-local observer without changing storage."""
+
+    def __init__(self, sink: AgentEventSink) -> None:
+        self._sink = sink
+        self._observer: ContextVar[Callable[[AgentEvent], None] | None] = ContextVar(
+            f"agent_event_observer_{id(self)}", default=None
+        )
+
+    def write(self, event: AgentEvent) -> bool:
+        stored = self._sink.write(event)
+        observer = self._observer.get()
+        if observer is not None:
+            observer(event)
+        return stored
+
+    @contextmanager
+    def capture(self, observer: Callable[[AgentEvent], None]) -> Iterator[None]:
+        token = self._observer.set(observer)
+        try:
+            yield
+        finally:
+            self._observer.reset(token)
 
 
 def safe_fingerprint(value: str) -> str:

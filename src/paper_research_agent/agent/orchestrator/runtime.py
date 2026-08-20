@@ -8,7 +8,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
-from typing import Any, cast
+from typing import Any, Protocol, cast
 
 from paper_research_agent.agent.observability import (
     AgentEvent,
@@ -27,6 +27,7 @@ from paper_research_agent.agent.orchestrator.control import (
 )
 from paper_research_agent.agent.orchestrator.identifiers import main_checkpoint_thread_id
 from paper_research_agent.agent.orchestrator.models import (
+    AgentRunStart,
     ChildTaskResult,
     ConversationWorkspace,
     MainAgentRequest,
@@ -35,10 +36,26 @@ from paper_research_agent.agent.orchestrator.models import (
     RunStatus,
 )
 from paper_research_agent.conversation.store import ConversationStore
+from paper_research_agent.web.events import (
+    AgentStreamEvent,
+    AgentStreamEventDraft,
+    AgentStreamEventType,
+    RunNodeStatus,
+    SafeRunEventDetail,
+)
 
 ApprovalResumer = Callable[[str, bool], Awaitable[MainAgentResult]]
 Closer = Callable[[], Awaitable[None]]
 ConversationClearer = Callable[[str], Awaitable[None]]
+
+
+class RunEventPublisherLike(Protocol):
+    async def publish(
+        self,
+        event: AgentStreamEventDraft,
+        *,
+        idempotency_key: str | None = None,
+    ) -> AgentStreamEvent: ...
 _MAIN_CAPABILITIES = frozenset(
     {"direct_chat", "local_rag", "dynamic_tools", "attachment_qa", "file_edit"}
 )
@@ -64,6 +81,7 @@ class MainAgentRuntime:
         close: Closer | None = None,
         clear: ConversationClearer | None = None,
         event_sink: AgentEventSink | None = None,
+        run_event_publisher: RunEventPublisherLike | None = None,
     ) -> None:
         if timeout_seconds <= 0 or timeout_seconds > 3600:
             raise ValueError("main agent timeout must be between 0 and 3600 seconds")
@@ -74,6 +92,7 @@ class MainAgentRuntime:
         self._close = close
         self._clear = clear
         self._event_sink = event_sink
+        self._run_event_publisher = run_event_publisher
         self._locks: dict[str, asyncio.Lock] = {}
         self._inflight: dict[str, asyncio.Task[MainAgentResult]] = {}
         self._inflight_conversations: dict[str, str] = {}
@@ -94,6 +113,10 @@ class MainAgentRuntime:
     @property
     def event_sink(self) -> AgentEventSink | None:
         return self._event_sink
+
+    @property
+    def run_event_publisher(self) -> RunEventPublisherLike | None:
+        return self._run_event_publisher
 
     async def run(self, request: MainAgentRequest) -> MainAgentResult:
         async with self._guard:
@@ -144,6 +167,7 @@ class MainAgentRuntime:
                         timeout_seconds=self._timeout_seconds,
                     )
                 )
+            await self._publish_run_start(request, start)
             try:
                 async with asyncio.timeout(self._timeout_seconds):
                     state = await self._graph.ainvoke(
@@ -181,12 +205,28 @@ class MainAgentRuntime:
                             timeout_seconds=self._timeout_seconds,
                         )
                     )
+                await self._publish_run_boundary(
+                    request,
+                    start,
+                    event_type="run_failed",
+                    status="failed",
+                    summary="运行超过总时限",
+                    reason_code="runtime_timeout",
+                )
                 raise TimeoutError("main agent run exceeded its total deadline") from None
             except asyncio.CancelledError:
                 await asyncio.to_thread(
                     self._repository.fail_agent_run,
                     run_id=start.run_id,
                     turn_id=start.turn_id,
+                    reason_code="runtime_cancelled",
+                )
+                await self._publish_run_boundary(
+                    request,
+                    start,
+                    event_type="run_cancelled",
+                    status="cancelled",
+                    summary="运行已取消",
                     reason_code="runtime_cancelled",
                 )
                 raise
@@ -207,8 +247,17 @@ class MainAgentRuntime:
                             reason_code="runtime_error",
                         )
                     )
+                await self._publish_run_boundary(
+                    request,
+                    start,
+                    event_type="run_failed",
+                    status="failed",
+                    summary="运行未能完成",
+                    reason_code="runtime_error",
+                )
                 raise
             result = _result_from_state(state, request)
+            await self._publish_result(request, start, result)
             if should_emit:
                 self._emit_result_events(
                     result=result,
@@ -217,6 +266,258 @@ class MainAgentRuntime:
                     started_at=started_at,
                 )
             return result
+
+    async def _publish_run_start(
+        self, request: MainAgentRequest, start: AgentRunStart
+    ) -> None:
+        if self._run_event_publisher is None:
+            return
+        existing = await asyncio.to_thread(
+            self._repository.run_events, request.request_id, limit=10_000
+        )
+        if start.outcome == "created":
+            await self._publish_product_event(
+                request,
+                start,
+                event_type="run_started",
+                status="running",
+                title="开始运行",
+                summary="正在准备对话上下文",
+                idempotency_key="lifecycle:start",
+            )
+        elif start.outcome == "resuming":
+            await self._publish_product_event(
+                request,
+                start,
+                event_type="run_resumed",
+                status="running",
+                title="继续运行",
+                summary="从已保存的计划继续",
+                idempotency_key=f"lifecycle:resume:{len(existing) + 1}",
+            )
+        elif not existing and start.outcome != "running_reused":
+            await self._publish_product_event(
+                request,
+                start,
+                event_type="run_reused",
+                status="running",
+                title="恢复已有运行",
+                summary="正在恢复已有结果",
+                idempotency_key="lifecycle:reused",
+            )
+
+    async def _publish_result(
+        self,
+        request: MainAgentRequest,
+        start: AgentRunStart,
+        result: MainAgentResult,
+    ) -> None:
+        if self._run_event_publisher is None:
+            return
+        existing = await asyncio.to_thread(
+            self._repository.run_events, request.request_id, limit=10_000
+        )
+        if any(item.to_stream_event().is_terminal for item in existing):
+            return
+        event_types = {item.event_type for item in existing}
+        if result.status == "completed" and "reasoning_completed" not in event_types:
+            await self._publish_product_event(
+                request,
+                start,
+                event_type="reasoning_completed",
+                status="completed",
+                title="研究过程完成",
+                summary="已完成计划内的研究与回答整理",
+                idempotency_key="reasoning:completed",
+                node_id="reasoning:main",
+            )
+        if result.status == "completed" and result.answer and "answer_delta" not in event_types:
+            await self._publish_product_event(
+                request,
+                start,
+                event_type="answer_started",
+                status="running",
+                title="整理回答",
+                detail=SafeRunEventDetail(delivery_mode="validated_replay"),
+                idempotency_key="answer:start",
+                node_id="answer:main",
+            )
+            for index, chunk in enumerate(_answer_chunks(result.answer)):
+                await self._publish_product_event(
+                    request,
+                    start,
+                    event_type="answer_delta",
+                    status="running",
+                    detail=SafeRunEventDetail(delivery_mode="validated_replay"),
+                    delta=chunk,
+                    idempotency_key=f"answer:delta:{index}",
+                    node_id="answer:main",
+                )
+            await self._publish_product_event(
+                request,
+                start,
+                event_type="answer_completed",
+                status="completed",
+                title="回答完成",
+                detail=SafeRunEventDetail(delivery_mode="validated_replay"),
+                idempotency_key="answer:completed",
+                node_id="answer:main",
+            )
+
+        if result.status == "waiting_approval":
+            tool_name = None
+            purpose = None
+            arguments_sha256 = None
+            expires_at_epoch = None
+            if result.pending_approval is not None:
+                candidate = result.pending_approval.get("tool_name")
+                tool_name = candidate if isinstance(candidate, str) else None
+                candidate = result.pending_approval.get("purpose")
+                purpose = candidate if isinstance(candidate, str) else None
+                candidate = result.pending_approval.get("arguments_sha256")
+                arguments_sha256 = candidate if isinstance(candidate, str) else None
+                candidate = result.pending_approval.get("expires_at_epoch")
+                expires_at_epoch = (
+                    float(candidate) if isinstance(candidate, (int, float)) else None
+                )
+            await self._publish_product_event(
+                request,
+                start,
+                event_type="interaction_required",
+                status="waiting_approval",
+                title="需要工具审批",
+                summary="敏感工具已暂停，等待批准或拒绝",
+                detail=SafeRunEventDetail(
+                    tool_name=tool_name,
+                    purpose=purpose,
+                    arguments_sha256=arguments_sha256,
+                    expires_at_epoch=expires_at_epoch,
+                ),
+                idempotency_key="interaction:approval",
+                node_id="interaction:approval",
+            )
+            await self._publish_run_boundary(
+                request,
+                start,
+                event_type="run_waiting_approval",
+                status="waiting_approval",
+                summary="等待工具审批",
+            )
+        elif result.status == "waiting_user":
+            await self._publish_product_event(
+                request,
+                start,
+                event_type="interaction_required",
+                status="waiting_user",
+                title="需要补充信息",
+                summary="请补充必要信息后继续",
+                idempotency_key="interaction:user",
+                node_id="interaction:user",
+            )
+            await self._publish_run_boundary(
+                request,
+                start,
+                event_type="run_waiting_user",
+                status="waiting_user",
+                summary="等待用户补充信息",
+            )
+        elif result.status == "paused":
+            await self._publish_run_boundary(
+                request,
+                start,
+                event_type="run_paused",
+                status="paused",
+                summary="运行已暂停，进度已保存",
+            )
+        elif result.status == "completed":
+            await self._publish_run_boundary(
+                request,
+                start,
+                event_type="run_completed",
+                status="completed",
+                summary="运行完成",
+            )
+        elif result.status == "cancelled":
+            await self._publish_run_boundary(
+                request,
+                start,
+                event_type="run_cancelled",
+                status="cancelled",
+                summary="运行已取消",
+            )
+        elif result.status == "conflict":
+            await self._publish_run_boundary(
+                request,
+                start,
+                event_type="run_conflict",
+                status="conflict",
+                summary="工作区版本发生冲突",
+                reason_code="workspace_conflict",
+            )
+        else:
+            await self._publish_run_boundary(
+                request,
+                start,
+                event_type="run_failed",
+                status="failed",
+                summary="运行未能完成",
+                reason_code="run_failed",
+            )
+
+    async def _publish_run_boundary(
+        self,
+        request: MainAgentRequest,
+        start: AgentRunStart,
+        *,
+        event_type: AgentStreamEventType,
+        status: RunNodeStatus,
+        summary: str,
+        reason_code: str | None = None,
+    ) -> None:
+        await self._publish_product_event(
+            request,
+            start,
+            event_type=event_type,
+            status=status,
+            title=summary,
+            summary=summary,
+            detail=SafeRunEventDetail(reason_code=reason_code),
+            idempotency_key=f"boundary:{event_type}",
+        )
+
+    async def _publish_product_event(
+        self,
+        request: MainAgentRequest,
+        start: AgentRunStart,
+        *,
+        event_type: AgentStreamEventType,
+        status: RunNodeStatus | None = None,
+        title: str | None = None,
+        summary: str | None = None,
+        detail: SafeRunEventDetail | None = None,
+        delta: str | None = None,
+        idempotency_key: str | None = None,
+        node_id: str | None = None,
+    ) -> None:
+        publisher = self._run_event_publisher
+        if publisher is None:
+            return
+        await publisher.publish(
+            AgentStreamEventDraft(
+                type=event_type,
+                occurred_at=datetime.now(UTC),
+                request_id=request.request_id,
+                run_id=start.run_id,
+                turn_id=start.turn_id,
+                node_id=node_id or f"run:{start.run_id}",
+                status=status,
+                title=title,
+                summary=summary,
+                detail=detail or SafeRunEventDetail(delivery_mode="event_only"),
+                delta=delta,
+            ),
+            idempotency_key=idempotency_key,
+        )
 
     async def load_control(self, request_id: str) -> AgentRunControl | None:
         """Read the durable control state for polling and optimistic commands."""
@@ -323,7 +624,43 @@ class MainAgentRuntime:
             raise RuntimeError("approval resume is unavailable")
         request = MainAgentResumeRequest(request_id=request_id, approved=approved)
         started_at = time.perf_counter()
+        original = await asyncio.to_thread(
+            self._repository.load_agent_request, request.request_id
+        )
+        run_start = None
+        if self._run_event_publisher is not None and original is not None:
+            run_start = await asyncio.to_thread(
+                self._repository.begin_agent_run,
+                request_id=original.request_id,
+                conversation_id=original.conversation_id,
+                user_question=original.message,
+                request=original,
+            )
+            existing = await asyncio.to_thread(
+                self._repository.run_events, original.request_id, limit=10_000
+            )
+            await self._publish_product_event(
+                original,
+                run_start,
+                event_type="interaction_resolved",
+                status="completed",
+                title="审批已处理",
+                summary="已批准工具调用" if approved else "已拒绝工具调用",
+                idempotency_key=f"interaction:approval:resolved:{len(existing) + 1}",
+                node_id="interaction:approval",
+            )
+            await self._publish_product_event(
+                original,
+                run_start,
+                event_type="run_resumed",
+                status="running",
+                title="继续运行",
+                summary="审批处理后继续",
+                idempotency_key=f"lifecycle:approval-resume:{len(existing) + 2}",
+            )
         result = await resumer(request.request_id, request.approved)
+        if original is not None and run_start is not None:
+            await self._publish_result(original, run_start, result)
         event_type: AgentEventType = (
             "main_run_paused"
             if result.status == "waiting_approval"
@@ -577,6 +914,12 @@ def _result_from_state(
 
 def _elapsed_ms(started_at: float) -> float:
     return max(0.0, (time.perf_counter() - started_at) * 1000)
+
+
+def _answer_chunks(text: str, *, chunk_size: int = 192) -> tuple[str, ...]:
+    """Coalesce output into durable chunks instead of per-token transactions."""
+
+    return tuple(text[index : index + chunk_size] for index in range(0, len(text), chunk_size))
 
 
 def _consume_background_result(task: asyncio.Task[MainAgentResult]) -> None:

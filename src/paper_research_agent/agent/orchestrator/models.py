@@ -330,10 +330,13 @@ class TaskPlanDecision(FrozenModel):
 
 class ChildTaskRequest(FrozenModel):
     run_id: str
+    request_id: str = Field(min_length=1, max_length=256)
     conversation_id: str
+    turn_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     goal_id: str
     goal_objective: str = Field(default="", max_length=2000)
     task_id: str
+    attempt_count: int = Field(default=0, ge=0, le=5)
     objective: str = Field(min_length=1, max_length=1000)
     success_criteria: tuple[str, ...] = Field(min_length=1, max_length=8)
     capability: Capability

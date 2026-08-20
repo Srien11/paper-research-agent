@@ -17,6 +17,7 @@ from paper_research_agent.agent.orchestrator.models import (
 )
 from paper_research_agent.agent.orchestrator.runtime import MainAgentRuntime
 from paper_research_agent.conversation.store import InMemoryConversationStore
+from paper_research_agent.web.run_event_bus import RunEventBus
 
 
 def _request(
@@ -78,6 +79,50 @@ class _RecordingSink:
 
 
 class MainAgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_product_stream_starts_before_graph_completes_and_closes_once(self) -> None:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        class GatedGraph(_FakeGraph):
+            async def ainvoke(self, value: object, config: object = None) -> dict[str, object]:
+                entered.set()
+                await release.wait()
+                return await super().ainvoke(value, config)
+
+        store = InMemoryConversationStore()
+        bus = RunEventBus(store)
+        runtime = MainAgentRuntime(
+            graph=GatedGraph(),
+            repository=store,
+            run_event_publisher=bus.publisher,
+        )
+        request = _request(
+            conversation_id="conversation-product-stream",
+            request_id="req_product_stream_1234",
+        )
+        subscription = await bus.subscribe(request.request_id)
+        task = asyncio.create_task(runtime.run(request))
+
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        first = await asyncio.wait_for(anext(subscription), timeout=1)
+
+        self.assertEqual(first.type, "run_started")
+        self.assertFalse(task.done())
+        release.set()
+        result = await asyncio.wait_for(task, timeout=1)
+        remaining = [event async for event in subscription]
+        event_types = [first.type, *(item.type for item in remaining)]
+        self.assertEqual(result.status, "completed")
+        self.assertIn("reasoning_completed", event_types)
+        self.assertIn("answer_delta", event_types)
+        self.assertLess(
+            event_types.index("reasoning_completed"),
+            event_types.index("run_completed"),
+        )
+        self.assertEqual(event_types[-1], "run_completed")
+        self.assertEqual(event_types.count("run_completed"), 1)
+        await bus.aclose()
+
     async def test_load_workspace_for_run_prefers_live_checkpoint_draft(self) -> None:
         now = datetime.now(UTC)
         goal_id = "a" * 32

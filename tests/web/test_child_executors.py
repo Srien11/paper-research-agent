@@ -8,8 +8,10 @@ from paper_research_agent.agent.orchestrator.models import (
     ChildTaskRequest,
     ContextMessage,
 )
+from paper_research_agent.conversation.store import InMemoryConversationStore
 from paper_research_agent.web.child_executors import ConversationChildExecutor
 from paper_research_agent.web.files import AttachmentStore
+from paper_research_agent.web.run_event_bus import RunEventBus
 
 
 async def _chunks(*values: bytes):
@@ -20,7 +22,9 @@ async def _chunks(*values: bytes):
 def _request(**overrides: object) -> ChildTaskRequest:
     values: dict[str, object] = {
         "run_id": "run-1",
+        "request_id": "req_child_12345678901",
         "conversation_id": "conversation-1",
+        "turn_id": "b" * 32,
         "goal_id": "a" * 32,
         "goal_objective": "比较 RAG 与 GraphRAG",
         "task_id": "task-1",
@@ -52,7 +56,8 @@ class _FakeConversationRuntime:
 
     async def stream_contextual_chat(self, request):
         self.direct_request = request
-        yield {"type": "delta", "text": "上下文回答"}
+        yield {"type": "delta", "text": "上下文"}
+        yield {"type": "delta", "text": "回答"}
         yield {
             "type": "done",
             "metrics": {
@@ -80,6 +85,39 @@ class _FakeConversationRuntime:
 
 
 class ConversationChildExecutorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_provider_deltas_are_persisted_before_child_returns(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = InMemoryConversationStore()
+            started = store.begin_agent_run(
+                request_id="req_child_12345678901",
+                conversation_id="conversation-1",
+                user_question="继续",
+            )
+            bus = RunEventBus(store)
+            executor = ConversationChildExecutor(
+                runtime=_FakeConversationRuntime(),
+                attachments=AttachmentStore(Path(directory)),
+                run_event_publisher=bus.publisher,
+            )
+
+            artifact = await executor.answer(
+                _request(run_id=started.run_id, turn_id=started.turn_id)
+            )
+            events = [item.to_stream_event() for item in store.run_events(started.request_id)]
+
+            self.assertEqual(artifact.text, "上下文回答")
+            self.assertEqual(
+                [item.type for item in events],
+                ["answer_started", "answer_delta", "answer_delta", "answer_completed"],
+            )
+            self.assertTrue(
+                all(
+                    item.detail.delivery_mode == "provider_live"
+                    for item in events
+                )
+            )
+            await bus.aclose()
+
     async def test_direct_chat_uses_explicit_orchestrator_context(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             runtime = _FakeConversationRuntime()
@@ -102,6 +140,13 @@ class ConversationChildExecutorTests(unittest.IsolatedAsyncioTestCase):
     async def test_attachment_and_file_paths_use_session_scoped_store(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = AttachmentStore(Path(directory))
+            conversation_store = InMemoryConversationStore()
+            started = conversation_store.begin_agent_run(
+                request_id="req_child_12345678901",
+                conversation_id="conversation-1",
+                user_question="继续",
+            )
+            bus = RunEventBus(conversation_store)
             source = await store.save(
                 session_id="conversation-1",
                 filename="notes.md",
@@ -109,12 +154,18 @@ class ConversationChildExecutorTests(unittest.IsolatedAsyncioTestCase):
                 chunks=_chunks("旧内容".encode()),
             )
             runtime = _FakeConversationRuntime()
-            executor = ConversationChildExecutor(runtime=runtime, attachments=store)
+            executor = ConversationChildExecutor(
+                runtime=runtime,
+                attachments=store,
+                run_event_publisher=bus.publisher,
+            )
 
             attachment = await executor.answer_attachment(
                 _request(
                     capability="attachment_qa",
                     attachment_ids=(source.attachment_id,),
+                    run_id=started.run_id,
+                    turn_id=started.turn_id,
                 )
             )
             edited = await executor.edit(
@@ -122,6 +173,8 @@ class ConversationChildExecutorTests(unittest.IsolatedAsyncioTestCase):
                     capability="file_edit",
                     task_id="edit-notes",
                     attachment_ids=(source.attachment_id,),
+                    run_id=started.run_id,
+                    turn_id=started.turn_id,
                 )
             )
 
@@ -133,6 +186,18 @@ class ConversationChildExecutorTests(unittest.IsolatedAsyncioTestCase):
                 store.extract("conversation-1", edited.output_attachment_ids)[0],
             )
             self.assertNotEqual(source.attachment_id, edited.output_attachment_ids[0])
+            file_events = [
+                item.to_stream_event()
+                for item in conversation_store.run_events(started.request_id)
+                if item.event_type == "file_created"
+            ]
+            self.assertEqual(len(file_events), 1)
+            self.assertEqual(
+                file_events[0].detail.output_attachment_id,
+                edited.output_attachment_ids[0],
+            )
+            self.assertNotIn("修改后的内容", file_events[0].model_dump_json())
+            await bus.aclose()
 
 
 if __name__ == "__main__":

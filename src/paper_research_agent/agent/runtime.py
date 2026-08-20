@@ -6,7 +6,8 @@ import asyncio
 import json
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
@@ -26,6 +27,7 @@ from paper_research_agent.agent.models import (
 from paper_research_agent.agent.observability import (
     AgentEvent,
     AgentEventSink,
+    AgentEventTap,
     emit_agent_event,
     safe_fingerprint,
 )
@@ -146,6 +148,18 @@ class ResearchAgentRuntime:
     @property
     def dynamic_tools_enabled(self) -> bool:
         return self._dynamic_tools is not None
+
+    @contextmanager
+    def capture_agent_events(
+        self, observer: Callable[[AgentEvent], None]
+    ) -> Iterator[None]:
+        """Expose only the already privacy-safe telemetry emitted in this task."""
+        sink = self._event_sink
+        if not isinstance(sink, AgentEventTap):
+            yield
+            return
+        with sink.capture(observer):
+            yield
 
     async def run_dynamic_tools(
         self,

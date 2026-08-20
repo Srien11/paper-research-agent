@@ -11,6 +11,7 @@ from pydantic import ValidationError
 
 from paper_research_agent.agent.observability import (
     AgentEvent,
+    AgentEventTap,
     SQLiteAgentEventLogger,
     emit_agent_event,
     safe_fingerprint,
@@ -36,6 +37,31 @@ def _event(**overrides: object) -> AgentEvent:
 
 
 class AgentEventTests(unittest.TestCase):
+    def test_event_tap_forwards_only_inside_the_current_capture_scope(self) -> None:
+        class MemorySink:
+            def __init__(self) -> None:
+                self.events: list[AgentEvent] = []
+
+            def write(self, event: AgentEvent) -> bool:
+                self.events.append(event)
+                return True
+
+        sink = MemorySink()
+        tap = AgentEventTap(sink)
+        captured: list[AgentEvent] = []
+
+        tap.write(_event(name="outside_before"))
+        with tap.capture(captured.append):
+            tap.write(_event(name="inside"))
+        tap.write(_event(name="outside_after"))
+
+        self.assertEqual([item.name for item in sink.events], [
+            "outside_before",
+            "inside",
+            "outside_after",
+        ])
+        self.assertEqual([item.name for item in captured], ["inside"])
+
     def test_tool_event_name_accepts_full_registered_name_boundary(self) -> None:
         self.assertEqual(_event(name="t" * 128).name, "t" * 128)
         with self.assertRaises(ValidationError):

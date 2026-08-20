@@ -1,23 +1,112 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import unittest
+from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi.testclient import TestClient
 
-from paper_research_agent.agent.observability import SQLiteAgentEventLogger
+from paper_research_agent.agent.dynamic.models import DynamicResearchResult
+from paper_research_agent.agent.observability import AgentEvent, SQLiteAgentEventLogger
 from paper_research_agent.agent.orchestrator.memory import ToolkitLongTermMemoryProvider
+from paper_research_agent.agent.orchestrator.models import ChildTaskRequest
 from paper_research_agent.conversation.store import SQLiteConversationStore
 from paper_research_agent.web.app import create_app
 from paper_research_agent.web.bootstrap import (
     ApplicationEnvironment,
+    _DynamicChildAdapter,
     create_application_services,
     main_agent_mode_from_environment,
 )
 from paper_research_agent.web.config import OwnerCredentials, WebConfig
 from paper_research_agent.web.files import AttachmentStore
+
+
+class _CapturingPublisher:
+    def __init__(self) -> None:
+        self.events = []
+
+    async def publish(self, event, *, idempotency_key: str):
+        del idempotency_key
+        self.events.append(event)
+        return event
+
+
+class _StreamingDynamicRuntime:
+    extended_tools_enabled = True
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self._observer = None
+
+    @contextmanager
+    def capture_agent_events(self, observer):
+        self._observer = observer
+        try:
+            yield
+        finally:
+            self._observer = None
+
+    async def run_dynamic_tools(self, question: str, *, thread_id: str):
+        del question
+        assert self._observer is not None
+        self._observer(
+            AgentEvent(
+                run_id="d" * 32,
+                occurred_at=datetime.now(UTC),
+                event_type="tool_started",
+                status="started",
+                component="tool",
+                name="search_corpus",
+            )
+        )
+        self.started.set()
+        await self.release.wait()
+        self._observer(
+            AgentEvent(
+                run_id="d" * 32,
+                occurred_at=datetime.now(UTC),
+                event_type="tool_completed",
+                status="succeeded",
+                component="tool",
+                name="search_corpus",
+                duration_ms=18.4,
+                returned_count=2,
+            )
+        )
+        return DynamicResearchResult(
+            run_id="d" * 32,
+            thread_id=thread_id,
+            status="completed",
+            final_summary="公开汇总",
+            termination_reason="router_finished",
+        )
+
+    async def resume_dynamic_tools(self, *, thread_id: str, approved: bool):
+        del thread_id, approved
+        raise AssertionError("resume is not expected")
+
+
+def _dynamic_request() -> ChildTaskRequest:
+    return ChildTaskRequest(
+        run_id="run-product-1",
+        request_id="req_dynamic_product_1234",
+        conversation_id="conversation-product",
+        turn_id="b" * 32,
+        goal_id="a" * 32,
+        goal_objective="检索论文",
+        task_id="task-dynamic",
+        objective="查找相关工作",
+        success_criteria=("找到来源",),
+        capability="dynamic_tools",
+        current_message="查找相关工作",
+        rag_mode="preferred",
+    )
 
 
 class _ClosableRuntime:
@@ -70,6 +159,39 @@ def _environment(root: Path, *, mode: str, api_key: str = "test-key") -> Applica
 
 
 class ApplicationBootstrapTests(unittest.IsolatedAsyncioTestCase):
+    async def test_dynamic_tool_events_arrive_before_child_completion(self) -> None:
+        runtime = _StreamingDynamicRuntime()
+        publisher = _CapturingPublisher()
+        adapter = _DynamicChildAdapter(
+            runtime,  # type: ignore[arg-type]
+            run_event_publisher=publisher,  # type: ignore[arg-type]
+        )
+
+        task = asyncio.create_task(adapter.run_task(_dynamic_request()))
+        await asyncio.wait_for(runtime.started.wait(), timeout=1)
+        for _ in range(10):
+            if publisher.events:
+                break
+            await asyncio.sleep(0)
+
+        self.assertFalse(task.done())
+        self.assertEqual([item.type for item in publisher.events], ["tool_started"])
+        runtime.release.set()
+        await asyncio.wait_for(task, timeout=1)
+
+        self.assertEqual(
+            [item.type for item in publisher.events],
+            ["tool_started", "tool_completed"],
+        )
+        self.assertEqual(publisher.events[0].node_id, publisher.events[1].node_id)
+        self.assertEqual(publisher.events[1].detail.returned_count, 2)
+        serialized = "\n".join(item.model_dump_json() for item in publisher.events)
+        self.assertNotIn(
+            "arguments",
+            publisher.events[1].detail.model_dump(exclude_none=True),
+        )
+        self.assertNotIn("查找相关工作", serialized)
+
     async def test_primary_mode_builds_main_runtime_with_shared_store(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -107,6 +229,7 @@ class ApplicationBootstrapTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertIs(services.main_agent_runtime, main)
             self.assertIs(services.conversation_store, services.main_agent_repository)
+            self.assertIsNotNone(services.run_event_bus.publisher)
             self.assertIs(
                 build_main.call_args.kwargs["store"], services.conversation_store
             )

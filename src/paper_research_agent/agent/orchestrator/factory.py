@@ -28,6 +28,7 @@ from paper_research_agent.agent.orchestrator.runtime import (
     Closer,
     ConversationClearer,
     MainAgentRuntime,
+    RunEventPublisherLike,
 )
 from paper_research_agent.agent.orchestrator.synthesizer import AnswerSynthesizer
 from paper_research_agent.conversation.store import ConversationStore
@@ -50,6 +51,7 @@ def build_main_agent_runtime(
     close: Closer | None = None,
     clear: ConversationClearer | None = None,
     event_sink: AgentEventSink | None = None,
+    run_event_publisher: RunEventPublisherLike | None = None,
 ) -> MainAgentRuntime:
     """Assemble one closable main Agent runtime with a strict Pydantic graph."""
     resolved_synthesizer = synthesizer or AnswerSynthesizer()
@@ -64,6 +66,7 @@ def build_main_agent_runtime(
         max_child_calls=max_child_calls,
         max_replans=max_replans,
         checkpointer=checkpointer,
+        run_event_publisher=run_event_publisher,
     )
     resolved_resumer = approval_resumer or MainAgentApprovalResumer(
         repository=store,
@@ -78,6 +81,7 @@ def build_main_agent_runtime(
         close=close,
         clear=clear,
         event_sink=event_sink,
+        run_event_publisher=run_event_publisher,
     )
 
 
@@ -94,6 +98,7 @@ def build_main_agent_runtime_from_model(
     clear: ConversationClearer | None = None,
     event_sink: AgentEventSink | None = None,
     memory_provider: LongTermMemoryProvider | None = None,
+    run_event_publisher: RunEventPublisherLike | None = None,
 ) -> MainAgentRuntime:
     """Build production stages while sharing one lifecycle-managed model client."""
     return build_main_agent_runtime(
@@ -115,6 +120,7 @@ def build_main_agent_runtime_from_model(
         close=close,
         clear=clear,
         event_sink=event_sink,
+        run_event_publisher=run_event_publisher,
     )
 
 

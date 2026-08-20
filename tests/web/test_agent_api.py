@@ -22,10 +22,12 @@ from paper_research_agent.agent.orchestrator.models import (
     MainAgentResult,
     TaskPlan,
 )
+from paper_research_agent.agent.orchestrator.runtime import MainAgentRuntime
 from paper_research_agent.conversation.models import ConversationResolution
 from paper_research_agent.conversation.store import InMemoryConversationStore
 from paper_research_agent.web.app import create_app
 from paper_research_agent.web.config import OwnerCredentials, WebConfig
+from paper_research_agent.web.run_event_bus import RunEventBus
 
 ORIGIN = "https://example.test"
 REQUEST_ID = "req_1234567890123456"
@@ -174,12 +176,82 @@ class _MainRuntime:
         return self.workspace
 
 
+class _ProductGraph:
+    async def ainvoke(self, value: dict[str, object], config: object = None) -> dict[str, object]:
+        del config
+        start = dict(value["run_start"])
+        return {
+            "run_id": start["run_id"],
+            "base_workspace_version": 0,
+            "final_answer": "实时回答",
+            "termination_reason": "completed",
+            "child_results": [],
+        }
+
+
 def _events(response: object) -> list[dict[str, object]]:
     text = str(response.text)
     return [json.loads(line) for line in text.splitlines() if line]
 
 
 class MainAgentApiTests(unittest.TestCase):
+    def test_product_runtime_uses_v2_durable_stream_and_resume_endpoint(self) -> None:
+        store = InMemoryConversationStore()
+        bus = RunEventBus(store)
+        runtime = MainAgentRuntime(
+            graph=_ProductGraph(),
+            repository=store,
+            run_event_publisher=bus.publisher,
+        )
+        config = WebConfig(
+            credentials=OwnerCredentials(username="owner", password="correct-password"),
+            session_secret=b"p" * 32,
+            allowed_origins=frozenset({ORIGIN}),
+        )
+        with TestClient(
+            create_app(
+                config=config,
+                runtime=self.legacy,  # type: ignore[arg-type]
+                serve_static=False,
+                conversation_store=store,
+                main_agent_runtime=runtime,
+                run_event_bus=bus,
+            ),
+            base_url=ORIGIN,
+        ) as client:
+            login = client.post(
+                "/paper-research/api/login",
+                headers={"Origin": ORIGIN},
+                json={"username": "owner", "password": "correct-password"},
+            )
+            response = client.post(
+                "/paper-research/api/agent/runs",
+                headers={"Origin": ORIGIN},
+                json={"request_id": "req_product_api_12345", "message": "hello"},
+            )
+            events = _events(response)
+
+            self.assertEqual(events[0]["schema_version"], "main-agent-stream-v2")
+            self.assertEqual(events[0]["type"], "run_started")
+            self.assertEqual(events[-1]["type"], "run_completed")
+            self.assertIn("answer_delta", [item["type"] for item in events])
+
+            replay = client.get(
+                "/paper-research/api/agent/runs/req_product_api_12345/events",
+                params={"after_event_id": events[-2]["event_id"]},
+            )
+            replayed = _events(replay)
+            self.assertEqual([item["type"] for item in replayed], ["run_completed"])
+
+            history = client.get(
+                f"/paper-research/api/conversations/{login.json()['conversation_id']}"
+            ).json()
+            assistant = next(
+                item for item in history["messages"] if item["role"] == "assistant"
+            )
+            self.assertEqual(assistant["request_id"], "req_product_api_12345")
+            self.assertEqual(assistant["events"][-1]["type"], "run_completed")
+
     def setUp(self) -> None:
         self.store = _RecordingStore()
         self.main = _MainRuntime(self.store)

@@ -23,6 +23,7 @@ from paper_research_agent.agent.orchestrator.models import (
     TurnInterpretationV2,
 )
 from paper_research_agent.conversation.store import InMemoryConversationStore
+from paper_research_agent.web.run_event_bus import RunEventBus
 
 
 def _utc() -> datetime:
@@ -222,6 +223,7 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
         on_dispatch: Callable[[int], None] | None = None,
         dispatch_delay_seconds: float = 0,
         recalled_context: tuple[RecalledContext, ...] = (),
+        run_event_publisher: object | None = None,
     ) -> tuple[object, InMemoryConversationStore, FakeDispatcher, FakePlanner]:
         resolved_store = store or InMemoryConversationStore()
         planner = FakePlanner(*plan_decisions)
@@ -240,6 +242,7 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
             task_planner=planner,
             dispatcher=dispatcher,
             max_child_calls=max_child_calls,
+            run_event_publisher=run_event_publisher,
         )
         return graph, resolved_store, dispatcher, planner
 
@@ -273,6 +276,55 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(dispatcher.calls), 1)
         self.assertEqual(dispatcher.calls[0].capability, "direct_chat")
         self.assertEqual(store.load_agent_run("request-1").status, "completed")
+
+    async def test_product_events_follow_graph_execution_order_without_private_text(self) -> None:
+        store = InMemoryConversationStore()
+        bus = RunEventBus(store)
+        graph, _, _dispatcher, _planner = self._build(
+            store=store,
+            plan_decisions=(
+                _plan_decision((_task(task_id="public-task", capability="direct_chat"),)),
+            ),
+            dispatch_results=(
+                _result(
+                    capability="direct_chat",
+                    task_id="public-task",
+                    summary="公开完成摘要",
+                    citation_kind="none",
+                    artifact=ChatArtifact(text="公开回答"),
+                ),
+            ),
+            run_event_publisher=bus.publisher,
+        )
+        request = MainAgentRequest(
+            request_id="request-product-order-1234",
+            conversation_id="conversation-product-order",
+            message="private raw question must not be projected",
+            rag_mode="preferred",
+        )
+
+        await self._run(graph, request)
+        events = [
+            item.to_stream_event()
+            for item in store.run_events(request.request_id)
+        ]
+        event_types = [item.type for item in events]
+
+        expected = [
+            "reasoning_started",
+            "reasoning_summary",
+            "reasoning_summary",
+            "goal_updated",
+            "plan_updated",
+            "task_started",
+            "task_completed",
+        ]
+        positions = [event_types.index(event_type) for event_type in expected]
+        self.assertEqual(positions, sorted(positions))
+        self.assertGreaterEqual(event_types.count("reasoning_summary"), 2)
+        serialized = "\n".join(item.model_dump_json() for item in events)
+        self.assertNotIn(request.message, serialized)
+        await bus.aclose()
 
     async def test_child_receives_only_interpreter_selected_context(self) -> None:
         selected_id = "m" * 32

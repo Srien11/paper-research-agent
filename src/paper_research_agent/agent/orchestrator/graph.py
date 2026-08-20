@@ -48,6 +48,12 @@ from paper_research_agent.agent.orchestrator.state import MainAgentGraphState
 from paper_research_agent.agent.orchestrator.synthesizer import AnswerSynthesizer
 from paper_research_agent.conversation.models import ConversationResolution, ConversationStatus
 from paper_research_agent.conversation.store import ConversationStore
+from paper_research_agent.web.events import (
+    AgentStreamEventDraft,
+    AgentStreamEventType,
+    RunNodeStatus,
+    SafeRunEventDetail,
+)
 
 
 def build_main_agent_graph(
@@ -62,6 +68,7 @@ def build_main_agent_graph(
     max_child_calls: int = MAX_CHILD_CALLS_PER_RUN,
     max_replans: int = MAX_REPLANS_PER_RUN,
     checkpointer: Any | None = None,
+    run_event_publisher: Any | None = None,
 ) -> CompiledStateGraph[Any, Any, Any, Any]:
     """Assemble the graph; only commit_turn and abort_turn write storage."""
     if max_child_calls <= 0 or max_child_calls > 12:
@@ -69,6 +76,43 @@ def build_main_agent_graph(
     if max_replans <= 0 or max_replans > 3:
         raise ValueError("max_replans must be between 1 and 3")
     answer_synthesizer = synthesizer or AnswerSynthesizer()
+
+    async def publish_product_event(
+        state: MainAgentGraphState,
+        event_type: AgentStreamEventType,
+        *,
+        node_id: str,
+        status: RunNodeStatus | None = None,
+        title: str | None = None,
+        summary: str | None = None,
+        detail: SafeRunEventDetail | None = None,
+        task_id: str | None = None,
+        idempotency_key: str,
+    ) -> None:
+        if run_event_publisher is None:
+            return
+        request = MainAgentRequest.model_validate(state["request"])
+        run_id = str(state.get("run_id", ""))
+        turn_id = str(state.get("turn_id", ""))
+        if not run_id or not turn_id:
+            return
+        await run_event_publisher.publish(
+            AgentStreamEventDraft(
+                type=event_type,
+                occurred_at=datetime.now(UTC),
+                request_id=request.request_id,
+                run_id=run_id,
+                turn_id=turn_id,
+                node_id=node_id,
+                parent_node_id=f"task:{task_id}" if task_id else None,
+                task_id=task_id,
+                status=status,
+                title=title,
+                summary=summary,
+                detail=detail or SafeRunEventDetail(delivery_mode="event_only"),
+            ),
+            idempotency_key=idempotency_key,
+        )
 
     async def initialize_turn(state: MainAgentGraphState) -> MainAgentGraphState:
         request = MainAgentRequest.model_validate(state["request"])
@@ -158,6 +202,15 @@ def build_main_agent_graph(
         }
 
     async def hydrate_context(state: MainAgentGraphState) -> MainAgentGraphState:
+        await publish_product_event(
+            state,
+            "reasoning_started",
+            node_id="reasoning:main",
+            status="running",
+            title="理解当前对话",
+            summary="正在准备对话上下文",
+            idempotency_key="reasoning:start",
+        )
         request = MainAgentRequest.model_validate(state["request"])
         workspace = ConversationWorkspace.model_validate(state["workspace_draft"])
         envelope = await hydrator.hydrate(
@@ -166,11 +219,34 @@ def build_main_agent_graph(
             turn_id=str(state["turn_id"]),
             run_id=str(state["run_id"]),
         )
+        await publish_product_event(
+            state,
+            "reasoning_summary",
+            node_id="reasoning:main",
+            status="running",
+            title="上下文已准备",
+            summary=f"已选择 {len(envelope.recalled_context)} 条相关记忆",
+            idempotency_key="reasoning:hydrate",
+        )
         return {"context": envelope}
 
     async def interpret_turn(state: MainAgentGraphState) -> MainAgentGraphState:
         envelope = AgentContextEnvelope.model_validate(state["context"])
         interpretation = await interpreter.interpret(envelope)
+        await publish_product_event(
+            state,
+            "reasoning_summary",
+            node_id="reasoning:main",
+            status="running",
+            title="已理解请求",
+            summary=(
+                f"请求类型：{interpretation.relation}；需要补充信息"
+                if interpretation.needs_clarification
+                else f"请求类型：{interpretation.relation}"
+            ),
+            detail=SafeRunEventDetail(route=interpretation.relation),
+            idempotency_key="reasoning:interpret",
+        )
         return {"interpretation": interpretation}
 
     async def reconcile_goal(state: MainAgentGraphState) -> MainAgentGraphState:
@@ -180,6 +256,16 @@ def build_main_agent_graph(
         workspace = reduce_workspace(
             ConversationWorkspace.model_validate(state["workspace_draft"]),
             goal_decision=decision,
+        )
+        await publish_product_event(
+            state,
+            "goal_updated",
+            node_id="goal:active",
+            status="completed",
+            title="目标已更新",
+            summary=f"目标动作：{decision.action}",
+            detail=SafeRunEventDetail(goal_action=decision.action),
+            idempotency_key="goal:update",
         )
         return {"workspace_draft": workspace, "goal_decision": decision}
 
@@ -191,6 +277,17 @@ def build_main_agent_graph(
         workspace = reduce_workspace(
             ConversationWorkspace.model_validate(state["workspace_draft"]),
             plan_decision=decision,
+        )
+        task_count = len(decision.plan.tasks) if decision.plan is not None else 0
+        await publish_product_event(
+            state,
+            "plan_updated",
+            node_id="plan:active",
+            status="completed",
+            title="研究计划已更新",
+            summary=f"计划动作：{decision.action}，共 {task_count} 个任务",
+            detail=SafeRunEventDetail(plan_action=decision.action),
+            idempotency_key=f"plan:update:{decision.plan.revision if decision.plan else 0}",
         )
         return {"workspace_draft": workspace, "plan_decision": decision}
 
@@ -263,6 +360,19 @@ def build_main_agent_graph(
                 "child_results": child_results,
                 "next_action": "select_next_task",
             }
+        await publish_product_event(
+            state,
+            "task_started",
+            node_id=f"task:{selected_task.task_id}",
+            status="running",
+            title=selected_task.title,
+            summary=selected_task.execution_reason,
+            detail=SafeRunEventDetail(capability=selected_task.capability),
+            task_id=selected_task.task_id,
+            idempotency_key=(
+                f"task:{selected_task.task_id}:attempt:{selected_task.attempt_count}:started"
+            ),
+        )
         return {"active_task_id": selection.task_id, "next_action": "route"}
 
     async def route_task(state: MainAgentGraphState) -> MainAgentGraphState:
@@ -348,6 +458,21 @@ def build_main_agent_graph(
             task_id=str(state["active_task_id"]),
             evaluation=evaluation,
             result=result,
+        )
+        active_task_id = str(state["active_task_id"])
+        completed = evaluation.outcome == "complete"
+        await publish_product_event(
+            state,
+            "task_completed" if completed else "task_failed",
+            node_id=f"task:{active_task_id}",
+            status="completed" if completed else "failed",
+            title="任务完成" if completed else "任务未完成",
+            summary=evaluation.reason,
+            task_id=active_task_id,
+            idempotency_key=(
+                f"task:{active_task_id}:evaluation:{evaluation.outcome}:"
+                f"{int(state.get('remaining_replans', max_replans))}"
+            ),
         )
         update: MainAgentGraphState = {"workspace_draft": workspace}
         if evaluation.outcome == "replan":
@@ -644,7 +769,9 @@ class MainAgentApprovalResumer:
             raise RuntimeError("approval request was already consumed or does not match")
         try:
             task, _pending = _validate_approval_claim(claim.workspace, claim.result)
-            child_request = _resume_child_request(claim.result, claim.workspace, task)
+            child_request = _resume_child_request(
+                claim.result, claim.workspace, task, claim.turn_id
+            )
             resumed = await self._dispatcher.resume_dynamic_tools(
                 child_request,
                 approved=request.approved,
@@ -795,16 +922,20 @@ def _resume_child_request(
     result: MainAgentResult,
     workspace: ConversationWorkspace,
     task: AgentTask,
+    turn_id: str,
 ) -> ChildTaskRequest:
     goal = workspace.active_goal
     if goal is None or goal.goal_id != task.goal_id:
         raise ValueError("waiting approval task has no matching active goal")
     return ChildTaskRequest(
         run_id=result.run_id,
+        request_id=result.request_id,
         conversation_id=result.conversation_id,
+        turn_id=turn_id,
         goal_id=task.goal_id,
         goal_objective=goal.objective,
         task_id=task.task_id,
+        attempt_count=task.attempt_count,
         objective=task.objective,
         success_criteria=task.success_criteria,
         capability="dynamic_tools",
@@ -919,7 +1050,9 @@ def _child_request(state: MainAgentGraphState) -> ChildTaskRequest:
     )
     return ChildTaskRequest(
         run_id=str(state.get("run_id", "")),
+        request_id=request.request_id,
         conversation_id=request.conversation_id,
+        turn_id=str(state.get("turn_id", "")),
         goal_id=task.goal_id,
         goal_objective=(
             workspace.active_goal.objective
@@ -927,6 +1060,7 @@ def _child_request(state: MainAgentGraphState) -> ChildTaskRequest:
             else ""
         ),
         task_id=task.task_id,
+        attempt_count=task.attempt_count,
         objective=task.objective,
         success_criteria=task.success_criteria,
         capability=_routed_capability(state),

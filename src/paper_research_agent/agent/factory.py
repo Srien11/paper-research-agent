@@ -19,6 +19,7 @@ from paper_research_agent.agent.models import StorageClass
 from paper_research_agent.agent.observability import (
     AgentEvent,
     AgentEventSink,
+    AgentEventTap,
     SQLiteAgentEventLogger,
     emit_agent_event,
 )
@@ -176,6 +177,7 @@ async def create_research_agent_runtime(
     resolved_event_sink = event_sink or SQLiteAgentEventLogger(
         event_log_path or checkpoint_path.with_name("agent-events-v1.sqlite3")
     )
+    tapped_event_sink = AgentEventTap(resolved_event_sink)
 
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     connection = await aiosqlite.connect(checkpoint_path)
@@ -225,7 +227,7 @@ async def create_research_agent_runtime(
                 papers=papers,
                 sections=sections,
                 elements=elements,
-                event_sink=resolved_event_sink,
+                event_sink=tapped_event_sink,
             )
             await _configure_mcp_toolkit(
                 toolkit=extended_handle.toolkit,
@@ -244,7 +246,7 @@ async def create_research_agent_runtime(
                 toolkit=extended_handle.toolkit,
                 max_steps=runtime_policy.max_dynamic_tool_steps,
                 checkpointer=checkpointer,
-                event_sink=resolved_event_sink,
+                event_sink=tapped_event_sink,
                 memory_proposer=LangChainMemoryProposer(model),
                 registry=extended_handle.toolkit.registry,
             )
@@ -259,7 +261,7 @@ async def create_research_agent_runtime(
             service=service,
             policy=runtime_policy,
             checkpointer=checkpointer,
-            event_sink=resolved_event_sink,
+            event_sink=tapped_event_sink,
             extended_toolkit=(extended_handle.toolkit if extended_handle else None),
         )
 
@@ -287,7 +289,7 @@ async def create_research_agent_runtime(
             policy=runtime_policy,
             close=close,
             clear=clear,
-            event_sink=resolved_event_sink,
+            event_sink=tapped_event_sink,
             extended_tools=(extended_handle.toolkit if extended_handle else None),
             dynamic_tools=dynamic_runtime,
         )
@@ -350,6 +352,7 @@ def create_main_agent_runtime_from_model(
     clear: Any = None,
     event_sink: AgentEventSink | None = None,
     memory_provider: Any = None,
+    run_event_publisher: Any = None,
 ) -> Any:
     """Assemble all model-backed main-Agent stages from one shared client."""
     from paper_research_agent.agent.orchestrator.factory import (
@@ -366,4 +369,5 @@ def create_main_agent_runtime_from_model(
         clear=clear,
         event_sink=event_sink,
         memory_provider=memory_provider,
+        run_event_publisher=run_event_publisher,
     )

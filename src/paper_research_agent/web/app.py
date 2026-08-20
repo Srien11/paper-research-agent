@@ -96,6 +96,7 @@ from paper_research_agent.web.routing import (
     RouteDecision,
     enforce_route_policy,
 )
+from paper_research_agent.web.run_event_bus import RunEventBus
 
 APP_PREFIX = "/paper-research"
 API_PREFIX = f"{APP_PREFIX}/api"
@@ -476,6 +477,13 @@ def _agent_stream_response(
     )
 
 
+def _consume_agent_execution(task: asyncio.Task[MainAgentResult]) -> None:
+    """Keep a disconnected browser from cancelling or leaking the runtime task."""
+
+    if not task.cancelled():
+        task.exception()
+
+
 def _safe_agent_status(result: MainAgentResult) -> AgentRunStatusResponse:
     pending = result.pending_approval
     safe_pending = (
@@ -596,6 +604,7 @@ def create_app(
     recommended_questions: tuple[RecommendedQuestion, ...] | None = None,
     conversation_store: ConversationStore | None = None,
     main_agent_runtime: MainAgentRuntime | None = None,
+    run_event_bus: RunEventBus | None = None,
     services_factory: ServicesFactory | None = None,
 ) -> FastAPI:
     """Create an isolated app; runtime injection keeps API tests free of local ML loading."""
@@ -607,6 +616,7 @@ def create_app(
     )
     owns_runtime = runtime is None
     owns_chat_runtime = chat_runtime is None
+    owns_run_event_bus = run_event_bus is None
     shared_store = conversation_store or SQLiteConversationStore(
         Path(__file__).resolve().parents[3] / "data/runtime/conversation-v1.sqlite3"
     )
@@ -620,7 +630,9 @@ def create_app(
         and runtime_factory is None
         and conversation_store is None
         and main_agent_runtime is None
+        and run_event_bus is None
     )
+    local_run_event_bus = None if use_services else (run_event_bus or RunEventBus(shared_store))
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -645,6 +657,7 @@ def create_app(
             )
             app.state.main_agent_mode = services.mode
             app.state.attachments = services.attachment_store
+            app.state.run_event_bus = services.run_event_bus
             conversation = ConversationCoordinator(services.conversation_store)
             app.state.conversation = conversation
             try:
@@ -683,6 +696,8 @@ def create_app(
                 await chat_runtime.aclose()
             if owns_runtime and active_runtime is not None:
                 await active_runtime.aclose()
+            if owns_run_event_bus and local_run_event_bus is not None:
+                await local_run_event_bus.aclose()
 
     app = FastAPI(
         title="Paper Research Agent",
@@ -705,6 +720,7 @@ def create_app(
     app.state.sessions = sessions
     app.state.attachments = shared_attachments
     app.state.conversation = conversation
+    app.state.run_event_bus = local_run_event_bus
 
     @app.middleware("http")
     async def private_response_headers(
@@ -828,6 +844,7 @@ def create_app(
     async def run_main_agent(
         request: Request,
         payload: AgentRunRequest,
+        after_event_id: int = Query(default=0, ge=0),
         _origin: None = Depends(require_origin),
         session: OwnerSession = Depends(current_session),  # noqa: B008
         main_runtime: MainAgentRuntime = Depends(active_main_agent),  # noqa: B008
@@ -852,16 +869,53 @@ def create_app(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="请求标识已被其他会话使用",
             )
-        try:
-            result = await main_runtime.run(
-                MainAgentRequest(
-                    request_id=payload.request_id,
-                    conversation_id=session.conversation_id,
-                    message=payload.message,
-                    rag_mode=payload.rag_mode,
-                    attachment_ids=payload.attachment_ids,
-                )
+        control = await asyncio.to_thread(
+            conversation.store.load_agent_control,
+            request_id=payload.request_id,
+        )
+        if control is not None and control.conversation_id != session.conversation_id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="请求标识已被其他会话使用",
             )
+        run_events = cast(RunEventBus | None, request.app.state.run_event_bus)
+        product_streaming = (
+            run_events is not None
+            and getattr(main_runtime, "run_event_publisher", None) is not None
+        )
+        main_request = MainAgentRequest(
+            request_id=payload.request_id,
+            conversation_id=session.conversation_id,
+            message=payload.message,
+            rag_mode=payload.rag_mode,
+            attachment_ids=payload.attachment_ids,
+        )
+        if product_streaming:
+            assert run_events is not None
+            subscription = await run_events.subscribe(
+                payload.request_id,
+                after_event_id=after_event_id,
+            )
+            execution = asyncio.create_task(
+                main_runtime.run(main_request),
+                name=f"web-main-agent::{payload.request_id}",
+            )
+            execution.add_done_callback(_consume_agent_execution)
+
+            async def live_events() -> AsyncIterator[bytes]:
+                try:
+                    async for event in subscription:
+                        yield event.to_ndjson()
+                finally:
+                    await subscription.aclose()
+
+            return StreamingResponse(
+                live_events(),
+                media_type="application/x-ndjson",
+                headers={"X-Accel-Buffering": "no"},
+            )
+        try:
+            result = await main_runtime.run(main_request)
         except HTTPException:
             raise
         except Exception as error:  # noqa: BLE001 - sanitize runtime boundary
@@ -890,8 +944,50 @@ def create_app(
             )
         return _safe_agent_status(result)
 
+    @app.get(f"{API_PREFIX}/agent/runs/{{request_id}}/events")
+    async def get_main_agent_events(
+        request: Request,
+        request_id: str,
+        after_event_id: int = Query(default=0, ge=0),
+        session: OwnerSession = Depends(current_session),  # noqa: B008
+    ) -> StreamingResponse:
+        normalized_id = _validated_request_id(request_id)
+        control = await asyncio.to_thread(
+            conversation.store.load_agent_control,
+            request_id=normalized_id,
+        )
+        if control is None or control.conversation_id != session.conversation_id:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="主 Agent 运行记录不存在",
+            )
+        run_events = cast(RunEventBus | None, request.app.state.run_event_bus)
+        if run_events is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="运行事件流暂不可用",
+            )
+        subscription = await run_events.subscribe(
+            normalized_id,
+            after_event_id=after_event_id,
+        )
+
+        async def replay_and_follow() -> AsyncIterator[bytes]:
+            try:
+                async for event in subscription:
+                    yield event.to_ndjson()
+            finally:
+                await subscription.aclose()
+
+        return StreamingResponse(
+            replay_and_follow(),
+            media_type="application/x-ndjson",
+            headers={"X-Accel-Buffering": "no"},
+        )
+
     @app.post(f"{API_PREFIX}/agent/runs/{{request_id}}/approval")
     async def resume_main_agent_approval(
+        request: Request,
         request_id: str,
         payload: AgentApprovalRequest,
         _origin: None = Depends(require_origin),
@@ -911,6 +1007,36 @@ def create_app(
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="审批请求已失效或已处理",
+            )
+        run_events = cast(RunEventBus | None, request.app.state.run_event_bus)
+        if (
+            run_events is not None
+            and getattr(main_runtime, "run_event_publisher", None) is not None
+        ):
+            subscription = await run_events.subscribe(
+                resume_request.request_id,
+                after_event_id=payload.after_event_id,
+            )
+            execution = asyncio.create_task(
+                main_runtime.resume_approval(
+                    request_id=resume_request.request_id,
+                    approved=resume_request.approved,
+                ),
+                name=f"web-main-agent-approval::{resume_request.request_id}",
+            )
+            execution.add_done_callback(_consume_agent_execution)
+
+            async def resumed_events() -> AsyncIterator[bytes]:
+                try:
+                    async for event in subscription:
+                        yield event.to_ndjson()
+                finally:
+                    await subscription.aclose()
+
+            return StreamingResponse(
+                resumed_events(),
+                media_type="application/x-ndjson",
+                headers={"X-Accel-Buffering": "no"},
             )
         try:
             result = await main_runtime.resume_approval(
@@ -1164,6 +1290,10 @@ def create_app(
                     text=message.text,
                     status=message.status,
                     created_at=message.created_at.isoformat(),
+                    turn_id=message.turn_id,
+                    request_id=message.request_id,
+                    run_id=message.run_id,
+                    events=message.events,
                 )
                 for message in selected
             ),

@@ -88,10 +88,14 @@ class ChildGraphDispatcher:
     ) -> ChildTaskResult:
         if request.capability != "dynamic_tools" or self.dynamic_tools is None:
             return _failed(request, "dynamic_tools_unavailable")
-        result = await self.dynamic_tools.resume(
-            thread_id=_dynamic_thread_id(request),
-            approved=approved,
-        )
+        resume_task = getattr(self.dynamic_tools, "resume_task", None)
+        if callable(resume_task):
+            result = await resume_task(request, approved=approved)
+        else:
+            result = await self.dynamic_tools.resume(
+                thread_id=_dynamic_thread_id(request),
+                approved=approved,
+            )
         return _dynamic_result(request, result)
 
     async def _dispatch_direct_chat(self, request: ChildTaskRequest) -> ChildTaskResult:
@@ -135,12 +139,16 @@ class ChildGraphDispatcher:
         if self.dynamic_tools is None:
             return _failed(request, "dynamic_tools_unavailable")
         question = request.objective or request.current_message
-        result = await self.dynamic_tools.run(
-            question,
-            thread_id=_dynamic_thread_id(request),
-            memory_context=_memory_context_from_request(request),
-            child_context=_child_context_from_request(request),
-        )
+        run_task = getattr(self.dynamic_tools, "run_task", None)
+        if callable(run_task):
+            result = await run_task(request)
+        else:
+            result = await self.dynamic_tools.run(
+                question,
+                thread_id=_dynamic_thread_id(request),
+                memory_context=_memory_context_from_request(request),
+                child_context=_child_context_from_request(request),
+            )
         return _dynamic_result(request, result)
 
     async def _dispatch_attachment(self, request: ChildTaskRequest) -> ChildTaskResult:

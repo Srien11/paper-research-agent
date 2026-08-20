@@ -31,7 +31,9 @@ from paper_research_agent.web.child_executors import RAGRuntimeChildExecutor
 def _request(**overrides: object) -> ChildTaskRequest:
     values: dict[str, object] = {
         "run_id": "run-1",
+        "request_id": "req_child_12345678901",
         "conversation_id": "conversation-1",
+        "turn_id": "b" * 32,
         "goal_id": "a" * 32,
         "task_id": "task-1",
         "objective": "比较 RAG 与 GraphRAG 的评测指标",
