@@ -70,8 +70,12 @@ Top 4 正文水化深度和最终覆盖完整性仍是主要瓶颈。完整聚�
 - `POST /paper-research/api/agent/runs`：提交带稳定 `request_id`、`message`、
   `rag_mode` 和附件 ID 的请求，返回统一 NDJSON 事件流。
 - `GET /paper-research/api/agent/runs/{request_id}`：断流后查询终态或等待状态。
+- `GET /paper-research/api/agent/runs/{request_id}/events?after_event_id=N`：从持久化游标
+  继续读取运行事件；刷新页面不会重新提交原问题或重复执行工具。
 - `POST /paper-research/api/agent/runs/{request_id}/approval`：批准或拒绝原写任务，
   只恢复暂停的 child，不重新解释、对齐目标或规划。
+- `POST /paper-research/api/agent/runs/{request_id}/control`：请求暂停、继续或取消运行；
+  浏览器只通过这一显式控制入口改变运行状态。
 
 同一 `request_id` 重试会返回持久化结果和 `run_reused`，不会新增 turn 或重复副作用。
 旧 `/ask`、`/chat/stream`、`/tools/run` 与 `/tools/approval` 在 `primary` 模式只作为
@@ -80,6 +84,30 @@ Top 4 正文水化深度和最终覆盖完整性仍是主要瓶颈。完整聚�
 生产命令 `scripts/serve_web.py` 默认使用 `PRA_MAIN_AGENT_MODE=primary`。显式配置
 `PRA_MAIN_AGENT_MODE=legacy` 并重启即可回滚；已废弃的
 `PRA_MAIN_AGENT_ENABLED` 只为旧部署读取兼容，不应继续写入新环境文件。
+
+### 实时运行轨迹
+
+主 Agent 使用 `main-agent-stream-v2` 事件协议。事件在主图和子执行器运行期间实时发布，
+先写入独立的 SQLite 产品事件账本，再通知当前浏览器；慢客户端或网络中断可按同一 run 内
+单调递增的 `event_id` 补齐。浏览器只在本地保存 `request_id`、`conversation_id` 和
+`last_event_id` 三个续传字段，不缓存问题、回答事件、工具结果或论文证据。历史会话也从同一
+账本恢复，因此实时视图、刷新续传和历史回放使用相同的对话节点。
+
+回答事件会明确标注 delivery mode（交付模式）：
+
+- `provider_live`：直接转发模型提供方的实时文本增量。
+- `validated_replay`：本地 RAG 或结构化回答完成引用验证后再分块输出，不宣称是模型首 token。
+- `event_only`：本轮只有状态、工具或交互事件，没有回答文本增量。
+
+产品事件只允许公开阶段名、任务标题、工具名、状态、计数、耗时、固定原因码和安全附件 ID。
+原始问题、system prompt（系统提示词）、隐藏 chain-of-thought（思维链）、工具参数、Provider
+原始载荷、论文正文与召回正文均不会进入事件账本或 DOM；原有安全遥测库继续独立存在，前端
+不会直接读取它。
+
+界面把研究过程放回当前对话：思考摘要、计划、工具、检索、回答和本轮统计按稳定节点原位更新，
+完成节点默认折叠；“详情”抽屉默认关闭。桌面会话导航可收起，移动端改为遮罩抽屉。附件和
+RAG 模式保留在紧凑输入区；等待工具审批时，输入区会切换为“拒绝/允许”，处理后恢复原输入框。
+运行中的暂停、继续、取消以及暂停后的计划编辑均按当前状态显示，不再依赖常驻右栏。
 
 ## 数据边界
 
