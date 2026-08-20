@@ -9,6 +9,7 @@ const API = Object.freeze({
   conversationDetail: (conversationId, messageLimit = 24) => `api/conversations/${encodeURIComponent(conversationId)}?message_limit=${messageLimit}`,
   activateConversation: (conversationId) => `api/conversations/${encodeURIComponent(conversationId)}/activate`,
   agentRuns: "api/agent/runs",
+  agentEvents: (requestId, afterEventId = 0) => `api/agent/runs/${encodeURIComponent(requestId)}/events?after_event_id=${afterEventId}`,
   agentApproval: (requestId) => `api/agent/runs/${encodeURIComponent(requestId)}/approval`,
   agentPlan: (requestId) => `api/agent/runs/${encodeURIComponent(requestId)}/plan`,
   agentControl: (requestId) => `api/agent/runs/${encodeURIComponent(requestId)}/control`,
@@ -40,6 +41,9 @@ const state = {
   serverConversations: [],
   historyHasMore: false,
   historyMessageCount: 0,
+  runViews: new Map(),
+  inspectorReturnFocus: null,
+  navigationReturnFocus: null,
 };
 
 const elements = {
@@ -53,6 +57,10 @@ const elements = {
   newConversation: document.querySelector("#new-conversation"),
   memoriesButton: document.querySelector("#memories-button"),
   conversationHistory: document.querySelector("#conversation-history"),
+  navigation: document.querySelector("#library-panel"),
+  navigationToggle: document.querySelector("#navigation-toggle"),
+  navigationClose: document.querySelector("#navigation-close"),
+  navigationScrim: document.querySelector("#navigation-scrim"),
   askForm: document.querySelector("#ask-form"),
   question: document.querySelector("#question"),
   askButton: document.querySelector("#ask-button"),
@@ -65,7 +73,6 @@ const elements = {
   messages: document.querySelector("#messages"),
   emptyState: document.querySelector("#empty-state"),
   loadingTemplate: document.querySelector("#loading-message-template"),
-  pipeline: document.querySelector("#pipeline-status"),
   notice: document.querySelector("#notice"),
   inspector: document.querySelector("#inspector"),
   inspectorToggle: document.querySelector("#inspector-toggle"),
@@ -128,13 +135,19 @@ function createPendingRequest(question) {
     ragMode: selectedRagMode(),
     attachmentIds: state.attachments.map((item) => item.attachment_id),
     conversationId: state.currentConversationId,
+    lastEventId: 0,
   };
 }
 
 function savePendingRequest(pendingRequest) {
   state.pendingRequest = pendingRequest;
+  const cursor = {
+    request_id: pendingRequest.requestId,
+    conversation_id: pendingRequest.conversationId || state.currentConversationId,
+    last_event_id: Number(pendingRequest.lastEventId) || 0,
+  };
   try {
-    localStorage.setItem(PENDING_REQUEST_KEY, JSON.stringify(pendingRequest));
+    localStorage.setItem(PENDING_REQUEST_KEY, JSON.stringify(cursor));
   } catch (_error) {
     // In-memory idempotency remains available when persistent storage is denied.
   }
@@ -145,16 +158,21 @@ function loadPendingRequest() {
   try {
     const value = JSON.parse(localStorage.getItem(PENDING_REQUEST_KEY) || "null");
     const valid = value
-      && typeof value.question === "string"
-      && /^[A-Za-z0-9_-]{16,128}$/.test(value.requestId)
-      && ["disabled", "preferred", "required"].includes(value.ragMode)
-      && Array.isArray(value.attachmentIds)
-      && value.attachmentIds.length <= 5
-      && value.attachmentIds.every((item) => /^[0-9a-f]{32}$/.test(item))
-      && (value.conversationId === undefined || typeof value.conversationId === "string");
-    if (!valid) return null;
-    state.pendingRequest = value;
-    return value;
+      && /^[A-Za-z0-9_-]{16,128}$/.test(value.request_id)
+      && typeof value.conversation_id === "string"
+      && value.conversation_id.length > 0
+      && Number.isInteger(value.last_event_id)
+      && value.last_event_id >= 0;
+    if (!valid) {
+      localStorage.removeItem(PENDING_REQUEST_KEY);
+      return null;
+    }
+    state.pendingRequest = {
+      requestId: value.request_id,
+      conversationId: value.conversation_id,
+      lastEventId: value.last_event_id,
+    };
+    return state.pendingRequest;
   } catch (_error) {
     return null;
   }
@@ -282,28 +300,10 @@ function setBusy(busy) {
   elements.fileButton.disabled = busy;
   elements.askButton.classList.toggle("is-loading", busy);
   elements.messages.setAttribute("aria-busy", String(busy));
-  elements.pipeline.hidden = !busy;
-  if (busy) startPhaseAnimation();
-  else stopPhaseAnimation();
-}
-
-function startPhaseAnimation() {
-  const phases = Array.from(elements.pipeline.querySelectorAll("[data-phase]"));
-  let current = 0;
-  phases.forEach((phase) => phase.classList.remove("is-active", "is-complete"));
-  phases[0].classList.add("is-active");
-  state.phaseTimer = window.setInterval(() => {
-    if (current >= phases.length - 1) return;
-    phases[current].classList.remove("is-active");
-    phases[current].classList.add("is-complete");
-    current += 1;
-    phases[current].classList.add("is-active");
-  }, 1700);
-}
-
-function stopPhaseAnimation() {
-  if (state.phaseTimer !== null) window.clearInterval(state.phaseTimer);
-  state.phaseTimer = null;
+  if (!busy && state.phaseTimer !== null) {
+    window.clearInterval(state.phaseTimer);
+    state.phaseTimer = null;
+  }
 }
 
 async function handleAsk(event) {
@@ -321,8 +321,8 @@ async function handleAsk(event) {
     return;
   }
   const existingRequest = loadPendingRequest();
-  if (existingRequest && existingRequest.question !== question) {
-    showNotice("上一条请求尚未确认完成，请先输入原问题重试。", "warning");
+  if (existingRequest) {
+    showNotice("上一条请求仍在运行或等待处理，请先继续接收该运行。", "warning");
     return;
   }
   hideNotice();
@@ -334,10 +334,10 @@ async function handleAsk(event) {
     });
     state.viewingArchive = false;
   }
-  const pendingRequest = existingRequest || createPendingRequest(question);
+  const pendingRequest = createPendingRequest(question);
   savePendingRequest(pendingRequest);
   elements.emptyState.hidden = true;
-  if (!existingRequest) appendUserMessage(question, true);
+  appendUserMessage(question, true);
   elements.question.value = "";
   setBusy(true);
   scrollMessages();
@@ -379,6 +379,183 @@ async function streamConversation(pendingRequest, sourceNote = "") {
   return consumeAgentStream(response, pendingRequest, sourceNote);
 }
 
+function runNodeKind(type) {
+  if (type.startsWith("reasoning_")) return "reasoning";
+  if (type === "plan_updated" || type === "goal_updated") return "plan";
+  if (type.startsWith("tool_")) return "tool";
+  if (type === "retrieval_completed") return "retrieval";
+  if (type === "file_created") return "tool";
+  if (type.startsWith("task_")) return "task";
+  if (type.startsWith("answer_")) return "answer";
+  if (type.startsWith("interaction_")) return "interaction";
+  if (["run_completed", "run_failed", "run_cancelled", "run_conflict"].includes(type)) return "turn-tail";
+  return "lifecycle";
+}
+
+function reduceRunEvent(runState, event) {
+  const eventId = Number(event.event_id) || 0;
+  if (eventId > 0 && eventId <= (runState.lastEventId || 0)) return runState;
+  const nodes = { ...runState.nodes };
+  const order = [...runState.order];
+  const nodeId = event.node_id || `${event.type}:${event.event_id}`;
+  const previous = nodes[nodeId] || {
+    nodeId,
+    kind: runNodeKind(event.type || ""),
+    title: "运行状态",
+    summary: "",
+    status: "running",
+    text: "",
+    detail: {},
+  };
+  if (!nodes[nodeId]) order.push(nodeId);
+  nodes[nodeId] = {
+    ...previous,
+    kind: runNodeKind(event.type || ""),
+    eventType: event.type,
+    title: event.title || previous.title,
+    summary: event.summary || previous.summary,
+    status: event.status || previous.status,
+    detail: event.detail && typeof event.detail === "object" ? event.detail : previous.detail,
+    durationMs: Number.isFinite(event.duration_ms) ? event.duration_ms : previous.durationMs,
+    text: event.type === "answer_delta" && typeof event.delta === "string"
+      ? `${previous.text || ""}${event.delta}`
+      : previous.text,
+  };
+  return {
+    nodes,
+    order,
+    lastEventId: Math.max(runState.lastEventId || 0, eventId),
+    lastEventType: event.type || runState.lastEventType || "",
+  };
+}
+
+function renderRunNode(node) {
+  if (node.kind === "answer") {
+    const answer = createElement("section", "run-node run-node-answer");
+    answer.dataset.nodeId = node.nodeId;
+    answer.dataset.kind = node.kind;
+    answer.append(createElement("div", "run-answer-copy natural-answer", naturalText(node.text || "")));
+    return answer;
+  }
+  if (node.kind === "lifecycle") {
+    const lifecycle = createElement("div", `run-node run-node-lifecycle is-${node.status}`);
+    lifecycle.dataset.nodeId = node.nodeId;
+    lifecycle.dataset.kind = node.kind;
+    lifecycle.append(
+      createElement("strong", "run-node-title", node.title || "运行状态"),
+      createElement("span", "run-node-summary", node.summary || ""),
+    );
+    return lifecycle;
+  }
+  if (node.kind === "turn-tail") {
+    const tail = createElement("footer", `run-node run-node-turn-tail is-${node.status}`);
+    tail.dataset.nodeId = node.nodeId;
+    tail.dataset.kind = node.kind;
+    tail.append(
+      createElement("strong", "run-node-title", node.title || "本轮结束"),
+      createElement("span", "run-node-summary", node.summary || ""),
+    );
+    const detailsButton = createElement("button", "run-detail-button", "运行详情");
+    detailsButton.type = "button";
+    detailsButton.addEventListener("click", openInspector);
+    tail.append(detailsButton);
+    return tail;
+  }
+  const details = createElement("details", `run-node run-node-${node.kind} is-${node.status}`);
+  details.dataset.nodeId = node.nodeId;
+  details.dataset.kind = node.kind;
+  const shouldOpen = ["failed", "waiting_approval", "waiting_user"].includes(node.status);
+  details.open = shouldOpen;
+  details.setAttribute("aria-expanded", String(shouldOpen));
+  details.addEventListener("toggle", () => {
+    details.setAttribute("aria-expanded", String(details.open));
+  });
+  const summary = createElement("summary", "run-node-heading");
+  summary.append(
+    createElement("strong", "run-node-title", node.title || "运行步骤"),
+    createElement("span", "run-node-status", node.status || "running"),
+  );
+  const body = createElement("div", "run-node-body");
+  body.append(createElement("p", "run-node-summary", node.summary || "暂无公开摘要"));
+  if (Number.isFinite(node.durationMs)) {
+    body.append(createElement("small", "run-node-duration", `${node.durationMs} ms`));
+  }
+  details.append(summary, body);
+  return details;
+}
+
+function renderRunEvent(runView, event) {
+  const previousState = runView.state;
+  runView.state = reduceRunEvent(runView.state, event);
+  if (runView.state === previousState) return null;
+  const node = runView.state.nodes[event.node_id || `${event.type}:${event.event_id}`];
+  const existing = runView.registry.get(node.nodeId);
+  if (!existing) {
+    const element = renderRunNode(node);
+    runView.registry.set(node.nodeId, element);
+    runView.transcript.append(element);
+    return element;
+  }
+  if (existing.dataset.kind && existing.dataset.kind !== node.kind) {
+    const replacement = renderRunNode(node);
+    existing.replaceWith(replacement);
+    runView.registry.set(node.nodeId, replacement);
+    return replacement;
+  }
+  existing.className = `run-node run-node-${node.kind} is-${node.status}`;
+  const title = existing.querySelector(".run-node-title");
+  const summary = existing.querySelector(".run-node-summary");
+  const status = existing.querySelector(".run-node-status");
+  const answer = existing.querySelector(".run-answer-copy");
+  if (title) title.textContent = node.title || "运行步骤";
+  if (summary) summary.textContent = node.summary || "";
+  if (status) status.textContent = node.status || "running";
+  if (answer) answer.textContent = naturalText(node.text || "");
+  return existing;
+}
+
+function getOrCreateRunView(pendingRequest, sourceNote = "") {
+  const existing = state.runViews.get(pendingRequest.requestId);
+  if (existing) return existing;
+  const article = createElement("article", "message message-assistant");
+  article.dataset.requestId = pendingRequest.requestId;
+  const meta = createElement("div", "message-meta");
+  meta.append(
+    createElement("span", "assistant-mark", "研"),
+    createElement("strong", "", "论文研究 Agent"),
+  );
+  if (sourceNote) meta.append(createElement("small", "source-note", sourceNote));
+  const copy = createElement("div", "answer-copy natural-answer");
+  copy.textContent = "正在连接运行轨迹…";
+  const transcript = createElement("div", "run-transcript");
+  const runView = {
+    article,
+    meta,
+    copy,
+    transcript,
+    registry: new Map(),
+    state: {
+      nodes: {},
+      order: [],
+      lastEventId: Number(pendingRequest.lastEventId) || 0,
+      lastEventType: "",
+    },
+  };
+  article.append(meta, transcript, copy);
+  elements.messages.append(article);
+  state.runViews.set(pendingRequest.requestId, runView);
+  return runView;
+}
+
+function answerTextFromRunView(runView) {
+  return runView.state.order
+    .map((nodeId) => runView.state.nodes[nodeId])
+    .filter((node) => node?.kind === "answer" && typeof node.text === "string")
+    .map((node) => node.text)
+    .join("")
+    .trim();
+}
+
 async function consumeAgentStream(response, pendingRequest, sourceNote = "") {
   if (!response.ok) {
     let message = "请求暂时未完成，请稍后重试。";
@@ -394,17 +571,8 @@ async function consumeAgentStream(response, pendingRequest, sourceNote = "") {
   }
   if (!response.body) throw new Error("浏览器不支持流式输出。请升级浏览器后重试。");
 
-  const article = createElement("article", "message message-assistant");
-  const meta = createElement("div", "message-meta");
-  meta.append(
-    createElement("span", "assistant-mark", "研"),
-    createElement("strong", "", "智能路由中"),
-  );
-  if (sourceNote) meta.append(createElement("small", "source-note", sourceNote));
-  const copy = createElement("div", "answer-copy natural-answer");
-  copy.textContent = "正在判断最合适的处理方式…";
-  article.append(meta, copy);
-  elements.messages.append(article);
+  const runView = getOrCreateRunView(pendingRequest, sourceNote);
+  const { article, copy, transcript } = runView;
   state.citations.clear();
   elements.routeMetrics.replaceChildren();
   elements.tokenMetrics.replaceChildren();
@@ -415,7 +583,7 @@ async function consumeAgentStream(response, pendingRequest, sourceNote = "") {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-  let rawText = "";
+  let rawText = answerTextFromRunView(runView);
   let route = "direct_chat";
   let finalStatus = "running";
   let waitingApproval = false;
@@ -429,6 +597,56 @@ async function consumeAgentStream(response, pendingRequest, sourceNote = "") {
     for (const line of lines) {
       if (!line.trim()) continue;
       const event = JSON.parse(line);
+      if (event.schema_version === "main-agent-stream-v2") {
+        const followOutput = shouldAutoScroll();
+        copy.hidden = true;
+        const rendered = renderRunEvent(runView, event);
+        if (!rendered) continue;
+        pendingRequest.lastEventId = runView.state.lastEventId;
+        savePendingRequest(pendingRequest);
+        if (event.detail?.capability) route = event.detail.capability;
+        if (event.type === "answer_delta" && typeof event.delta === "string") {
+          rawText += event.delta;
+          const now = performance.now();
+          if (now - lastPaint >= 40) {
+            scrollMessages(followOutput);
+            lastPaint = now;
+          }
+        } else if (event.type === "file_created" && event.detail?.output_attachment_id) {
+          const attachmentId = event.detail.output_attachment_id;
+          if (/^[0-9a-f]{32}$/.test(attachmentId) && !outputAttachmentIds.includes(attachmentId)) {
+            outputAttachmentIds.push(attachmentId);
+          }
+        } else if (event.type === "interaction_required" && event.status === "waiting_approval") {
+          waitingApproval = true;
+          if (event.detail?.arguments_sha256 && event.detail?.expires_at_epoch) {
+            openToolApproval(event.detail, pendingRequest.requestId);
+          }
+        } else if (event.type === "run_completed") {
+          finalStatus = "completed";
+          stopPlanRefresh();
+        } else if (event.type === "run_failed") {
+          finalStatus = "failed";
+          stopPlanRefresh();
+        } else if (event.type === "run_cancelled") {
+          finalStatus = "cancelled";
+          stopPlanRefresh();
+        } else if (event.type === "run_conflict") {
+          finalStatus = "conflict";
+          stopPlanRefresh();
+        } else if (event.type === "run_paused") {
+          finalStatus = "paused";
+          stopPlanRefresh();
+        } else if (event.type === "run_waiting_approval") {
+          finalStatus = "waiting_approval";
+          waitingApproval = true;
+          stopPlanRefresh();
+        } else if (event.type === "run_waiting_user") {
+          finalStatus = "waiting_user";
+          stopPlanRefresh();
+        }
+        continue;
+      }
       if (event.type === "run_reused") {
         meta.append(createElement("small", "source-note", "已复用原请求结果"));
       } else if (event.type === "task_started") {
@@ -505,11 +723,20 @@ async function consumeAgentStream(response, pendingRequest, sourceNote = "") {
     await refreshPlanControl();
     return;
   }
+  if (finalStatus === "waiting_user") {
+    showNotice("需要补充信息后才能继续运行。", "warning");
+    return;
+  }
   const editMode = route === "file_edit";
+  rawText = answerTextFromRunView(runView) || rawText;
   const finalText = (editMode ? rawText : naturalText(rawText)).trim();
   if (editMode) {
     copy.textContent = "文件修改完成，可以下载新文件。";
-  } else copy.replaceChildren(renderTextWithCitations(finalText));
+  } else if (!copy.hidden) copy.replaceChildren(renderTextWithCitations(finalText));
+  else {
+    const answer = transcript.querySelector(".run-answer-copy");
+    if (answer) answer.replaceChildren(renderTextWithCitations(finalText));
+  }
   outputAttachmentIds.forEach((attachmentId) => {
     article.append(createServerDownloadButton(attachmentId));
   });
@@ -897,7 +1124,14 @@ function openToolApproval(pending, requestId) {
   appendDetail(elements.toolApprovalDetails, "用途", pending.purpose);
   appendDetail(elements.toolApprovalDetails, "参数指纹", pending.arguments_sha256);
   appendDetail(elements.toolApprovalDetails, "有效期", new Date(pending.expires_at_epoch * 1000).toLocaleString());
-  elements.toolApprovalDialog.showModal();
+  elements.toolApprovalDialog.hidden = false;
+  elements.askForm.classList.add("is-approving");
+  elements.toolApprovalReject.focus();
+}
+
+function closeToolApproval() {
+  elements.toolApprovalDialog.hidden = true;
+  elements.askForm.classList.remove("is-approving");
 }
 
 async function resolveToolApproval(approved) {
@@ -906,7 +1140,7 @@ async function resolveToolApproval(approved) {
   const pendingRequest = loadPendingRequest();
   if (!pendingRequest || pendingRequest.requestId !== pendingTool.requestId) {
     clearPendingRequest();
-    elements.toolApprovalDialog.close();
+    closeToolApproval();
     showNotice("审批对应的请求已失效，请重新发起。", "error");
     return;
   }
@@ -918,9 +1152,12 @@ async function resolveToolApproval(approved) {
       method: "POST",
       credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ approved }),
+      body: JSON.stringify({
+        approved,
+        after_event_id: Number(pendingRequest.lastEventId) || 0,
+      }),
     });
-    elements.toolApprovalDialog.close();
+    closeToolApproval();
     await consumeAgentStream(response, pendingRequest, "审批恢复");
   } catch (error) {
     showNotice(error.message, "error");
@@ -993,7 +1230,7 @@ function appendErrorMessage(text, persist) {
   const message = createElement("p", "insufficient", text);
   article.append(meta, message);
   if (loadPendingRequest()) {
-    const retry = createElement("button", "download-file", "重试原请求");
+    const retry = createElement("button", "download-file", "继续接收运行");
     retry.type = "button";
     retry.addEventListener("click", retryPendingRequest);
     article.append(retry);
@@ -1266,6 +1503,9 @@ function showToast(message) {
 }
 
 function openInspector() {
+  state.inspectorReturnFocus = document.activeElement instanceof HTMLElement
+    ? document.activeElement
+    : null;
   elements.inspector.classList.add("is-open");
   elements.inspectorToggle.setAttribute("aria-expanded", "true");
   elements.inspectorScrim.hidden = false;
@@ -1273,9 +1513,108 @@ function openInspector() {
 }
 
 function closeInspector() {
+  const wasOpen = elements.inspector.classList.contains("is-open");
   elements.inspector.classList.remove("is-open");
   elements.inspectorToggle.setAttribute("aria-expanded", "false");
   elements.inspectorScrim.hidden = true;
+  if (wasOpen && state.inspectorReturnFocus?.isConnected) {
+    state.inspectorReturnFocus.focus();
+  }
+  state.inspectorReturnFocus = null;
+}
+
+function handleInspectorKeyboard(event) {
+  if (!elements.inspector.classList.contains("is-open")) return;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeInspector();
+    return;
+  }
+  if (event.key !== "Tab") return;
+  const focusable = [...elements.inspector.querySelectorAll(
+    'button:not([disabled]), a[href], input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])',
+  )].filter((node) => !node.hidden && node.getClientRects().length > 0);
+  if (!focusable.length) return;
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
+function toggleNavigation() {
+  const mobile = window.matchMedia("(max-width: 760px)").matches;
+  if (!mobile) {
+    const collapsed = elements.appView.classList.toggle("nav-collapsed");
+    elements.navigationToggle.setAttribute("aria-expanded", String(!collapsed));
+    return;
+  }
+  state.navigationReturnFocus = document.activeElement instanceof HTMLElement
+    ? document.activeElement
+    : null;
+  elements.navigation.classList.add("is-open");
+  elements.navigationToggle.setAttribute("aria-expanded", "true");
+  elements.navigationScrim.hidden = false;
+  elements.navigationClose.focus();
+}
+
+function closeNavigation() {
+  if (!window.matchMedia("(max-width: 760px)").matches) {
+    elements.navigationToggle.setAttribute(
+      "aria-expanded",
+      String(!elements.appView.classList.contains("nav-collapsed")),
+    );
+    return;
+  }
+  const wasOpen = elements.navigation.classList.contains("is-open");
+  elements.navigation.classList.remove("is-open");
+  elements.navigationToggle.setAttribute("aria-expanded", "false");
+  elements.navigationScrim.hidden = true;
+  if (wasOpen && state.navigationReturnFocus?.isConnected) {
+    state.navigationReturnFocus.focus();
+  }
+  state.navigationReturnFocus = null;
+}
+
+function handleNavigationKeyboard(event) {
+  if (!elements.navigation.classList.contains("is-open")) return;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeNavigation();
+    return;
+  }
+  if (event.key !== "Tab") return;
+  const focusable = [...elements.navigation.querySelectorAll(
+    'button:not([disabled]), a[href], input:not([disabled]), [tabindex]:not([tabindex="-1"])',
+  )].filter((node) => !node.hidden && node.getClientRects().length > 0);
+  if (!focusable.length) return;
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
+function syncNavigationViewport() {
+  if (window.matchMedia("(max-width: 760px)").matches) {
+    elements.appView.classList.remove("nav-collapsed");
+    elements.navigation.classList.remove("is-open");
+    elements.navigationScrim.hidden = true;
+    elements.navigationToggle.setAttribute("aria-expanded", "false");
+  } else {
+    elements.navigationToggle.setAttribute(
+      "aria-expanded",
+      String(!elements.appView.classList.contains("nav-collapsed")),
+    );
+  }
 }
 
 async function restoreServerHistory(renderCurrent = true) {
@@ -1298,9 +1637,9 @@ async function restoreServerHistory(renderCurrent = true) {
       renderDialogueMessages([], "新研究会话");
     }
     const pendingRequest = loadPendingRequest();
-    if (pendingRequest) {
-      elements.question.value = pendingRequest.question;
-      showNotice(`已恢复未完成的原问题：“${pendingRequest.question}”。可直接点击发送重试。`, "warning");
+    if (pendingRequest && pendingRequest.conversationId === state.currentConversationId) {
+      showNotice("检测到未结束的运行，正在从上次事件继续接收。", "warning");
+      if (renderCurrent) await retryPendingRequest();
     }
   } catch (_error) {
     restoreHistory();
@@ -1314,6 +1653,10 @@ async function loadConversationMessages(conversationId, messageLimit = 24) {
     role: item.role,
     text: item.text,
     status: item.status,
+    turnId: item.turn_id,
+    requestId: item.request_id,
+    runId: item.run_id,
+    events: Array.isArray(item.events) ? item.events : [],
   }));
   state.historyHasMore = detail.has_more_messages === true;
   state.historyMessageCount = Number.isInteger(detail.message_count)
@@ -1325,7 +1668,12 @@ async function loadConversationMessages(conversationId, messageLimit = 24) {
   if (index >= 0) state.serverConversations[index] = detail;
   else state.serverConversations.unshift(detail);
   try {
-    sessionStorage.setItem(STORAGE_KEY, JSON.stringify(state.history.slice(-24)));
+    const cache = state.history.slice(-24).map((item) => ({
+      role: item.role,
+      text: item.text,
+      status: item.status,
+    }));
+    sessionStorage.setItem(STORAGE_KEY, JSON.stringify(cache));
   } catch (_error) {
     // The server remains authoritative when browser caching is unavailable.
   }
@@ -1358,12 +1706,12 @@ async function activatePersistedConversation(dialogue) {
       elements.question.value = "";
       hideNotice();
     } else if (pendingRequest) {
-      elements.question.value = pendingRequest.question;
-      showNotice(`已恢复未完成的原问题：“${pendingRequest.question}”。可直接点击发送重试。`, "warning");
+      showNotice("该对话仍有未结束运行，可继续接收最新事件。", "warning");
     }
     state.viewingArchive = false;
     showCurrentDialogue();
     renderHistoryList();
+    closeNavigation();
   } catch (error) {
     showNotice(error.message, "error");
   }
@@ -1431,7 +1779,12 @@ function saveHistoryItem(item) {
     else state.serverConversations.unshift(persisted);
   }
   try {
-    sessionStorage.setItem(STORAGE_KEY, JSON.stringify(state.history));
+    const cache = state.history.map((entry) => ({
+      role: entry.role,
+      text: entry.text,
+      status: entry.status,
+    }));
+    sessionStorage.setItem(STORAGE_KEY, JSON.stringify(cache));
     renderHistoryList();
   } catch (_error) {
     // Browsers may deny storage in private contexts; the live view remains functional.
@@ -1520,6 +1873,7 @@ function showArchivedDialogue(archive) {
 
 function renderDialogueMessages(items, label, allowLoadEarlier = false) {
   elements.messages.replaceChildren();
+  state.runViews.clear();
   if (!items.length) {
     elements.messages.append(elements.emptyState);
     elements.emptyState.hidden = false;
@@ -1535,16 +1889,56 @@ function renderDialogueMessages(items, label, allowLoadEarlier = false) {
   }
   items.forEach((item) => {
     if (item.role === "user") appendUserMessage(item.text, false);
-    else appendRestoredAssistant(item.text, item.status);
+    else appendRestoredAssistant(item.text, item.status, item.events, item.requestId || item.request_id);
   });
   elements.conversationLabel.textContent = label;
 }
 
-function appendRestoredAssistant(text, status) {
+function appendRestoredAssistant(text, status, events = [], requestId = null) {
   const article = createElement("article", "message message-assistant");
+  if (requestId) article.dataset.requestId = requestId;
   const meta = createElement("div", "message-meta");
   meta.append(createElement("span", "assistant-mark", "研"), createElement("strong", "", "论文研究 Agent"));
-  article.append(meta, status === "error" ? createElement("p", "insufficient", text) : renderCompactText(text));
+  article.append(meta);
+  if (Array.isArray(events) && events.length) {
+    const transcript = createElement("div", "run-transcript");
+    const copy = createElement("div", "answer-copy natural-answer");
+    copy.hidden = true;
+    const runView = {
+      article,
+      meta,
+      copy,
+      transcript,
+      registry: new Map(),
+      state: { nodes: {}, order: [], lastEventId: 0, lastEventType: "" },
+    };
+    events.forEach((event) => {
+      if (event?.schema_version === "main-agent-stream-v2") renderRunEvent(runView, event);
+    });
+    article.append(transcript, copy);
+    if (requestId) state.runViews.set(requestId, runView);
+    const outputAttachmentIds = events
+      .filter((event) => event?.type === "file_created")
+      .map((event) => event.detail?.output_attachment_id)
+      .filter((attachmentId) => /^[0-9a-f]{32}$/.test(attachmentId || ""));
+    [...new Set(outputAttachmentIds)].forEach((attachmentId) => {
+      article.append(createServerDownloadButton(attachmentId));
+    });
+    const approval = [...events].reverse().find(
+      (event) => event?.type === "interaction_required" && event.status === "waiting_approval",
+    );
+    const pendingRequest = loadPendingRequest();
+    if (
+      approval?.detail?.arguments_sha256
+      && requestId
+      && pendingRequest?.requestId === requestId
+      && runView.state.lastEventType === "run_waiting_approval"
+    ) {
+      openToolApproval(approval.detail, requestId);
+    }
+  } else {
+    article.append(status === "error" ? createElement("p", "insufficient", text) : renderCompactText(text));
+  }
   elements.messages.append(article);
 }
 
@@ -1562,10 +1956,30 @@ function clearLocalDialogue() {
 async function retryPendingRequest() {
   const pendingRequest = loadPendingRequest();
   if (!pendingRequest || state.busy) return;
+  if (pendingRequest.conversationId !== state.currentConversationId) return;
+  const existingView = state.runViews.get(pendingRequest.requestId);
+  const segmentBoundary = existingView?.state.lastEventType;
+  if (segmentBoundary === "run_waiting_approval") {
+    showNotice("运行正在等待工具审批；处理后会从当前游标继续。", "warning");
+    return;
+  }
+  if (segmentBoundary === "run_paused") {
+    showNotice("运行已暂停，可在计划控制中编辑或继续。", "warning");
+    return;
+  }
+  if (segmentBoundary === "run_waiting_user") {
+    showNotice("运行正在等待补充信息。", "warning");
+    return;
+  }
   hideNotice();
   setBusy(true);
   try {
-    await streamConversation(pendingRequest, "断线重试，复用原请求标识");
+    activatePlanControl(pendingRequest.requestId);
+    const response = await fetch(
+      API.agentEvents(pendingRequest.requestId, Number(pendingRequest.lastEventId) || 0),
+      { method: "GET", credentials: "same-origin" },
+    );
+    await consumeAgentStream(response, pendingRequest, "断线续传");
   } catch (error) {
     if (error.status >= 400 && error.status < 500 && error.status !== 409) {
       clearPendingRequest();
@@ -1579,8 +1993,19 @@ async function retryPendingRequest() {
   }
 }
 
-function scrollMessages() {
-  window.requestAnimationFrame(() => elements.messages.lastElementChild?.scrollIntoView({ behavior: "smooth", block: "nearest" }));
+function shouldAutoScroll() {
+  const distance = elements.messages.scrollHeight - elements.messages.scrollTop - elements.messages.clientHeight;
+  return distance <= 96;
+}
+
+function scrollMessages(force = false) {
+  if (!force && !shouldAutoScroll()) return;
+  window.requestAnimationFrame(() => elements.messages.lastElementChild?.scrollIntoView({ behavior: "auto", block: "nearest" }));
+}
+
+function resizeComposer() {
+  elements.question.style.height = "auto";
+  elements.question.style.height = `${Math.min(elements.question.scrollHeight, 160)}px`;
 }
 
 elements.loginForm.addEventListener("submit", handleLogin);
@@ -1588,6 +2013,7 @@ elements.logout.addEventListener("click", handleLogout);
 elements.newConversation.addEventListener("click", startNewConversation);
 elements.memoriesButton.addEventListener("click", openMemories);
 elements.askForm.addEventListener("submit", handleAsk);
+elements.question.addEventListener("input", resizeComposer);
 elements.toolMode.addEventListener("change", syncRagControls);
 elements.fileButton.addEventListener("click", () => elements.fileInput.click());
 elements.fileInput.addEventListener("change", () => uploadSelectedFile(elements.fileInput.files[0]));
@@ -1610,6 +2036,12 @@ elements.question.addEventListener("keydown", (event) => {
 elements.inspectorToggle.addEventListener("click", openInspector);
 elements.inspectorClose.addEventListener("click", closeInspector);
 elements.inspectorScrim.addEventListener("click", closeInspector);
+document.addEventListener("keydown", handleInspectorKeyboard);
+elements.navigationToggle.addEventListener("click", toggleNavigation);
+elements.navigationClose.addEventListener("click", closeNavigation);
+elements.navigationScrim.addEventListener("click", closeNavigation);
+document.addEventListener("keydown", handleNavigationKeyboard);
+window.addEventListener("resize", syncNavigationViewport);
 elements.evidenceClose.addEventListener("click", () => elements.evidenceDialog.close());
 elements.evidenceDialog.addEventListener("click", (event) => {
   if (event.target === elements.evidenceDialog) elements.evidenceDialog.close();
@@ -1629,4 +2061,5 @@ elements.planSaveObjective.addEventListener("click", () => {
   if (objective) editActivePlan({ objective });
 });
 
+syncNavigationViewport();
 checkSession();

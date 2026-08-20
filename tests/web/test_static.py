@@ -16,6 +16,15 @@ class StaticWebContractTests(unittest.TestCase):
         cls.html = (STATIC_ROOT / "index.html").read_text(encoding="utf-8")
         cls.css = (STATIC_ROOT / "app.css").read_text(encoding="utf-8")
         cls.javascript = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+        cls.nginx = (DEPLOY_ROOT / "nginx-paper-research-locations.conf").read_text(
+            encoding="utf-8"
+        )
+
+    def test_main_agent_stream_disables_reverse_proxy_buffering(self) -> None:
+        location = self.nginx.split("location ^~ /paper-research/api/agent/runs", 1)[1]
+        location = location.split("}", 1)[0]
+        self.assertIn("proxy_buffering off", location)
+        self.assertIn("proxy_cache off", location)
 
     def test_login_and_research_workspace_have_accessible_landmarks(self) -> None:
         required_ids = {
@@ -30,7 +39,6 @@ class StaticWebContractTests(unittest.TestCase):
             "file-button",
             "file-list",
             "question",
-            "pipeline-status",
             "inspector",
             "generation-metrics",
             "evidence-dialog",
@@ -56,10 +64,6 @@ class StaticWebContractTests(unittest.TestCase):
         for text in (
             "可视化测试",
             "知识库包含什么",
-            "检索证据",
-            "重排与组装",
-            "生成回答",
-            "验证引用",
             "上下文检查器",
             "引用证据",
             "新对话",
@@ -87,8 +91,13 @@ class StaticWebContractTests(unittest.TestCase):
             "is-loading",
             "appendErrorMessage",
             "empty-state",
+            "reduceRunEvent",
+            "renderRunNode",
+            "run-transcript",
+            "answer_delta",
         ):
             self.assertIn(state_token, self.javascript + self.html)
+        self.assertNotIn('id="pipeline-status"', self.html)
 
     def test_server_text_is_only_projected_with_text_content(self) -> None:
         forbidden_property = "inner" + "HTML"
@@ -150,6 +159,17 @@ class StaticWebContractTests(unittest.TestCase):
         self.assertIn("localStorage.removeItem(PENDING_REQUEST_KEY)", self.javascript)
         self.assertIn("loadPendingRequest()", self.javascript)
         self.assertIn("pendingRequest.requestId", self.javascript)
+        self.assertIn("request_id: pendingRequest.requestId", self.javascript)
+        self.assertIn("conversation_id: pendingRequest.conversationId", self.javascript)
+        self.assertIn("last_event_id: Number(pendingRequest.lastEventId)", self.javascript)
+        self.assertNotIn(
+            "localStorage.setItem(PENDING_REQUEST_KEY, JSON.stringify(pendingRequest))",
+            self.javascript,
+        )
+        self.assertIn("API.agentEvents(pendingRequest.requestId", self.javascript)
+        reconnect = self.javascript.split("async function retryPendingRequest()", 1)[1]
+        reconnect = reconnect.split("function shouldAutoScroll()", 1)[0]
+        self.assertNotIn("streamConversation(pendingRequest", reconnect)
         self.assertNotRegex(
             self.javascript,
             r"(?:sessionStorage|localStorage)\.setItem\([^\n]+(?:citation|evidence|payload)",
@@ -179,6 +199,19 @@ class StaticWebContractTests(unittest.TestCase):
         self.assertIn("@media (max-width: 430px)", self.css)
         self.assertIn("min-height: 44px", self.css)
         self.assertIn("env(safe-area-inset-bottom)", self.css)
+        self.assertIn('id="navigation-toggle"', self.html)
+        self.assertIn('id="navigation-scrim"', self.html)
+        self.assertIn(".library-panel.is-open", self.css)
+        self.assertIn("handleNavigationKeyboard", self.javascript)
+        self.assertIn("handleInspectorKeyboard", self.javascript)
+        self.assertIn("run-node-turn-tail", self.javascript + self.css)
+        self.assertIn('rows="1"', self.html)
+
+    def test_approval_replaces_the_composer_without_a_second_dialog(self) -> None:
+        self.assertIn('id="tool-approval-dialog" class="approval-composer"', self.html)
+        self.assertNotIn('<dialog id="tool-approval-dialog"', self.html)
+        self.assertIn('elements.askForm.classList.add("is-approving")', self.javascript)
+        self.assertIn(".composer.is-approving", self.css)
 
 
 class RecommendationContractTests(unittest.TestCase):
