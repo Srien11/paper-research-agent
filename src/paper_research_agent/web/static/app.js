@@ -429,12 +429,30 @@ function reduceRunEvent(runState, event) {
   };
 }
 
+function citationMap(values) {
+  const citations = new Map();
+  if (!Array.isArray(values)) return citations;
+  values.forEach((citation) => {
+    if (citation && /^E[1-9]\d*$/.test(citation.citation_id || "")) {
+      citations.set(citation.citation_id, citation);
+    }
+  });
+  return citations;
+}
+
 function renderRunNode(node) {
   if (node.kind === "answer") {
     const answer = createElement("section", "run-node run-node-answer");
     answer.dataset.nodeId = node.nodeId;
     answer.dataset.kind = node.kind;
-    answer.append(createElement("div", "run-answer-copy natural-answer", naturalText(node.text || "")));
+    const copy = createElement("div", "run-answer-copy natural-answer");
+    copy.replaceChildren(
+      renderTextWithCitations(
+        naturalText(node.text || ""),
+        citationMap(node.detail?.citations),
+      ),
+    );
+    answer.append(copy);
     return answer;
   }
   if (node.kind === "lifecycle") {
@@ -510,8 +528,30 @@ function renderRunEvent(runView, event) {
   if (title) title.textContent = node.title || "运行步骤";
   if (summary) summary.textContent = node.summary || "";
   if (status) status.textContent = node.status || "running";
-  if (answer) answer.textContent = naturalText(node.text || "");
+  if (answer) {
+    answer.replaceChildren(
+      renderTextWithCitations(
+        naturalText(node.text || ""),
+        citationMap(node.detail?.citations),
+      ),
+    );
+  }
   return existing;
+}
+
+function finalizeRunAnswers(runView) {
+  runView.state.order.forEach((nodeId) => {
+    const node = runView.state.nodes[nodeId];
+    if (node?.kind !== "answer") return;
+    const answer = runView.registry.get(nodeId)?.querySelector(".run-answer-copy");
+    if (!answer) return;
+    answer.replaceChildren(
+      renderTextWithCitations(
+        naturalText(node.text || ""),
+        citationMap(node.detail?.citations),
+      ),
+    );
+  });
 }
 
 function getOrCreateRunView(pendingRequest, sourceNote = "") {
@@ -572,7 +612,7 @@ async function consumeAgentStream(response, pendingRequest, sourceNote = "") {
   if (!response.body) throw new Error("浏览器不支持流式输出。请升级浏览器后重试。");
 
   const runView = getOrCreateRunView(pendingRequest, sourceNote);
-  const { article, copy, transcript } = runView;
+  const { article, copy } = runView;
   state.citations.clear();
   elements.routeMetrics.replaceChildren();
   elements.tokenMetrics.replaceChildren();
@@ -733,10 +773,7 @@ async function consumeAgentStream(response, pendingRequest, sourceNote = "") {
   if (editMode) {
     copy.textContent = "文件修改完成，可以下载新文件。";
   } else if (!copy.hidden) copy.replaceChildren(renderTextWithCitations(finalText));
-  else {
-    const answer = transcript.querySelector(".run-answer-copy");
-    if (answer) answer.replaceChildren(renderTextWithCitations(finalText));
-  }
+  else finalizeRunAnswers(runView);
   outputAttachmentIds.forEach((attachmentId) => {
     article.append(createServerDownloadButton(attachmentId));
   });
@@ -1092,7 +1129,7 @@ function naturalText(value) {
     .replace(/\n{3,}/g, "\n\n");
 }
 
-function renderTextWithCitations(value) {
+function renderTextWithCitations(value, citations = state.citations) {
   const fragment = document.createDocumentFragment();
   const text = String(value || "");
   const pattern = /\[E[1-9]\d*\]/g;
@@ -1102,11 +1139,11 @@ function renderTextWithCitations(value) {
     if (index > cursor) fragment.append(document.createTextNode(text.slice(cursor, index)));
     const marker = match[0];
     const citationId = marker.slice(1, -1);
-    if (state.citations.has(citationId)) {
+    if (citations.has(citationId)) {
       const button = createElement("button", "citation-button inline-citation", marker);
       button.type = "button";
       button.setAttribute("aria-label", `查看引用 ${citationId}`);
-      button.addEventListener("click", () => openEvidence(citationId));
+      button.addEventListener("click", () => openEvidence(citations.get(citationId)));
       fragment.append(button);
     } else {
       fragment.append(document.createTextNode(marker));
@@ -1440,8 +1477,10 @@ function formatPages(citation) {
   return start === end || !end ? `第 ${start} 页` : `第 ${start}–${end} 页`;
 }
 
-function openEvidence(citationId) {
-  const citation = state.citations.get(citationId);
+function openEvidence(citationReference) {
+  const citation = typeof citationReference === "string"
+    ? state.citations.get(citationReference)
+    : citationReference;
   if (!citation) {
     showToast("当前页面没有这条引用的详细信息。重新提问可恢复引用详情。");
     return;

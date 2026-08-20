@@ -31,8 +31,8 @@ function streamEvents(requestId) {
     { ...common, event_id: 4, type: "tool_started", node_id: "tool:one:search:1", parent_node_id: "task:one", task_id: "one", status: "running", title: "调用工具 search_corpus", summary: "执行中", detail: { tool_name: "search_corpus", delivery_mode: "event_only" } },
     { ...common, event_id: 5, type: "tool_completed", node_id: "tool:one:search:1", parent_node_id: "task:one", task_id: "one", status: "completed", title: "工具已完成", summary: "返回 2 项结果", duration_ms: 18, detail: { tool_name: "search_corpus", returned_count: 2, delivery_mode: "event_only" } },
     { ...common, event_id: 6, type: "answer_started", node_id: "answer:one", parent_node_id: "task:one", task_id: "one", status: "running", title: "生成回答", detail: { delivery_mode: "provider_live" } },
-    { ...common, event_id: 7, type: "answer_delta", node_id: "answer:one", parent_node_id: "task:one", task_id: "one", status: "running", detail: { delivery_mode: "provider_live" }, delta: "这是实时生成的可验证回答。" },
-    { ...common, event_id: 8, type: "answer_completed", node_id: "answer:one", parent_node_id: "task:one", task_id: "one", status: "completed", title: "回答完成", detail: { delivery_mode: "provider_live", total_tokens: 42 } },
+    { ...common, event_id: 7, type: "answer_delta", node_id: "answer:one", parent_node_id: "task:one", task_id: "one", status: "running", detail: { delivery_mode: "provider_live" }, delta: "这是实时生成的可验证回答 [E1]。" },
+    { ...common, event_id: 8, type: "answer_completed", node_id: "answer:one", parent_node_id: "task:one", task_id: "one", status: "completed", title: "回答完成", detail: { delivery_mode: "provider_live", total_tokens: 42, citations: [{ citation_id: "E1", chunk_id: "chunk-1", corpus_id: "C001", title: "浏览器测试论文", official_url: "https://example.com/paper", section_id: null, page_start: 3, page_end: 4, evidence_type: "text", storage_class: "internal_research_only", excerpt: "浏览器安全证据预览", final_rank: 1 }] } },
     { ...common, event_id: 9, type: "reasoning_completed", node_id: "reasoning:main", status: "completed", title: "研究过程完成", summary: "已完成研究与整理" },
     { ...common, event_id: 10, type: "run_completed", node_id: "run:browser", status: "completed", title: "运行完成", summary: "运行完成" },
   ];
@@ -95,6 +95,15 @@ async function desktopChecks(browser, diagnostics) {
   if (await page.evaluate(() => localStorage.getItem("paper-research.pending-request.v1")) !== null) {
     throw new Error("completed cursor was not cleared");
   }
+  const citationButton = page.getByRole("button", { name: "查看引用 E1" });
+  await citationButton.click();
+  if (!(await page.locator("#evidence-dialog").evaluate((node) => node.open))) {
+    throw new Error("citation did not open the evidence dialog");
+  }
+  if (!(await page.locator("#evidence-content").innerText()).includes("浏览器测试论文")) {
+    throw new Error("citation evidence metadata was not rendered");
+  }
+  await page.locator("#evidence-close").click();
 
   const perf = await page.evaluate(() => {
     const transcript = document.createElement("div");

@@ -3,13 +3,18 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from paper_research_agent.agent.orchestrator.models import (
     ChildTaskRequest,
     ContextMessage,
 )
+from paper_research_agent.answering.models import AnswerCitation, AnswerClaim, RAGAnswer
 from paper_research_agent.conversation.store import InMemoryConversationStore
-from paper_research_agent.web.child_executors import ConversationChildExecutor
+from paper_research_agent.web.child_executors import (
+    ConversationChildExecutor,
+    RAGRuntimeChildExecutor,
+)
 from paper_research_agent.web.files import AttachmentStore
 from paper_research_agent.web.run_event_bus import RunEventBus
 
@@ -84,7 +89,99 @@ class _FakeConversationRuntime:
         yield {"type": "delta", "text": "# 修改后的内容"}
 
 
+class _FakeRAGRuntime:
+    async def ask(self, question: str, **_kwargs: object) -> object:
+        del question
+        citation = AnswerCitation(
+            citation_id="E1",
+            chunk_id="chunk-1",
+            corpus_id="C001",
+            asset_id="asset-1",
+            page_start=3,
+            page_end=4,
+            text_sha256="a" * 64,
+            evidence_type="text",
+            storage_class="internal_research_only",
+        )
+        answer = RAGAnswer(
+            status="answered",
+            answer_markdown="可验证结论 [E1]",
+            claims=(AnswerClaim(text="可验证结论", citation_ids=("E1",)),),
+            citations=(citation,),
+            requested_model="test-model",
+            actual_model="test-model",
+            prompt_version="test-v1",
+            input_tokens=10,
+            output_tokens=5,
+            latency_ms=8,
+            attempts=1,
+        )
+        return SimpleNamespace(
+            answer=answer,
+            retrieval=SimpleNamespace(
+                index_id="idx-test",
+                resolved_question="测试问题",
+                degraded=False,
+                hits=(SimpleNamespace(),),
+            ),
+            context=SimpleNamespace(
+                estimated_tokens=100,
+                token_budget=1000,
+                output_reserve_tokens=100,
+            ),
+            sources=(
+                SimpleNamespace(
+                    citation_id="E1",
+                    chunk_id="chunk-1",
+                    corpus_id="C001",
+                    title="测试论文",
+                    official_url="https://example.com/paper",
+                    section_id=None,
+                    page_start=3,
+                    page_end=4,
+                    evidence_type="text",
+                    storage_class="internal_research_only",
+                    excerpt="受控证据预览",
+                    final_rank=1,
+                ),
+            ),
+        )
+
+
 class ConversationChildExecutorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_local_rag_answer_completion_persists_safe_citations(self) -> None:
+        store = InMemoryConversationStore()
+        started = store.begin_agent_run(
+            request_id="req_child_12345678901",
+            conversation_id="conversation-1",
+            user_question="测试问题",
+        )
+        bus = RunEventBus(store)
+        executor = RAGRuntimeChildExecutor(
+            _FakeRAGRuntime(),
+            run_event_publisher=bus.publisher,
+        )
+
+        await executor.answer(
+            _request(
+                capability="local_rag",
+                rag_mode="required",
+                objective="测试问题",
+                run_id=started.run_id,
+                turn_id=started.turn_id,
+            )
+        )
+        completed = next(
+            item.to_stream_event()
+            for item in store.run_events(started.request_id)
+            if item.event_type == "answer_completed"
+        )
+
+        self.assertEqual(completed.detail.citations[0].citation_id, "E1")
+        self.assertEqual(completed.detail.citations[0].title, "测试论文")
+        self.assertEqual(completed.detail.citations[0].excerpt, "受控证据预览")
+        await bus.aclose()
+
     async def test_provider_deltas_are_persisted_before_child_returns(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = InMemoryConversationStore()

@@ -185,13 +185,14 @@ class StaticWebContractTests(unittest.TestCase):
     def test_hybrid_answer_citation_markers_open_evidence_dialog(self) -> None:
         self.assertIn("function renderTextWithCitations", self.javascript)
         self.assertIn(
-            'button.addEventListener("click", () => openEvidence(citationId))',
+            'button.addEventListener("click", () => openEvidence(citations.get(citationId)))',
             self.javascript,
         )
         self.assertIn(
-            "copy.replaceChildren(renderTextWithCitations(finalText))",
+            "citationMap(node.detail?.citations)",
             self.javascript,
         )
+        self.assertIn("else finalizeRunAnswers(runView)", self.javascript)
 
     def test_styles_cover_focus_reduced_motion_and_mobile_layout(self) -> None:
         self.assertIn(":focus-visible", self.css)

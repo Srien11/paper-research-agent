@@ -31,6 +31,7 @@ from paper_research_agent.web.events import (
     SafeRunEventDetail,
 )
 from paper_research_agent.web.files import AttachmentStore
+from paper_research_agent.web.models import SafeEvidenceSource
 from paper_research_agent.web.run_event_bus import RunEventPublisher
 
 
@@ -135,6 +136,7 @@ class RAGRuntimeChildExecutor:
             ),
         )
         if self._run_event_publisher is not None:
+            safe_sources = _answer_sources(result, answer)
             await self._run_event_publisher.publish(
                 _task_event(
                     request,
@@ -159,7 +161,7 @@ class RAGRuntimeChildExecutor:
             )
             for chunk in _text_chunks(artifact.text):
                 await answer_publisher.publish(chunk)
-            await answer_publisher.complete(artifact.metrics)
+            await answer_publisher.complete(artifact.metrics, citations=safe_sources)
         return artifact
 
 
@@ -400,7 +402,12 @@ class _TaskAnswerPublisher:
         )
         self._index += 1
 
-    async def complete(self, metrics: ChildExecutionMetrics) -> None:
+    async def complete(
+        self,
+        metrics: ChildExecutionMetrics,
+        *,
+        citations: tuple[SafeEvidenceSource, ...] = (),
+    ) -> None:
         if self._publisher is None or not self._started:
             return
         await self._publisher.publish(
@@ -416,10 +423,30 @@ class _TaskAnswerPublisher:
                     output_tokens=metrics.output_tokens,
                     total_tokens=metrics.total_tokens,
                     first_token_ms=metrics.first_token_ms,
+                    citations=citations,
                 ),
             ),
             idempotency_key=_task_event_key(self._request, "answer:completed"),
         )
+
+
+def _answer_sources(
+    result: object,
+    answer: RAGAnswer,
+) -> tuple[SafeEvidenceSource, ...]:
+    sources = tuple(
+        SafeEvidenceSource.model_validate(item)
+        for item in tuple(_value(result, "sources", ()))
+    )
+    by_citation_id = {item.citation_id: item for item in sources}
+    missing = [
+        citation.citation_id
+        for citation in answer.citations
+        if citation.citation_id not in by_citation_id
+    ]
+    if missing:
+        raise RuntimeError(f"answer citations are missing safe source metadata: {missing}")
+    return tuple(by_citation_id[item.citation_id] for item in answer.citations)
 
 
 def _task_event(

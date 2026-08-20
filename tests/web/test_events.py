@@ -15,10 +15,38 @@ from paper_research_agent.web.events import (
     AgentStreamEvent,
     SafeRunEventDetail,
 )
-from paper_research_agent.web.models import AgentRunRequest
+from paper_research_agent.web.models import AgentRunRequest, SafeEvidenceSource
 
 
 class AgentEventContractTests(unittest.TestCase):
+    def test_answer_event_accepts_only_safe_citation_projection(self) -> None:
+        citation = SafeEvidenceSource(
+            citation_id="E1",
+            chunk_id="chunk-1",
+            corpus_id="C001",
+            title="测试论文",
+            official_url="https://example.com/paper",
+            page_start=3,
+            page_end=4,
+            evidence_type="text",
+            storage_class="internal_research_only",
+            excerpt="受控长度的证据预览",
+            final_rank=1,
+        )
+
+        detail = SafeRunEventDetail(citations=(citation,))
+
+        self.assertEqual(detail.citations[0].citation_id, "E1")
+        with self.assertRaises(ValidationError):
+            SafeRunEventDetail(
+                citations=(
+                    {
+                        **citation.model_dump(),
+                        "local_path": "D:/private/paper.pdf",
+                    },
+                )
+            )
+
     def test_v2_event_requires_stable_identity_and_safe_detail(self) -> None:
         event = AgentStreamEvent(
             event_id=1,

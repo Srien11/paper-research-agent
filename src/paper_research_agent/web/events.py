@@ -12,7 +12,11 @@ from paper_research_agent.agent.orchestrator.models import (
     ChildTaskResult,
     MainAgentResult,
 )
-from paper_research_agent.web.models import SafePendingToolApproval, WebModel
+from paper_research_agent.web.models import (
+    SafeEvidenceSource,
+    SafePendingToolApproval,
+    WebModel,
+)
 
 LegacyAgentStreamEventType = Literal[
     "run_started",
@@ -114,6 +118,7 @@ class SafeRunEventDetail(WebModel):
     total_tokens: int | None = Field(default=None, ge=0)
     first_token_ms: int | None = Field(default=None, ge=0)
     browser_first_answer_byte_ms: int | None = Field(default=None, ge=0)
+    citations: tuple[SafeEvidenceSource, ...] = Field(default=(), max_length=100)
 
 
 class AgentStreamEventDraft(WebModel):

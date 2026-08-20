@@ -38,8 +38,8 @@ const historyEvents = [
   event(3, "answer_delta", { node_id: "answer:main", delta: "前半段", detail: { delivery_mode: "provider_live" } }),
 ];
 const resumedEvents = [
-  event(4, "answer_delta", { node_id: "answer:main", delta: "与后半段", detail: { delivery_mode: "provider_live" } }),
-  event(5, "answer_completed", { node_id: "answer:main", status: "completed", title: "回答完成", detail: { delivery_mode: "provider_live" } }),
+  event(4, "answer_delta", { node_id: "answer:main", delta: "与后半段 [E1]", detail: { delivery_mode: "provider_live" } }),
+  event(5, "answer_completed", { node_id: "answer:main", status: "completed", title: "回答完成", detail: { delivery_mode: "provider_live", citations: [{ citation_id: "E1", chunk_id: "chunk-history", corpus_id: "C001", title: "历史引用论文", official_url: "https://example.com/history", section_id: null, page_start: 7, page_end: 7, evidence_type: "text", storage_class: "redistributable", excerpt: "历史安全证据预览", final_rank: 1 }] } }),
   event(6, "run_completed", { status: "completed", title: "运行完成", summary: "运行完成" }),
 ];
 
@@ -109,7 +109,12 @@ async function main() {
     await page.locator(".run-node-turn-tail").waitFor();
 
     const answer = await page.locator(".run-answer-copy").innerText();
-    if (answer !== "前半段与后半段") throw new Error(`reconnected answer is incomplete: ${answer}`);
+    if (answer !== "前半段与后半段 [E1]") throw new Error(`reconnected answer is incomplete: ${answer}`);
+    await page.getByRole("button", { name: "查看引用 E1" }).click();
+    if (!(await page.locator("#evidence-content").innerText()).includes("历史引用论文")) {
+      throw new Error("historical citation metadata was not restored");
+    }
+    await page.locator("#evidence-close").click();
     if (requests.getEvents.length !== 1 || requests.getEvents[0] !== 3) {
       throw new Error(`unexpected reconnect cursor: ${JSON.stringify(requests.getEvents)}`);
     }
