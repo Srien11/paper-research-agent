@@ -145,6 +145,18 @@ async function desktopChecks(browser, diagnostics) {
   const inspectorToggle = page.getByRole("button", { name: "详情", exact: true });
   await inspectorToggle.focus();
   await inspectorToggle.click();
+  if (!(await page.locator("#inspector").evaluate((node) => node.classList.contains("is-open")))) {
+    throw new Error("inspector did not open from the details toggle");
+  }
+  const inspectorClose = page.locator("#inspector-close");
+  if (!(await inspectorClose.isVisible())) {
+    throw new Error("desktop inspector close button is not visible");
+  }
+  await inspectorClose.click();
+  if (await page.locator("#inspector").evaluate((node) => node.classList.contains("is-open"))) {
+    throw new Error("desktop inspector close button did not close the drawer");
+  }
+  await inspectorToggle.click();
   await page.keyboard.press("Escape");
   if (!(await inspectorToggle.evaluate((node) => node === document.activeElement))) {
     throw new Error("inspector focus was not restored");

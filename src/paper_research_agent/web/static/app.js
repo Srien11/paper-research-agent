@@ -1512,6 +1512,14 @@ function openInspector() {
   elements.inspectorClose.focus();
 }
 
+function toggleInspector() {
+  if (elements.inspector.classList.contains("is-open")) {
+    closeInspector();
+  } else {
+    openInspector();
+  }
+}
+
 function closeInspector() {
   const wasOpen = elements.inspector.classList.contains("is-open");
   elements.inspector.classList.remove("is-open");
@@ -2033,7 +2041,7 @@ elements.question.addEventListener("keydown", (event) => {
     elements.askForm.requestSubmit();
   }
 });
-elements.inspectorToggle.addEventListener("click", openInspector);
+elements.inspectorToggle.addEventListener("click", toggleInspector);
 elements.inspectorClose.addEventListener("click", closeInspector);
 elements.inspectorScrim.addEventListener("click", closeInspector);
 document.addEventListener("keydown", handleInspectorKeyboard);

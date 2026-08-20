@@ -237,6 +237,14 @@ class RouteTaskTests(unittest.TestCase):
         decision = route_task(task, _envelope())
         self.assertEqual(decision.capability, "direct_chat")
 
+    def test_required_mode_forces_direct_chat_plan_to_local_rag(self) -> None:
+        task = _task(task_id="chat", capability="direct_chat")
+
+        decision = route_task(task, _envelope(rag_mode="required"))
+
+        self.assertEqual(decision.capability, "local_rag")
+        self.assertIn("required", decision.reason)
+
     def test_single_task_single_capability(self) -> None:
         task = _task(task_id="one", capability="direct_chat")
         decision = route_task(task, _envelope())

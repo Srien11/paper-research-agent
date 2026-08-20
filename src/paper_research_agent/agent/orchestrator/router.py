@@ -101,4 +101,9 @@ def route_task(
                 reason="本地多论文比较由固定检索图执行",
             )
         return RouteDecision(capability="dynamic_tools", reason="需要最新信息或非论文工具")
+    if capability == "direct_chat" and rag_mode == "required":
+        return RouteDecision(
+            capability="local_rag",
+            reason="required 模式必须使用本地论文证据",
+        )
     return RouteDecision(capability="direct_chat", reason="任务不需要外部事实")

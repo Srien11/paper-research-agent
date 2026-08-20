@@ -446,6 +446,23 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(dispatcher.calls[0].capability, "local_rag")
 
+    async def test_required_mode_dispatches_direct_chat_plan_to_local_rag(self) -> None:
+        plan = _plan_decision((_task(task_id="chat", capability="direct_chat"),))
+        graph, _store, dispatcher, _planner = self._build(
+            plan_decisions=(plan,),
+            dispatch_results=(_result(task_id="chat", source_id="chunk-1"),),
+        )
+        request = MainAgentRequest(
+            request_id="request-required-direct",
+            conversation_id="conversation-1",
+            message="只依据本地论文回答",
+            rag_mode="required",
+        )
+
+        await self._run(graph, request)
+
+        self.assertEqual(dispatcher.calls[0].capability, "local_rag")
+
     async def test_disabled_mode_never_dispatches_local_rag(self) -> None:
         plan = _plan_decision((_task(task_id="local", capability="local_rag"),))
         graph, store, dispatcher, _planner = self._build(

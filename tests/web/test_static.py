@@ -204,6 +204,14 @@ class StaticWebContractTests(unittest.TestCase):
         self.assertIn(".library-panel.is-open", self.css)
         self.assertIn("handleNavigationKeyboard", self.javascript)
         self.assertIn("handleInspectorKeyboard", self.javascript)
+        self.assertIn("function toggleInspector()", self.javascript)
+        self.assertIn(
+            'elements.inspectorToggle.addEventListener("click", toggleInspector)',
+            self.javascript,
+        )
+        self.assertNotIn(
+            'id="inspector-close" class="icon-button mobile-only"', self.html
+        )
         self.assertIn("run-node-turn-tail", self.javascript + self.css)
         self.assertIn('rows="1"', self.html)
 
