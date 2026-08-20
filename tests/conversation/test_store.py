@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from pathlib import Path
 
 from paper_research_agent.agent.orchestrator.artifacts import DynamicToolArtifact
@@ -17,9 +19,114 @@ from paper_research_agent.conversation.store import (
     InMemoryConversationStore,
     SQLiteConversationStore,
 )
+from paper_research_agent.web.events import AgentStreamEventDraft
 
 
 class ConversationStoreTests(unittest.TestCase):
+    def test_concurrent_run_event_appends_allocate_each_id_once(self) -> None:
+        stores = [InMemoryConversationStore()]
+        with tempfile.TemporaryDirectory() as directory:
+            stores.append(SQLiteConversationStore(Path(directory) / "concurrent-events.sqlite3"))
+            for store in stores:
+                with self.subTest(store=type(store).__name__):
+                    started = store.begin_agent_run(
+                        request_id="req_concurrent_123456",
+                        conversation_id="conversation-events",
+                        user_question="stream concurrently",
+                    )
+
+                    def append(index: int, target=store, start=started) -> int:
+                        persisted = target.append_run_event(
+                            AgentStreamEventDraft(
+                                type="reasoning_summary",
+                                occurred_at=datetime.now(UTC),
+                                request_id=start.request_id,
+                                run_id=start.run_id,
+                                turn_id=start.turn_id,
+                                node_id="reasoning:main",
+                                summary=f"阶段 {index}",
+                            ),
+                            idempotency_key=f"summary-{index}",
+                        )
+                        return persisted.event_id
+
+                    with ThreadPoolExecutor(max_workers=8) as pool:
+                        allocated = tuple(pool.map(append, range(20)))
+
+                    self.assertEqual(sorted(allocated), list(range(1, 21)))
+
+    def test_run_events_are_monotonic_idempotent_and_resume_after_segment_boundary(self) -> None:
+        stores = [InMemoryConversationStore()]
+        with tempfile.TemporaryDirectory() as directory:
+            stores.append(SQLiteConversationStore(Path(directory) / "events.sqlite3"))
+            for store in stores:
+                with self.subTest(store=type(store).__name__):
+                    started = store.begin_agent_run(
+                        request_id="req_1234567890123456",
+                        conversation_id="conversation-events",
+                        user_question="stream it",
+                    )
+
+                    def draft(event_type: str, *, status: str | None = None, start=started):
+                        return AgentStreamEventDraft(
+                            type=event_type,
+                            occurred_at=datetime.now(UTC),
+                            request_id=start.request_id,
+                            run_id=start.run_id,
+                            turn_id=start.turn_id,
+                            node_id=f"run:{start.run_id}",
+                            status=status,
+                        )
+
+                    first = store.append_run_event(
+                        draft("run_started"), idempotency_key="run-started"
+                    )
+                    duplicate = store.append_run_event(
+                        draft("run_started"), idempotency_key="run-started"
+                    )
+                    paused = store.append_run_event(
+                        draft("run_paused", status="paused"),
+                        idempotency_key="pause-1",
+                    )
+                    resumed = store.append_run_event(
+                        draft("run_resumed", status="running"),
+                        idempotency_key="resume-1",
+                    )
+                    completed = store.append_run_event(
+                        draft("run_completed", status="completed"),
+                        idempotency_key="completed",
+                    )
+
+                    self.assertEqual(first.event_id, 1)
+                    self.assertEqual(duplicate.event_id, 1)
+                    self.assertEqual(
+                        [item.event_id for item in store.run_events(started.request_id)],
+                        [1, 2, 3, 4],
+                    )
+                    self.assertEqual(paused.to_stream_event().status, "paused")
+                    self.assertEqual(resumed.event_id, 3)
+                    self.assertEqual(completed.event_id, 4)
+                    self.assertEqual(
+                        [item.event_id for item in store.run_events(started.request_id, after_event_id=2)],
+                        [3, 4],
+                    )
+                    self.assertEqual(len(store.turn_events(started.turn_id)), 4)
+                    dialogue = store.conversation(started.conversation_id)
+                    self.assertIsNotNone(dialogue)
+                    assert dialogue is not None
+                    assistant = next(
+                        item for item in dialogue.messages if item.role == "assistant"
+                    )
+                    self.assertEqual(assistant.turn_id, started.turn_id)
+                    self.assertEqual(assistant.request_id, started.request_id)
+                    self.assertEqual(assistant.run_id, started.run_id)
+                    self.assertEqual(len(assistant.events), 4)
+                    with self.assertRaisesRegex(RuntimeError, "terminal"):
+                        store.append_run_event(
+                            draft("reasoning_started"),
+                            idempotency_key="too-late",
+                        )
+
     def test_conversation_archive_includes_pending_question_and_full_answer(self) -> None:
         stores = [InMemoryConversationStore()]
         with tempfile.TemporaryDirectory() as directory:

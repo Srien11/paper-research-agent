@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+if TYPE_CHECKING:
+    from paper_research_agent.web.events import AgentStreamEvent
 
 ConversationStatus = Literal[
     "pending",
@@ -61,6 +64,30 @@ class PersistedConversationMessage(FrozenConversationModel):
     text: str = Field(min_length=1, max_length=20_000)
     status: str = Field(min_length=1, max_length=64)
     created_at: datetime
+    turn_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+    request_id: str | None = Field(default=None, max_length=256)
+    run_id: str | None = Field(default=None, max_length=256)
+    events: tuple[dict[str, object], ...] = Field(default=(), max_length=10_000)
+
+
+class PersistedRunEvent(FrozenConversationModel):
+    """One durable, owner-scoped product event for a main-Agent run."""
+
+    run_id: str = Field(min_length=1, max_length=256)
+    event_id: int = Field(ge=1)
+    request_id: str = Field(pattern=r"^[A-Za-z0-9_-]{16,128}$")
+    conversation_id: str = Field(min_length=1, max_length=256)
+    turn_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    event_json: str = Field(min_length=2, max_length=20_000)
+    event_type: str = Field(min_length=1, max_length=64)
+    node_id: str = Field(min_length=1, max_length=256)
+    occurred_at: datetime
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=256)
+
+    def to_stream_event(self) -> AgentStreamEvent:
+        from paper_research_agent.web.events import AgentStreamEvent
+
+        return AgentStreamEvent.model_validate_json(self.event_json)
 
 
 class PersistedConversation(FrozenConversationModel):

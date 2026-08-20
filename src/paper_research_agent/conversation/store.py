@@ -42,6 +42,12 @@ from paper_research_agent.conversation.models import (
     ConversationTurn,
     PersistedConversation,
     PersistedConversationMessage,
+    PersistedRunEvent,
+)
+from paper_research_agent.web.events import AgentStreamEvent, AgentStreamEventDraft
+
+_TERMINAL_RUN_EVENT_TYPES = frozenset(
+    {"run_completed", "run_failed", "run_cancelled", "run_conflict"}
 )
 
 
@@ -91,6 +97,21 @@ class ConversationStore(Protocol):
         user_question: str,
         request: MainAgentRequest | None = None,
     ) -> AgentRunStart: ...
+
+    def append_run_event(
+        self,
+        event: AgentStreamEventDraft,
+        *,
+        idempotency_key: str | None = None,
+    ) -> PersistedRunEvent: ...
+
+    def run_events(
+        self, request_id: str, *, after_event_id: int = 0, limit: int = 2_000
+    ) -> tuple[PersistedRunEvent, ...]: ...
+
+    def turn_events(
+        self, turn_id: str, *, after_event_id: int = 0, limit: int = 2_000
+    ) -> tuple[PersistedRunEvent, ...]: ...
 
     def load_workspace(self, conversation_id: str) -> ConversationWorkspace: ...
 
@@ -353,6 +374,106 @@ class SQLiteConversationStore:
             workspace=workspace,
             outcome="created",
         )
+
+    def append_run_event(
+        self,
+        event: AgentStreamEventDraft,
+        *,
+        idempotency_key: str | None = None,
+    ) -> PersistedRunEvent:
+        key = _idempotency_key(idempotency_key)
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            run = connection.execute(
+                "SELECT request_id, conversation_id, turn_id FROM main_agent_runs WHERE run_id = ?",
+                (event.run_id,),
+            ).fetchone()
+            if run is None:
+                connection.rollback()
+                raise ValueError("run event references an unknown run")
+            if str(run[0]) != event.request_id or str(run[2]) != event.turn_id:
+                connection.rollback()
+                raise ValueError("run event identity does not match the durable run")
+            if key is not None:
+                existing = connection.execute(
+                    """SELECT run_id, event_id, request_id, conversation_id, turn_id,
+                              event_json, event_type, node_id, occurred_at, idempotency_key
+                       FROM main_agent_run_events
+                       WHERE run_id = ? AND idempotency_key = ?""",
+                    (event.run_id, key),
+                ).fetchone()
+                if existing is not None:
+                    connection.commit()
+                    return _persisted_run_event(existing)
+            terminal = connection.execute(
+                """SELECT 1 FROM main_agent_run_events
+                   WHERE run_id = ? AND event_type IN ('run_completed', 'run_failed', 'run_cancelled', 'run_conflict')
+                   LIMIT 1""",
+                (event.run_id,),
+            ).fetchone()
+            if terminal is not None:
+                connection.rollback()
+                raise RuntimeError("cannot append after a terminal run event")
+            event_id = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(event_id), 0) + 1 FROM main_agent_run_events WHERE run_id = ?",
+                    (event.run_id,),
+                ).fetchone()[0]
+            )
+            durable = event.with_event_id(event_id)
+            row = (
+                durable.run_id,
+                durable.event_id,
+                durable.request_id,
+                str(run[1]),
+                durable.turn_id,
+                durable.model_dump_json(exclude_none=True),
+                durable.type,
+                durable.node_id,
+                durable.occurred_at.isoformat(),
+                key,
+            )
+            connection.execute(
+                """INSERT INTO main_agent_run_events (
+                       run_id, event_id, request_id, conversation_id, turn_id,
+                       event_json, event_type, node_id, occurred_at, idempotency_key
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                row,
+            )
+            connection.commit()
+            return _persisted_run_event(row)
+
+    def run_events(
+        self, request_id: str, *, after_event_id: int = 0, limit: int = 2_000
+    ) -> tuple[PersistedRunEvent, ...]:
+        normalized = _request_id(request_id)
+        after, bounded = _event_page(after_event_id, limit)
+        with self._lock, closing(self._connect()) as connection:
+            rows = connection.execute(
+                """SELECT run_id, event_id, request_id, conversation_id, turn_id,
+                          event_json, event_type, node_id, occurred_at, idempotency_key
+                   FROM main_agent_run_events
+                   WHERE request_id = ? AND event_id > ?
+                   ORDER BY event_id LIMIT ?""",
+                (normalized, after, bounded),
+            ).fetchall()
+        return tuple(_persisted_run_event(row) for row in rows)
+
+    def turn_events(
+        self, turn_id: str, *, after_event_id: int = 0, limit: int = 2_000
+    ) -> tuple[PersistedRunEvent, ...]:
+        normalized = _turn_id(turn_id)
+        after, bounded = _event_page(after_event_id, limit)
+        with self._lock, closing(self._connect()) as connection:
+            rows = connection.execute(
+                """SELECT run_id, event_id, request_id, conversation_id, turn_id,
+                          event_json, event_type, node_id, occurred_at, idempotency_key
+                   FROM main_agent_run_events
+                   WHERE turn_id = ? AND event_id > ?
+                   ORDER BY event_id LIMIT ?""",
+                (normalized, after, bounded),
+            ).fetchall()
+        return tuple(_persisted_run_event(row) for row in rows)
 
     def load_workspace(self, conversation_id: str) -> ConversationWorkspace:
         normalized = _conversation_id(conversation_id)
@@ -864,19 +985,43 @@ class SQLiteConversationStore:
                 updated_at=datetime.fromisoformat(str(summary[2])),
                 messages=(),
             )
-        rows = connection.execute(
+        base_rows = connection.execute(
             "SELECT t.user_question, t.status, t.assistant_summary, "
-            "t.created_at, t.completed_at, r.result_json "
+            "t.created_at, t.completed_at, r.result_json, t.turn_id, "
+            "r.request_id, r.run_id "
             "FROM conversation_turns AS t "
             "LEFT JOIN main_agent_runs AS r ON r.turn_id = t.turn_id "
             "WHERE t.conversation_id = ? ORDER BY t.sequence",
             (conversation_id,),
         ).fetchall()
+        rows = [
+            (
+                *row,
+                tuple(
+                    str(event[0])
+                    for event in connection.execute(
+                        "SELECT event_json FROM main_agent_run_events "
+                        "WHERE turn_id = ? ORDER BY event_id",
+                        (str(row[6]),),
+                    ).fetchall()
+                ),
+            )
+            for row in base_rows
+        ]
         return _persisted_dialogue(conversation_id, rows)
 
     def clear(self, conversation_id: str) -> int:
         normalized = _conversation_id(conversation_id)
         with self._lock, closing(self._connect()) as connection, connection:
+            connection.execute(
+                "DELETE FROM main_agent_run_events WHERE conversation_id = ?", (normalized,)
+            )
+            connection.execute(
+                "DELETE FROM main_agent_controls WHERE conversation_id = ?", (normalized,)
+            )
+            connection.execute(
+                "DELETE FROM main_agent_runs WHERE conversation_id = ?", (normalized,)
+            )
             cursor = connection.execute(
                 "DELETE FROM conversation_turns WHERE conversation_id = ?", (normalized,)
             )
@@ -885,12 +1030,6 @@ class SQLiteConversationStore:
             )
             connection.execute(
                 "DELETE FROM conversation_workspaces WHERE conversation_id = ?", (normalized,)
-            )
-            connection.execute(
-                "DELETE FROM main_agent_controls WHERE conversation_id = ?", (normalized,)
-            )
-            connection.execute(
-                "DELETE FROM main_agent_runs WHERE conversation_id = ?", (normalized,)
             )
         return int(cursor.rowcount)
 
@@ -1014,6 +1153,25 @@ class SQLiteConversationStore:
                 );
                 CREATE INDEX IF NOT EXISTS main_agent_runs_conversation_idx
                     ON main_agent_runs(conversation_id, created_at DESC);
+                CREATE TABLE IF NOT EXISTS main_agent_run_events (
+                    run_id TEXT NOT NULL,
+                    event_id INTEGER NOT NULL,
+                    request_id TEXT NOT NULL,
+                    conversation_id TEXT NOT NULL,
+                    turn_id TEXT NOT NULL,
+                    event_json TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    node_id TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    idempotency_key TEXT,
+                    PRIMARY KEY (run_id, event_id),
+                    UNIQUE (run_id, idempotency_key),
+                    FOREIGN KEY (run_id) REFERENCES main_agent_runs(run_id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS main_agent_run_events_request_idx
+                    ON main_agent_run_events(request_id, event_id);
+                CREATE INDEX IF NOT EXISTS main_agent_run_events_turn_idx
+                    ON main_agent_run_events(turn_id, event_id);
                 CREATE TABLE IF NOT EXISTS main_agent_controls (
                     request_id TEXT PRIMARY KEY,
                     run_id TEXT NOT NULL UNIQUE,
@@ -1049,6 +1207,7 @@ class SQLiteConversationStore:
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=5.0)
+        connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("PRAGMA busy_timeout = 5000")
         connection.execute("PRAGMA secure_delete = ON")
@@ -1110,6 +1269,8 @@ class InMemoryConversationStore:
         self._workspaces: dict[str, ConversationWorkspace] = {}
         self._runs: dict[str, _AgentRunRecord] = {}
         self._controls: dict[str, AgentRunControl] = {}
+        self._run_events: dict[str, list[PersistedRunEvent]] = {}
+        self._run_event_keys: dict[tuple[str, str], PersistedRunEvent] = {}
 
     def begin_turn(self, conversation_id: str, user_question: str) -> ConversationTurn:
         normalized_id = _conversation_id(conversation_id)
@@ -1257,6 +1418,70 @@ class InMemoryConversationStore:
             workspace=workspace,
             outcome="created",
         )
+
+    def append_run_event(
+        self,
+        event: AgentStreamEventDraft,
+        *,
+        idempotency_key: str | None = None,
+    ) -> PersistedRunEvent:
+        key = _idempotency_key(idempotency_key)
+        with self._lock:
+            run = self._runs.get(event.request_id)
+            if run is None:
+                raise ValueError("run event references an unknown run")
+            if run.run_id != event.run_id or run.turn_id != event.turn_id:
+                raise ValueError("run event identity does not match the durable run")
+            if key is not None:
+                existing = self._run_event_keys.get((event.run_id, key))
+                if existing is not None:
+                    return existing
+            values = self._run_events.setdefault(event.request_id, [])
+            if any(item.event_type in _TERMINAL_RUN_EVENT_TYPES for item in values):
+                raise RuntimeError("cannot append after a terminal run event")
+            durable_event = event.with_event_id(len(values) + 1)
+            persisted = PersistedRunEvent(
+                run_id=event.run_id,
+                event_id=durable_event.event_id,
+                request_id=event.request_id,
+                conversation_id=run.conversation_id,
+                turn_id=event.turn_id,
+                event_json=durable_event.model_dump_json(exclude_none=True),
+                event_type=event.type,
+                node_id=event.node_id,
+                occurred_at=event.occurred_at,
+                idempotency_key=key,
+            )
+            values.append(persisted)
+            if key is not None:
+                self._run_event_keys[(event.run_id, key)] = persisted
+            return persisted
+
+    def run_events(
+        self, request_id: str, *, after_event_id: int = 0, limit: int = 2_000
+    ) -> tuple[PersistedRunEvent, ...]:
+        normalized = _request_id(request_id)
+        after, bounded = _event_page(after_event_id, limit)
+        with self._lock:
+            return tuple(
+                item
+                for item in self._run_events.get(normalized, ())
+                if item.event_id > after
+            )[:bounded]
+
+    def turn_events(
+        self, turn_id: str, *, after_event_id: int = 0, limit: int = 2_000
+    ) -> tuple[PersistedRunEvent, ...]:
+        normalized = _turn_id(turn_id)
+        after, bounded = _event_page(after_event_id, limit)
+        with self._lock:
+            values = (
+                item
+                for events in self._run_events.values()
+                for item in events
+                if item.turn_id == normalized and item.event_id > after
+            )
+            return tuple(sorted(values, key=lambda item: item.event_id))[:bounded]
 
     def load_workspace(self, conversation_id: str) -> ConversationWorkspace:
         normalized = _conversation_id(conversation_id)
@@ -1572,13 +1797,19 @@ class InMemoryConversationStore:
             raise ValueError("conversation list limit must be between 1 and 500")
         with self._lock:
             turns = tuple(self._turns.values())
-            runs_by_turn = {
-                record.turn_id: record.result.model_dump_json()
-                for record in self._runs.values()
-                if record.result is not None
+            runs_by_turn = {record.turn_id: record for record in self._runs.values()}
+            events_by_turn = {
+                turn_id: tuple(
+                    event.event_json
+                    for values in self._run_events.values()
+                    for event in values
+                    if event.turn_id == turn_id
+                )
+                for turn_id in {item.turn_id for item in self._runs.values()}
             }
         grouped: dict[str, list[tuple[object, ...]]] = {}
         for turn in sorted(turns, key=lambda item: item.sequence):
+            record = runs_by_turn.get(turn.turn_id)
             grouped.setdefault(turn.conversation_id, []).append(
                 (
                     turn.user_question,
@@ -1586,7 +1817,13 @@ class InMemoryConversationStore:
                     turn.assistant_summary,
                     turn.created_at.isoformat(),
                     turn.completed_at.isoformat() if turn.completed_at else None,
-                    runs_by_turn.get(turn.turn_id),
+                    record.result.model_dump_json()
+                    if record is not None and record.result is not None
+                    else None,
+                    turn.turn_id,
+                    record.request_id if record is not None else None,
+                    record.run_id if record is not None else None,
+                    events_by_turn.get(turn.turn_id, ()),
                 )
             )
         dialogues = tuple(
@@ -1628,8 +1865,16 @@ class InMemoryConversationStore:
                 for run_request, record in self._runs.items()
                 if record.conversation_id == normalized
             ]:
-                self._runs.pop(request_id, None)
+                record = self._runs.pop(request_id, None)
                 self._controls.pop(request_id, None)
+                self._run_events.pop(request_id, None)
+                if record is not None:
+                    for event_key in [
+                        item
+                        for item in self._run_event_keys
+                        if item[0] == record.run_id
+                    ]:
+                        self._run_event_keys.pop(event_key, None)
         return len(targets)
 
     def agent_checkpoint_threads(
@@ -1694,24 +1939,37 @@ def _persisted_dialogue(
             updated_at = turn_updated
         if not title:
             title = question[:200]
+        turn_id = str(row[6]) if len(row) > 6 and row[6] is not None else None
+        request_id = str(row[7]) if len(row) > 7 and row[7] is not None else None
+        run_id = str(row[8]) if len(row) > 8 and row[8] is not None else None
+        events = _safe_event_payloads(row[9] if len(row) > 9 else ())
         messages.append(
             PersistedConversationMessage(
                 role="user",
                 text=question,
                 status="sent" if status != "pending" else "pending",
                 created_at=turn_created,
+                turn_id=turn_id,
             )
         )
         answer = _persisted_answer(row[5]) or (
             str(row[2]).strip() if row[2] is not None else ""
-        )
-        if answer:
+        ) or "".join(
+            str(item.get("delta", ""))
+            for item in events
+            if item.get("type") == "answer_delta"
+        ).strip()
+        if answer or events:
             messages.append(
                 PersistedConversationMessage(
                     role="assistant",
-                    text=answer[:20_000],
+                    text=(answer or "运行轨迹已保存。")[:20_000],
                     status=status,
                     created_at=turn_updated,
+                    turn_id=turn_id,
+                    request_id=request_id,
+                    run_id=run_id,
+                    events=events,
                 )
             )
     if not messages or created_at is None or updated_at is None:
@@ -1735,6 +1993,37 @@ def _persisted_answer(result_json: object) -> str:
     return result.answer.strip()
 
 
+def _safe_event_payloads(value: object) -> tuple[dict[str, object], ...]:
+    if not isinstance(value, (tuple, list)):
+        return ()
+    payloads: list[dict[str, object]] = []
+    for raw in value:
+        try:
+            parsed = json.loads(str(raw))
+            if not isinstance(parsed, dict):
+                continue
+            event = AgentStreamEvent.model_validate(parsed)
+            payloads.append(event.model_dump(mode="json", exclude_none=True))
+        except (TypeError, ValueError):
+            continue
+    return tuple(payloads)
+
+
+def _persisted_run_event(row: Sequence[object]) -> PersistedRunEvent:
+    return PersistedRunEvent(
+        run_id=str(row[0]),
+        event_id=int(str(row[1])),
+        request_id=str(row[2]),
+        conversation_id=str(row[3]),
+        turn_id=str(row[4]),
+        event_json=str(row[5]),
+        event_type=str(row[6]),
+        node_id=str(row[7]),
+        occurred_at=datetime.fromisoformat(str(row[8])),
+        idempotency_key=str(row[9]) if row[9] is not None else None,
+    )
+
+
 def _conversation_id(value: str) -> str:
     normalized = value.strip()
     if not normalized or len(normalized) > 256 or any(char.isspace() for char in normalized):
@@ -1747,6 +2036,30 @@ def _request_id(value: str) -> str:
     if not normalized or len(normalized) > 256 or any(char.isspace() for char in normalized):
         raise ValueError("request_id is invalid")
     return normalized
+
+
+def _turn_id(value: str) -> str:
+    normalized = value.strip()
+    if not re.fullmatch(r"[0-9a-f]{32}", normalized):
+        raise ValueError("turn_id is invalid")
+    return normalized
+
+
+def _idempotency_key(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    if not normalized or len(normalized) > 256 or any(char.isspace() for char in normalized):
+        raise ValueError("idempotency_key is invalid")
+    return normalized
+
+
+def _event_page(after_event_id: int, limit: int) -> tuple[int, int]:
+    if after_event_id < 0:
+        raise ValueError("after_event_id must be non-negative")
+    if limit < 1 or limit > 10_000:
+        raise ValueError("event limit must be between 1 and 10000")
+    return after_event_id, limit
 
 
 def _control_lookup(

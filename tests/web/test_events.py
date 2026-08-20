@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from datetime import UTC, datetime
 
 from pydantic import ValidationError
 
@@ -9,11 +10,88 @@ from paper_research_agent.agent.orchestrator.artifacts import (
     ChildExecutionMetrics,
 )
 from paper_research_agent.agent.orchestrator.models import ChildTaskResult, MainAgentResult
-from paper_research_agent.web.events import AgentEventProjector
+from paper_research_agent.web.events import (
+    AgentEventProjector,
+    AgentStreamEvent,
+    SafeRunEventDetail,
+)
 from paper_research_agent.web.models import AgentRunRequest
 
 
 class AgentEventContractTests(unittest.TestCase):
+    def test_v2_event_requires_stable_identity_and_safe_detail(self) -> None:
+        event = AgentStreamEvent(
+            event_id=1,
+            type="tool_started",
+            occurred_at=datetime.now(UTC),
+            request_id="req_1234567890123456",
+            run_id="run-1",
+            turn_id="a" * 32,
+            node_id="tool:task-1:search-corpus:1",
+            parent_node_id="task:task-1",
+            task_id="task-1",
+            status="running",
+            title="检索本地论文",
+            summary="正在检索",
+            detail=SafeRunEventDetail(
+                tool_name="search_corpus",
+                capability="local_rag",
+            ),
+        )
+
+        self.assertEqual(event.schema_version, "main-agent-stream-v2")
+        self.assertEqual(event.detail.tool_name, "search_corpus")
+        with self.assertRaises(ValidationError):
+            SafeRunEventDetail(tool_name="search_corpus", arguments={"secret": "x"})
+
+    def test_only_answer_delta_may_contain_delta(self) -> None:
+        common = {
+            "event_id": 1,
+            "occurred_at": datetime.now(UTC),
+            "request_id": "req_1234567890123456",
+            "run_id": "run-1",
+            "turn_id": "a" * 32,
+            "node_id": "answer:main",
+        }
+        event = AgentStreamEvent(type="answer_delta", delta="一段回答", **common)
+        self.assertEqual(event.delta, "一段回答")
+        with self.assertRaises(ValidationError):
+            AgentStreamEvent(type="reasoning_summary", delta="隐藏推理", **common)
+        with self.assertRaises(ValidationError):
+            AgentStreamEvent(type="answer_delta", **common)
+
+    def test_pause_and_approval_are_nonterminal_stream_boundaries(self) -> None:
+        common = {
+            "occurred_at": datetime.now(UTC),
+            "request_id": "req_1234567890123456",
+            "run_id": "run-1",
+            "turn_id": "a" * 32,
+            "node_id": "run:run-1",
+        }
+        paused = AgentStreamEvent(
+            event_id=1,
+            type="run_paused",
+            status="paused",
+            **common,
+        )
+        approval = AgentStreamEvent(
+            event_id=2,
+            type="run_waiting_approval",
+            status="waiting_approval",
+            **common,
+        )
+        completed = AgentStreamEvent(
+            event_id=3,
+            type="run_completed",
+            status="completed",
+            **common,
+        )
+
+        self.assertTrue(paused.closes_delivery_segment)
+        self.assertTrue(approval.closes_delivery_segment)
+        self.assertFalse(paused.is_terminal)
+        self.assertTrue(completed.is_terminal)
+
     def test_agent_run_request_requires_client_request_id(self) -> None:
         with self.assertRaises(ValidationError):
             AgentRunRequest(message="hello", rag_mode="disabled")
