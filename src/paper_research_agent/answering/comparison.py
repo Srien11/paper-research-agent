@@ -278,18 +278,13 @@ def _render_claims(
     ordered_fact_ids: Mapping[str, tuple[str, ...]],
 ) -> tuple[AnswerClaim, ...]:
     fact_by_id = {item.fact_id: item for item in request.facts}
-    target_by_id = {item.target_id: item for item in request.targets}
-    dimension_by_id = {item.dimension_id: item for item in request.dimensions}
     claims: list[AnswerClaim] = []
     for dimension in request.dimensions:
         for fact_id in ordered_fact_ids[dimension.dimension_id]:
             fact = fact_by_id[fact_id]
             claims.append(
                 AnswerClaim(
-                    text=(
-                        f"{dimension_by_id[fact.dimension_id].label}｜"
-                        f"{target_by_id[fact.target_id].label}：{fact.statement}"
-                    ),
+                    text=fact.statement,
                     citation_ids=fact.citation_ids,
                     fact_ids=(fact.fact_id,),
                 )

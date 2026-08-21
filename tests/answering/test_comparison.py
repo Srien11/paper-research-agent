@@ -160,6 +160,10 @@ class ComparisonAnswerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("使用方法 B。[E2]", result.answer_markdown)
         self.assertNotIn("draft A", result.answer_markdown)
         self.assertEqual(
+            [claim.text for claim in result.claims],
+            ["使用方法 A。", "使用方法 B。"],
+        )
+        self.assertEqual(
             {fact_id for claim in result.claims for fact_id in claim.fact_ids},
             {"a-method-f1", "b-method-f1"},
         )
