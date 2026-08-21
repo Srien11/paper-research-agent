@@ -65,6 +65,8 @@ _PLANNER_FAILURE_FRAGMENTS: tuple[tuple[str, str], ...] = (
     ("target ids must be unique", "planner_target_duplicate"),
     ("left the resolved candidate set", "planner_target_outside_candidate_set"),
     ("requires at least one dimension", "planner_dimension_invalid"),
+    ("requires valid dimensions", "planner_dimension_invalid"),
+    ("requires unique dimensions", "planner_dimension_invalid"),
     ("requirements must form a complete target-dimension grid", "planner_grid_incomplete"),
     ("requirement references an unknown target or dimension", "planner_requirement_reference_invalid"),
     ("step fact does not belong to its cell", "planner_requirement_reference_invalid"),
@@ -162,11 +164,33 @@ def parse_explicit_corpus_ids(question: str) -> tuple[str, ...]:
     )
 
 
+def comparison_dimension_hints(question: str) -> tuple[str, ...]:
+    """Derive high-level comparison topics only from explicit question clauses."""
+    normalized = " ".join(question.split())
+    scoped = re.split(r"[：:]", normalized, maxsplit=1)[-1]
+    primary = (
+        part.strip()
+        for part in re.split(r"[，,；;。.!?！？]+", scoped)
+        if part.strip()
+    )
+    hints: list[str] = []
+    for part in primary:
+        if re.match(r"^(?:请|找出|identify\b|find\b|which\b)", part, re.IGNORECASE):
+            continue
+        subparts = re.split(
+            r"(?:同时|以及|并(?=以|且|指出|展示|验证|评估|比较|分析|说明))",
+            part,
+        )
+        hints.extend(item.strip() for item in subparts if item.strip())
+    return tuple(dict.fromkeys(hints))[:5] or (normalized,)
+
+
 def build_comparison_research_plan(
     proposal: ComparisonPlanProposal,
     *,
     resolved_catalog: Mapping[str, str],
     max_steps: int,
+    expected_dimension_count: int | None = None,
 ) -> ResearchPlan:
     """Build all comparison control-plane IDs and scopes deterministically."""
     if len(proposal.selected_corpus_ids) < 2:
@@ -175,6 +199,11 @@ def build_comparison_research_plan(
         raise ValueError("comparison plan left the resolved candidate set")
     if not proposal.dimension_labels:
         raise ValueError("comparison research plan requires at least one dimension")
+    if (
+        expected_dimension_count is not None
+        and len(proposal.dimension_labels) != expected_dimension_count
+    ):
+        raise ValueError("comparison research plan requires valid dimensions")
     cell_count = len(proposal.selected_corpus_ids) * len(proposal.dimension_labels)
     if cell_count > max_steps:
         raise ValueError("research plan exceeds the requested step budget")
@@ -371,6 +400,15 @@ class LangChainResearchPlanner:
             ensure_ascii=False,
             separators=(",", ":"),
         )
+        dimension_hints = comparison_dimension_hints(question)
+        dimension_hint_catalog = json.dumps(
+            [
+                {"dimension_index": index, "text": text}
+                for index, text in enumerate(dimension_hints)
+            ],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
         system = SystemMessage(
             content=(
                 "你是论文研究任务规划器。只拆分需要在现有本地论文库中检索的子问题，"
@@ -433,6 +471,9 @@ class LangChainResearchPlanner:
                     "dimension label for every explicit comparison topic, clue cluster, method, "
                     "result, limitation, condition, or manipulation requested by the user; do "
                     "not merge separate requested topics. Return at least one atomic fact for "
+                    f"exactly {len(dimension_hints)} dimensions, preserving the one-to-one order "
+                    "of EXPLICIT_DIMENSION_HINTS_JSON. Do not merge, drop, or add hint entries. "
+                    "Return at least one atomic fact for "
                     "every selected corpus_id by zero-based dimension_index pair, even when the "
                     "question gives most detail for only one target. Each fact description must "
                     "come only from the user's question. Select non-empty protected_anchor_ids "
@@ -443,6 +484,7 @@ class LangChainResearchPlanner:
                     "local deterministic code creates them. Do not answer the question and do not "
                     "use private references or gold answers."
                     f"\nVERBATIM_ANCHOR_SOURCE_JSON={anchor_catalog}"
+                    f"\nEXPLICIT_DIMENSION_HINTS_JSON={dimension_hint_catalog}"
                     f"\nLOCAL_CORPUS_CATALOG_JSON={catalog}"
                 )
             )
@@ -466,6 +508,7 @@ class LangChainResearchPlanner:
                         proposal,
                         resolved_catalog=resolved_catalog,
                         max_steps=max_steps,
+                        expected_dimension_count=len(dimension_hints),
                     )
                 else:
                     plan = ResearchPlan.model_validate(raw)

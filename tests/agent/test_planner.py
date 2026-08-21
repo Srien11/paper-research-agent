@@ -15,6 +15,7 @@ from paper_research_agent.agent.planner import (
     LangChainResearchPlanner,
     _planner_failure_code,
     build_comparison_research_plan,
+    comparison_dimension_hints,
     parse_explicit_corpus_ids,
 )
 from paper_research_agent.retrieval.contracts import QueryRewriteTrace
@@ -170,6 +171,15 @@ class LangChainComparisonTargetResolverTests(unittest.IsolatedAsyncioTestCase):
 
 
 class LangChainResearchPlannerTests(unittest.IsolatedAsyncioTestCase):
+    def test_derives_explicit_dimension_hints_without_answer_data(self) -> None:
+        self.assertEqual(
+            comparison_dimension_hints(
+                "比较两项研究：一项讨论偏差并以竞技场验证，"
+                "另一项展示顺序操纵。请找出论文。"
+            ),
+            ("一项讨论偏差", "以竞技场验证", "另一项展示顺序操纵"),
+        )
+
     def test_builds_comparison_control_plane_deterministically(self) -> None:
         proposal = ComparisonPlanProposal.model_validate(
             {
@@ -381,7 +391,7 @@ class LangChainResearchPlannerTests(unittest.IsolatedAsyncioTestCase):
             },
             {
                 "selected_corpus_ids": ["C001", "T001"],
-                "dimension_labels": ["Method"],
+                "dimension_labels": ["Mechanism", "Input dependency"],
                 "facts": [
                     {
                         "corpus_id": "C001",
@@ -392,7 +402,7 @@ class LangChainResearchPlannerTests(unittest.IsolatedAsyncioTestCase):
                     },
                     {
                         "corpus_id": "C001",
-                        "dimension_index": 0,
+                        "dimension_index": 1,
                         "description": "Paper A input dependency",
                         "protected_anchor_ids": [3],
                         "retrieval_expansions": ["required input"],
@@ -403,6 +413,13 @@ class LangChainResearchPlannerTests(unittest.IsolatedAsyncioTestCase):
                         "description": "Paper B core mechanism",
                         "protected_anchor_ids": [2],
                         "retrieval_expansions": ["mechanism", "architecture"],
+                    },
+                    {
+                        "corpus_id": "T001",
+                        "dimension_index": 1,
+                        "description": "Paper B input dependency",
+                        "protected_anchor_ids": [3],
+                        "retrieval_expansions": ["required input"],
                     },
                 ],
             },
@@ -415,7 +432,7 @@ class LangChainResearchPlannerTests(unittest.IsolatedAsyncioTestCase):
 
         plan = await planner.plan(
             "Compare Paper A and Paper B: core mechanism; input dependency.",
-            max_steps=3,
+            max_steps=4,
             planning_required=True,
         )
 
@@ -433,9 +450,10 @@ class LangChainResearchPlannerTests(unittest.IsolatedAsyncioTestCase):
                 for intent in requirement.fact_requirements
             )
         )
-        self.assertEqual(len(plan.requirements[0].fact_requirements), 2)
+        self.assertEqual(len(plan.requirements[0].fact_requirements), 1)
         a_anchors = [
-            item.protected_anchors for item in plan.requirements[0].fact_requirements
+            requirement.fact_requirements[0].protected_anchors
+            for requirement in plan.requirements[:2]
         ]
         self.assertEqual(
             a_anchors,
