@@ -216,6 +216,25 @@ class CompilationAuditDiagnostic(FrozenEvaluationModel):
     repair: CompilationRepairDiagnostic
 
 
+class PlannerAttemptDiagnostic(FrozenEvaluationModel):
+    """Body-free result of one Planner structured-output attempt."""
+
+    attempt: int = Field(ge=1, le=2)
+    outcome: Literal["validated", "schema_invalid", "contract_invalid"]
+    failure_code: str | None = Field(
+        default=None,
+        pattern=r"^[a-z][a-z0-9_]{0,95}$",
+    )
+
+    @model_validator(mode="after")
+    def validate_outcome(self) -> PlannerAttemptDiagnostic:
+        if self.outcome == "validated" and self.failure_code is not None:
+            raise ValueError("validated planner attempt cannot have a failure code")
+        if self.outcome != "validated" and self.failure_code is None:
+            raise ValueError("failed planner attempt requires a failure code")
+        return self
+
+
 class ComparisonCaseDiagnostic(FrozenEvaluationModel):
     schema_version: Literal["comparison-e2e-diagnostic-v1"] = (
         "comparison-e2e-diagnostic-v1"
@@ -232,6 +251,9 @@ class ComparisonCaseDiagnostic(FrozenEvaluationModel):
     candidate_paper_ids_top8: tuple[str, ...] = Field(max_length=8)
     final_paper_ids: tuple[str, ...]
     planned_dimensions: tuple[str, ...]
+    planner_attempts: tuple[PlannerAttemptDiagnostic, ...] = Field(
+        default=(), max_length=2
+    )
     retrievals: tuple[RetrievalDiagnostic, ...]
     step_budget: int | None = Field(default=None, ge=1)
     assessment_count: int = Field(default=0, ge=0)
@@ -412,6 +434,31 @@ def aggregate_compilation_audits(
             for item in attempts
             if item.outcome == "contract_invalid"
         ),
+    }
+
+
+def aggregate_planner_attempts(
+    cases: Iterable[ComparisonCaseDiagnostic],
+) -> dict[str, object]:
+    """Aggregate body-free Planner outcomes and stable failure codes."""
+    attempts = tuple(attempt for case in cases for attempt in case.planner_attempts)
+    failure_codes = Counter(
+        attempt.failure_code
+        for attempt in attempts
+        if attempt.failure_code is not None
+    )
+    return {
+        "attempt_count": len(attempts),
+        "validated_attempt_count": sum(
+            attempt.outcome == "validated" for attempt in attempts
+        ),
+        "schema_invalid_attempt_count": sum(
+            attempt.outcome == "schema_invalid" for attempt in attempts
+        ),
+        "contract_invalid_attempt_count": sum(
+            attempt.outcome == "contract_invalid" for attempt in attempts
+        ),
+        "failure_code_counts": dict(sorted(failure_codes.items())),
     }
 
 

@@ -14,6 +14,7 @@ from paper_research_agent.agent.models import (
     EvidenceRecord,
     EvidenceRequirement,
     GetEvidenceResult,
+    PlannerAttemptAudit,
     ResearchDimension,
     ResearchObservation,
     ResearchPlan,
@@ -21,6 +22,7 @@ from paper_research_agent.agent.models import (
     ResearchTarget,
     SearchCorpusResult,
 )
+from paper_research_agent.agent.planner import ComparisonTargetResolutionError
 from paper_research_agent.retrieval.contracts import (
     BilingualRetrievalRun,
     QueryRewriteTrace,
@@ -123,6 +125,77 @@ def test_diagnostic_copies_safe_fact_requirement_id_from_executed_step() -> None
     )
 
     assert diagnostic.retrievals[0].fact_requirement_id == "a-method-primary"
+
+
+def test_diagnostic_copies_planner_attempts_from_success_and_failure() -> None:
+    success_attempts = (
+        PlannerAttemptAudit(
+            attempt=1,
+            outcome="contract_invalid",
+            failure_code="planner_grid_incomplete",
+        ),
+        PlannerAttemptAudit(attempt=2, outcome="validated"),
+    )
+    research = SimpleNamespace(
+        plan=ResearchPlan(
+            steps=(ResearchStep(step_id="one", objective="One", query="one"),),
+            planner_attempts=success_attempts,
+        ),
+        observations=(),
+        assessments=(),
+        step_budget=1,
+        tool_call_count=0,
+        tool_call_budget=1,
+    )
+    question = SimpleNamespace(
+        question_id="CPG001", split="dev", question="private question body"
+    )
+
+    success = _diagnostic(
+        question,
+        query_call=None,
+        candidate_call=None,
+        research=research,
+        answer=None,
+        generation=None,
+        elapsed_ms=1.0,
+        error=None,
+    )
+    failure_error = ComparisonTargetResolutionError(
+        "planner_grid_incomplete",
+        attempts=(
+            PlannerAttemptAudit(
+                attempt=1,
+                outcome="contract_invalid",
+                failure_code="planner_grid_incomplete",
+            ),
+            PlannerAttemptAudit(
+                attempt=2,
+                outcome="contract_invalid",
+                failure_code="planner_grid_incomplete",
+            ),
+        ),
+    )
+    failure = _diagnostic(
+        question,
+        query_call=None,
+        candidate_call=None,
+        research=None,
+        answer=None,
+        generation=None,
+        elapsed_ms=1.0,
+        error=failure_error,
+    )
+
+    assert [item.outcome for item in success.planner_attempts] == [
+        "contract_invalid",
+        "validated",
+    ]
+    assert [item.failure_code for item in failure.planner_attempts] == [
+        "planner_grid_incomplete",
+        "planner_grid_incomplete",
+    ]
+    assert "private question body" not in str(failure.planner_attempts)
 
 
 def _hit(

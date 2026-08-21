@@ -9,9 +9,11 @@ from paper_research_agent.evaluation.comparison_end_to_end import (
     CompilationAttemptDiagnostic,
     CompilationAuditDiagnostic,
     CompilationRepairDiagnostic,
+    PlannerAttemptDiagnostic,
     RetrievalDiagnostic,
     aggregate_compilation_audits,
     aggregate_fact_lineage,
+    aggregate_planner_attempts,
     classify_fact_lineage,
     deterministic_rewrite_retention,
     question_sha256,
@@ -251,6 +253,34 @@ def test_case_diagnostic_persists_body_free_compilation_audit() -> None:
     assert summary["accepted_unit_count"] == 1
     assert summary["failed_unit_count"] == 1
     assert summary["schema_failed_unit_count"] == 1
+
+
+def test_case_diagnostic_persists_and_aggregates_body_free_planner_attempts() -> None:
+    attempts = (
+        PlannerAttemptDiagnostic(
+            attempt=1,
+            outcome="contract_invalid",
+            failure_code="planner_grid_incomplete",
+        ),
+        PlannerAttemptDiagnostic(attempt=2, outcome="validated"),
+    )
+
+    case = _case(planner_attempts=attempts)
+    serialized = case.model_dump(mode="json")
+
+    assert serialized["planner_attempts"] == [
+        {
+            "attempt": 1,
+            "outcome": "contract_invalid",
+            "failure_code": "planner_grid_incomplete",
+        },
+        {"attempt": 2, "outcome": "validated", "failure_code": None},
+    ]
+    for forbidden in ("question", "query", "description", "statement", "evidence"):
+        assert forbidden not in str(serialized["planner_attempts"])
+    summary = aggregate_planner_attempts((case,))
+    assert summary["attempt_count"] == 2
+    assert summary["failure_code_counts"] == {"planner_grid_incomplete": 1}
 
 
 def test_rewrite_retention_preserves_identifiers_numbers_and_metrics() -> None:

@@ -33,6 +33,7 @@ from paper_research_agent.evaluation.comparison_end_to_end import (
     aggregate_answer_scores,
     aggregate_compilation_audits,
     aggregate_fact_lineage,
+    aggregate_planner_attempts,
     aggregate_smoke_cases,
     classify_fact_lineage,
     deterministic_rewrite_retention,
@@ -386,9 +387,11 @@ def _diagnostic(
     retrievals: list[RetrievalDiagnostic] = []
     final_ids: tuple[str, ...] = ()
     dimensions: tuple[str, ...] = ()
+    planner_attempts: tuple[object, ...] = ()
     if research is not None:
         final_ids = tuple(target.corpus_id for target in research.plan.targets)
         dimensions = tuple(item.label for item in research.plan.dimensions)
+        planner_attempts = tuple(research.plan.planner_attempts)
         steps = {step.step_id: step for step in research.plan.steps}
         for observation in research.observations:
             step = steps[observation.step_id]
@@ -407,6 +410,8 @@ def _diagnostic(
                     ),
                 )
             )
+    elif error is not None:
+        planner_attempts = tuple(getattr(error, "attempts", ()))
     compilation_audit = None
     if research is not None and research.assessments:
         audit = research.assessments[-1].compilation_audit
@@ -455,6 +460,9 @@ def _diagnostic(
         candidate_paper_ids_top8=candidate_ids,
         final_paper_ids=final_ids,
         planned_dimensions=dimensions,
+        planner_attempts=tuple(
+            item.model_dump(mode="json") for item in planner_attempts
+        ),
         retrievals=tuple(retrievals),
         step_budget=(int(research.step_budget) if research is not None else None),
         assessment_count=(len(research.assessments) if research is not None else 0),
@@ -843,6 +851,9 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             "compilation": aggregate_compilation_audits(
                 case for case in cases if case.split == split
             ),
+            "planner": aggregate_planner_attempts(
+                case for case in cases if case.split == split
+            ),
         }
         for split in split_counts
     }
@@ -857,6 +868,7 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             item for case in cases for item in case.fact_lineage
         ),
         "compilation": aggregate_compilation_audits(cases),
+        "planner": aggregate_planner_attempts(cases),
         "split_summaries": split_summaries,
         "cases": [item.model_dump(mode="json") for item in cases],
     }
