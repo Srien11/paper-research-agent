@@ -30,12 +30,28 @@ from paper_research_agent.retrieval.contracts import (
 )
 from scripts.evaluate_comparison_end_to_end import (
     _build_parser,
+    _citation_correct,
     _diagnostic,
     _experiment_metadata,
     _fact_ranking,
     _load_resumed_cases,
     _QueryRecorder,
 )
+
+
+def test_exact_gold_citation_is_not_overridden_by_model_judge_variance() -> None:
+    assert _citation_correct(
+        exact_gold_citation=True,
+        semantic_citation_supported=False,
+    )
+    assert _citation_correct(
+        exact_gold_citation=False,
+        semantic_citation_supported=True,
+    )
+    assert not _citation_correct(
+        exact_gold_citation=False,
+        semantic_citation_supported=False,
+    )
 
 
 def test_diagnostic_copies_safe_fact_requirement_id_from_executed_step() -> None:

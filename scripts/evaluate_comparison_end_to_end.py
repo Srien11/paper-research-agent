@@ -598,14 +598,28 @@ def _fact_lineage(
                 in_generation_input=bool(semantic_facts),
                 expressed=bool(semantic_claims or exact_matching_claims),
                 citation_correct=(
-                    semantic_match.citation_supported
-                    if semantic_match is not None
-                    else exact_citation_correct
+                    _citation_correct(
+                        exact_gold_citation=exact_citation_correct,
+                        semantic_citation_supported=(
+                            None
+                            if semantic_match is None
+                            else semantic_match.citation_supported
+                        ),
+                    )
                 ),
                 **ranking,
             )
         )
     return tuple(result)
+
+
+def _citation_correct(
+    *,
+    exact_gold_citation: bool,
+    semantic_citation_supported: bool | None,
+) -> bool:
+    """Trust exact gold relations; require semantic review for alternatives."""
+    return exact_gold_citation or semantic_citation_supported is True
 
 
 def _fact_ranking(
