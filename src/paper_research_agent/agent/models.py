@@ -672,6 +672,25 @@ class ResearchStep(FrozenContract):
         return normalized
 
 
+class PlannerAttemptAudit(FrozenContract):
+    """Body-free result of one structured planning attempt."""
+
+    attempt: int = Field(ge=1, le=2)
+    outcome: Literal["validated", "schema_invalid", "contract_invalid"]
+    failure_code: str | None = Field(
+        default=None,
+        pattern=r"^[a-z][a-z0-9_]{0,95}$",
+    )
+
+    @model_validator(mode="after")
+    def validate_attempt_outcome(self) -> PlannerAttemptAudit:
+        if self.outcome == "validated" and self.failure_code is not None:
+            raise ValueError("validated planner attempt cannot have a failure code")
+        if self.outcome != "validated" and self.failure_code is None:
+            raise ValueError("failed planner attempt requires a failure code")
+        return self
+
+
 class ResearchPlan(FrozenContract):
     """Ordered, auditable subquestions that stay within the read-only workflow."""
 
@@ -681,9 +700,15 @@ class ResearchPlan(FrozenContract):
     dimensions: tuple[ResearchDimension, ...] = Field(default=(), max_length=5)
     requirements: tuple[EvidenceRequirement, ...] = Field(default=(), max_length=20)
     steps: tuple[ResearchStep, ...] = Field(min_length=1, max_length=24)
+    planner_attempts: SkipJsonSchema[tuple[PlannerAttemptAudit, ...]] = Field(
+        default=(), max_length=2
+    )
 
     @model_validator(mode="after")
     def validate_steps(self) -> ResearchPlan:
+        attempts = [item.attempt for item in self.planner_attempts]
+        if attempts != list(range(1, len(attempts) + 1)):
+            raise ValueError("planner audit attempts must be consecutive")
         step_ids = [step.step_id for step in self.steps]
         if len(step_ids) != len(set(step_ids)):
             raise ValueError("research plan step IDs must be unique")

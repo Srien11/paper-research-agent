@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import unittest
 from unittest.mock import AsyncMock, Mock
 
@@ -8,6 +9,7 @@ from paper_research_agent.agent.planner import (
     ComparisonTargetResolutionError,
     LangChainComparisonTargetResolver,
     LangChainResearchPlanner,
+    _planner_failure_code,
     parse_explicit_corpus_ids,
 )
 from paper_research_agent.retrieval.contracts import QueryRewriteTrace
@@ -163,6 +165,96 @@ class LangChainComparisonTargetResolverTests(unittest.IsolatedAsyncioTestCase):
 
 
 class LangChainResearchPlannerTests(unittest.IsolatedAsyncioTestCase):
+    def test_planner_failures_have_stable_body_free_codes(self) -> None:
+        base = {
+            "task_type": "comparison",
+            "targets": [
+                {"target_id": "a", "label": "Paper A", "corpus_id": "C001"},
+                {"target_id": "b", "label": "Paper B", "corpus_id": "T001"},
+            ],
+            "dimensions": [{"dimension_id": "method", "label": "Method"}],
+            "requirements": [
+                {
+                    "requirement_id": f"{target}-method",
+                    "target_id": target,
+                    "dimension_id": "method",
+                    "description": f"Paper {target} method",
+                    "fact_requirements": [
+                        {
+                            "fact_requirement_id": f"{target}-fact",
+                            "description": f"Paper {target} mechanism",
+                            "protected_anchor_ids": [0],
+                        }
+                    ],
+                }
+                for target in ("a", "b")
+            ],
+            "steps": [
+                {
+                    "step_id": target,
+                    "objective": f"Paper {target} method",
+                    "query": f"Paper {target} method",
+                    "corpus_id": "C001" if target == "a" else "T001",
+                    "target_ids": [target],
+                    "dimension_ids": ["method"],
+                }
+                for target in ("a", "b")
+            ],
+        }
+
+        invalid_payloads: list[tuple[str, dict[str, object]]] = []
+        one_target = copy.deepcopy(base)
+        one_target["targets"] = one_target["targets"][:1]
+        one_target["requirements"] = one_target["requirements"][:1]
+        one_target["steps"] = one_target["steps"][:1]
+        invalid_payloads.append(("planner_target_count_invalid", one_target))
+        duplicate_target = copy.deepcopy(base)
+        duplicate_target["targets"][1]["corpus_id"] = "C001"
+        invalid_payloads.append(("planner_target_duplicate", duplicate_target))
+        no_dimensions = copy.deepcopy(base)
+        no_dimensions["dimensions"] = []
+        invalid_payloads.append(("planner_dimension_invalid", no_dimensions))
+        incomplete_grid = copy.deepcopy(base)
+        incomplete_grid["requirements"] = incomplete_grid["requirements"][:1]
+        invalid_payloads.append(("planner_grid_incomplete", incomplete_grid))
+        bad_requirement_reference = copy.deepcopy(base)
+        bad_requirement_reference["requirements"][0]["target_id"] = "outside"
+        invalid_payloads.append(
+            ("planner_requirement_reference_invalid", bad_requirement_reference)
+        )
+        bad_step_scope = copy.deepcopy(base)
+        bad_step_scope["steps"][0]["target_ids"] = ["a", "b"]
+        invalid_payloads.append(("planner_step_scope_invalid", bad_step_scope))
+        incomplete_steps = copy.deepcopy(base)
+        incomplete_steps["steps"] = incomplete_steps["steps"][:1]
+        invalid_payloads.append(("planner_step_grid_incomplete", incomplete_steps))
+        duplicate_id = copy.deepcopy(base)
+        duplicate_id["steps"][1]["step_id"] = "a"
+        invalid_payloads.append(("planner_id_duplicate", duplicate_id))
+
+        errors: list[tuple[str, ValueError]] = [
+            ("planner_task_type_invalid", ValueError("planned research requires a comparison plan")),
+            ("planner_target_outside_candidate_set", ValueError("comparison plan left the resolved candidate set")),
+            ("planner_step_budget_invalid", ValueError("research plan exceeds the requested step budget")),
+            ("planner_fact_budget_invalid", ValueError("comparison fact requirements exceed the requested step budget")),
+            ("planner_anchor_selection_invalid", ValueError("protected anchor selection is invalid")),
+        ]
+        for expected, payload in invalid_payloads:
+            with self.subTest(expected=expected):
+                try:
+                    ResearchPlan.model_validate(payload)
+                except ValueError as error:
+                    self.assertEqual(_planner_failure_code(error), expected)
+                else:
+                    self.fail("invalid plan unexpectedly validated")
+        for expected, error in errors:
+            with self.subTest(expected=expected):
+                self.assertEqual(_planner_failure_code(error), expected)
+        try:
+            ResearchPlan.model_validate({"steps": "model-authored body"})
+        except ValueError as error:
+            self.assertEqual(_planner_failure_code(error), "planner_schema_invalid")
+
     async def test_requests_bounded_structured_plan_from_chat_model(self) -> None:
         model = Mock()
         structured = AsyncMock()
@@ -307,6 +399,12 @@ class LangChainResearchPlannerTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(plan.task_type, "comparison")
+        self.assertEqual(
+            [item.outcome for item in plan.planner_attempts],
+            ["contract_invalid", "validated"],
+        )
+        retry_message = structured.ainvoke.await_args_list[1].args[0][-1].content
+        self.assertIn("FAILURE_CODE=planner_task_type_invalid", retry_message)
         self.assertTrue(
             all(
                 intent.origin == "planned"
@@ -428,7 +526,11 @@ class LangChainResearchPlannerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ComparisonTargetResolutionError) as raised:
             await planner.plan("Compare C001 and T001", max_steps=2, planning_required=True)
 
-        self.assertEqual(raised.exception.reason_code, "planner_contract_invalid")
+        self.assertEqual(raised.exception.reason_code, "planner_task_type_invalid")
+        self.assertEqual(
+            [item.failure_code for item in raised.exception.attempts],
+            ["planner_task_type_invalid", "planner_task_type_invalid"],
+        )
 
     async def test_required_comparison_rejects_targets_outside_resolved_candidates(self) -> None:
         model = Mock()
@@ -446,12 +548,26 @@ class LangChainResearchPlannerTests(unittest.IsolatedAsyncioTestCase):
                     "target_id": "a",
                     "dimension_id": "method",
                     "description": "Paper A method",
+                    "fact_requirements": [
+                        {
+                            "fact_requirement_id": "a-method-fact",
+                            "description": "Paper A method",
+                            "protected_anchor_ids": [0],
+                        }
+                    ],
                 },
                 {
                     "requirement_id": "x-method",
                     "target_id": "x",
                     "dimension_id": "method",
                     "description": "Paper X method",
+                    "fact_requirements": [
+                        {
+                            "fact_requirement_id": "x-method-fact",
+                            "description": "Paper X method",
+                            "protected_anchor_ids": [0],
+                        }
+                    ],
                 },
             ],
             "steps": [
@@ -481,8 +597,17 @@ class LangChainResearchPlannerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ComparisonTargetResolutionError) as raised:
             await planner.plan("Compare the methods", max_steps=2, planning_required=True)
 
-        self.assertEqual(raised.exception.reason_code, "planner_contract_invalid")
+        self.assertEqual(
+            raised.exception.reason_code,
+            "planner_target_outside_candidate_set",
+        )
         self.assertEqual(structured.ainvoke.await_count, 2)
+        retry_message = structured.ainvoke.await_args_list[1].args[0][-1].content
+        self.assertIn(
+            "FAILURE_CODE=planner_target_outside_candidate_set",
+            retry_message,
+        )
+        self.assertIn("LOCAL_CORPUS_CATALOG_JSON", retry_message)
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ from paper_research_agent.agent.models import (
     EvidenceRequirement,
     GetEvidenceInput,
     GetEvidenceResult,
+    PlannerAttemptAudit,
     ResearchActionRecord,
     ResearchDimension,
     ResearchPlan,
@@ -47,6 +48,36 @@ def _hit(*, rank: int = 1) -> SearchCorpusHit:
 
 
 class ResearchToolModelTests(unittest.TestCase):
+    def test_planner_attempt_audit_is_local_only_and_consecutive(self) -> None:
+        attempts = (
+            PlannerAttemptAudit(
+                attempt=1,
+                outcome="contract_invalid",
+                failure_code="planner_grid_incomplete",
+            ),
+            PlannerAttemptAudit(attempt=2, outcome="validated"),
+        )
+        plan = ResearchPlan(
+            steps=(ResearchStep(step_id="one", objective="One", query="one"),),
+            planner_attempts=attempts,
+        )
+
+        self.assertEqual(plan.planner_attempts, attempts)
+        self.assertNotIn("planner_attempts", ResearchPlan.model_json_schema()["properties"])
+        with self.assertRaisesRegex(ValidationError, "requires a failure code"):
+            PlannerAttemptAudit(attempt=1, outcome="contract_invalid")
+        with self.assertRaisesRegex(ValidationError, "cannot have a failure code"):
+            PlannerAttemptAudit(
+                attempt=1,
+                outcome="validated",
+                failure_code="planner_grid_incomplete",
+            )
+        with self.assertRaisesRegex(ValidationError, "must be consecutive"):
+            ResearchPlan(
+                steps=(ResearchStep(step_id="one", objective="One", query="one"),),
+                planner_attempts=(PlannerAttemptAudit(attempt=2, outcome="validated"),),
+            )
+
     def test_fact_requirement_normalizes_structured_query_terms(self) -> None:
         item = EvidenceFactRequirement(
             fact_requirement_id="a-method-input",

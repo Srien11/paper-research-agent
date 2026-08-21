@@ -9,13 +9,18 @@ from typing import Protocol
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
+from pydantic import ValidationError
 
 from paper_research_agent.agent.fact_queries import (
     bind_question_anchors,
     question_anchor_catalog,
     validate_question_anchors,
 )
-from paper_research_agent.agent.models import ResearchPlan, ResearchStep
+from paper_research_agent.agent.models import (
+    PlannerAttemptAudit,
+    ResearchPlan,
+    ResearchStep,
+)
 from paper_research_agent.agent.policy import MAX_INITIAL_PLAN_STEPS
 from paper_research_agent.retrieval.contracts import QueryRewriteTrace
 from paper_research_agent.retrieval.papers import (
@@ -27,8 +32,14 @@ from paper_research_agent.retrieval.papers import (
 class ComparisonTargetResolutionError(RuntimeError):
     """Comparison targets could not be resolved without leaving local scope."""
 
-    def __init__(self, reason_code: str) -> None:
+    def __init__(
+        self,
+        reason_code: str,
+        *,
+        attempts: tuple[PlannerAttemptAudit, ...] = (),
+    ) -> None:
         self.reason_code = reason_code
+        self.attempts = attempts
         super().__init__(f"comparison target resolution failed: {reason_code}")
 
 
@@ -40,13 +51,95 @@ class ComparisonQueryResolver(Protocol):
     async def resolve_query(self, question: str) -> QueryRewriteTrace: ...
 
 
-def _planner_contract_reason(error: ValueError) -> str:
-    message = str(error)
-    if "protected anchor" in message or "protected_anchor_ids" in message:
-        return "planner_anchor_selection_invalid"
-    if "fact requirements exceed" in message:
-        return "planner_fact_budget_invalid"
-    return "planner_contract_invalid"
+_PLANNER_FAILURE_FRAGMENTS: tuple[tuple[str, str], ...] = (
+    ("planned research requires a comparison plan", "planner_task_type_invalid"),
+    ("task_type", "planner_task_type_invalid"),
+    ("requires at least two targets", "planner_target_count_invalid"),
+    ("targets must use distinct corpus ids", "planner_target_duplicate"),
+    ("target ids must be unique", "planner_target_duplicate"),
+    ("left the resolved candidate set", "planner_target_outside_candidate_set"),
+    ("requires at least one dimension", "planner_dimension_invalid"),
+    ("requirements must form a complete target-dimension grid", "planner_grid_incomplete"),
+    ("requirement references an unknown target or dimension", "planner_requirement_reference_invalid"),
+    ("step fact does not belong to its cell", "planner_requirement_reference_invalid"),
+    ("steps require one target and one dimension", "planner_step_scope_invalid"),
+    ("step corpus scope does not match its target", "planner_step_scope_invalid"),
+    ("steps do not cover every requirement cell", "planner_step_grid_incomplete"),
+    ("step ids must be unique", "planner_id_duplicate"),
+    ("dimension ids must be unique", "planner_id_duplicate"),
+    ("requirement ids must be unique", "planner_id_duplicate"),
+    ("fact requirement ids must be globally unique", "planner_id_duplicate"),
+    ("fact-bound research steps must be unique", "planner_id_duplicate"),
+    ("exceeds the requested step budget", "planner_step_budget_invalid"),
+    ("fact requirements exceed", "planner_fact_budget_invalid"),
+    ("protected anchor", "planner_anchor_selection_invalid"),
+    ("protected_anchor_ids", "planner_anchor_selection_invalid"),
+)
+
+
+_PLANNER_REPAIR_INSTRUCTIONS: dict[str, str] = {
+    "planner_task_type_invalid": (
+        "Return task_type=comparison and include the complete comparison metadata."
+    ),
+    "planner_target_count_invalid": "Return between two and four resolved targets.",
+    "planner_target_duplicate": (
+        "Return unique targets whose corpus IDs are distinct."
+    ),
+    "planner_target_outside_candidate_set": (
+        "Use corpus IDs only from LOCAL_CORPUS_CATALOG_JSON."
+    ),
+    "planner_dimension_invalid": (
+        "Return one or more unique dimensions explicitly requested by the question."
+    ),
+    "planner_grid_incomplete": (
+        "Return exactly one requirement for every resolved target-by-dimension pair."
+    ),
+    "planner_requirement_reference_invalid": (
+        "Bind every requirement and fact reference to declared target, dimension, and cell IDs."
+    ),
+    "planner_step_scope_invalid": (
+        "Bind each step to exactly one target, one dimension, and that target's corpus ID."
+    ),
+    "planner_step_grid_incomplete": (
+        "Return one discovery step for every resolved target-by-dimension pair."
+    ),
+    "planner_id_duplicate": "Return globally unique target, dimension, requirement, fact, and step IDs.",
+    "planner_step_budget_invalid": "Return the full grid within the supplied step budget.",
+    "planner_fact_budget_invalid": "Return no more atomic fact requirements than the supplied budget.",
+    "planner_anchor_selection_invalid": (
+        "Use valid, non-duplicate protected_anchor_ids from VERBATIM_ANCHOR_SOURCE_JSON."
+    ),
+    "planner_schema_invalid": "Return every field required by the ResearchPlan schema with valid types.",
+}
+
+
+def _planner_failure_code(error: ValueError) -> str:
+    """Classify a planner failure without exposing model-authored text."""
+    diagnostics: list[str] = []
+    if isinstance(error, ValidationError):
+        for item in error.errors():
+            diagnostics.append(str(item.get("msg", "")))
+            diagnostics.extend(str(part) for part in item.get("loc", ()))
+            diagnostics.append(str(item.get("type", "")))
+            location = tuple(str(part) for part in item.get("loc", ()))
+            error_type = str(item.get("type", ""))
+            if location == ("targets",) and error_type in {
+                "too_short",
+                "too_long",
+            }:
+                return "planner_target_count_invalid"
+            if location == ("dimensions",) and error_type in {
+                "too_short",
+                "too_long",
+            }:
+                return "planner_dimension_invalid"
+    else:
+        diagnostics.append(str(error))
+    normalized = " ".join(diagnostics).casefold()
+    for fragment, code in _PLANNER_FAILURE_FRAGMENTS:
+        if fragment in normalized:
+            return code
+    return "planner_schema_invalid"
 
 
 def parse_explicit_corpus_ids(question: str) -> tuple[str, ...]:
@@ -215,7 +308,8 @@ class LangChainResearchPlanner:
             )
         )
         messages = [system, HumanMessage(content=question)]
-        failure_reason = "planner_contract_invalid"
+        failure_reason = "planner_schema_invalid"
+        attempt_audits: list[PlannerAttemptAudit] = []
         for attempt in range(2):
             try:
                 raw = await self._structured_model.ainvoke(messages)
@@ -249,33 +343,43 @@ class LangChainResearchPlanner:
                     planned_corpora = {target.corpus_id for target in plan.targets}
                     if not planned_corpora <= set(resolved_catalog):
                         raise ValueError("comparison plan left the resolved candidate set")
-                return plan
+                attempt_audits.append(
+                    PlannerAttemptAudit(attempt=attempt + 1, outcome="validated")
+                )
+                return plan.model_copy(
+                    update={"planner_attempts": tuple(attempt_audits)}
+                )
             except ValueError as exc:
-                failure_reason = _planner_contract_reason(exc)
+                failure_reason = _planner_failure_code(exc)
+                attempt_audits.append(
+                    PlannerAttemptAudit(
+                        attempt=attempt + 1,
+                        outcome=(
+                            "schema_invalid"
+                            if failure_reason == "planner_schema_invalid"
+                            else "contract_invalid"
+                        ),
+                        failure_code=failure_reason,
+                    )
+                )
                 if attempt == 0:
                     messages = [
                         *messages,
                         HumanMessage(
                             content=(
-                                "The previous plan violated the structured planning contract. "
-                                "Return a valid full target-by-dimension comparison grid within "
-                                f"the {max_steps}-step budget. The number of steps must equal "
-                                "the target count multiplied by the dimension count. Preserve "
-                                "every comparison dimension required by the question; never "
-                                "return a partial grid. Every requirement must include one to six "
-                                "explicit, question-derived atomic fact_requirements with globally "
-                                "unique IDs and non-empty protected_anchor_ids selected from "
-                                "VERBATIM_ANCHOR_SOURCE_JSON. Do not emit anchor text. Put "
-                                "translations and academic synonyms only in "
-                                "retrieval_expansions. Do not replace anchors with broader concepts, "
-                                "rely on a derived compatibility intent, or copy sibling facts. The "
-                                f"total fact_requirement count must not exceed {max_steps}."
+                                f"FAILURE_CODE={failure_reason}. "
+                                f"{_PLANNER_REPAIR_INSTRUCTIONS[failure_reason]} "
+                                "Return the full corrected plan. Do not include model output from "
+                                "the previous attempt."
                             )
                         ),
                     ]
 
         if planning_required:
-            raise ComparisonTargetResolutionError(failure_reason)
+            raise ComparisonTargetResolutionError(
+                failure_reason,
+                attempts=tuple(attempt_audits),
+            )
         return ResearchPlan(
             steps=(
                 ResearchStep(
