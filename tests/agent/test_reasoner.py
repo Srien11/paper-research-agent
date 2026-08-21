@@ -107,6 +107,44 @@ def _comparison_plan() -> ResearchPlan:
     )
 
 
+def _qualified_comparison_plan(*, two_facts: bool = False) -> ResearchPlan:
+    base = _comparison_plan()
+    fact_requirements = [
+        EvidenceFactRequirement(
+            fact_requirement_id="a-qualified",
+            description="Qualified method result",
+            required_qualifier_kinds=("condition", "method"),
+        )
+    ]
+    if two_facts:
+        fact_requirements.insert(
+            0,
+            EvidenceFactRequirement(
+                fact_requirement_id="a-mechanism",
+                description="Core mechanism",
+            ),
+        )
+    requirement = base.requirements[0].model_copy(
+        update={"fact_requirements": tuple(fact_requirements)}
+    )
+    return base.model_copy(
+        update={"requirements": (requirement, base.requirements[1])}
+    )
+
+
+def _comparison_observation() -> ResearchObservation:
+    observation = _observation("Paper A uses method X under condition Y.")
+    return observation.model_copy(
+        update={
+            "step_id": "a",
+            "objective": "Find Paper A method",
+            "search": observation.search.model_copy(
+                update={"query": "Paper A method", "corpus_id": "C001"}
+            ),
+        }
+    )
+
+
 class LangChainEvidenceReasonerTests(unittest.IsolatedAsyncioTestCase):
     def test_schema_diagnostics_count_raw_facts_without_retaining_content(self) -> None:
         raw = {
@@ -530,7 +568,202 @@ class LangChainEvidenceReasonerTests(unittest.IsolatedAsyncioTestCase):
             ["b-method"],
         )
         self.assertEqual(
-            retry_payload["repair_errors"], {"b-method": "compilation_unit_missing"}
+            retry_payload["repair_errors"],
+            {
+                "b-method": {
+                    "code": "compilation_unit_missing",
+                    "required_qualifiers_by_fact": {"b-method-primary": []},
+                }
+            },
+        )
+
+    async def test_retries_missing_qualifiers_with_per_fact_requirements(self) -> None:
+        model = Mock()
+        structured = AsyncMock()
+        structured.ainvoke.side_effect = (
+            {
+                "cells": [
+                    {
+                        "requirement_id": "a-method",
+                        "facts": [
+                            {
+                                "statement": "Paper A uses method X under condition Y.",
+                                "chunk_ids": ["chunk-1"],
+                                "fact_requirement_ids": ["a-qualified"],
+                                "qualifiers": [{"kind": "method", "value": "X"}],
+                            }
+                        ],
+                    },
+                    {"requirement_id": "b-method", "facts": []},
+                ]
+            },
+            {
+                "cells": [
+                    {
+                        "requirement_id": "a-method",
+                        "facts": [
+                            {
+                                "statement": "Paper A uses method X under condition Y.",
+                                "chunk_ids": ["chunk-1"],
+                                "fact_requirement_ids": ["a-qualified"],
+                                "qualifiers": [
+                                    {"kind": "condition", "value": "Y"},
+                                    {"kind": "method", "value": "X"},
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+        model.with_structured_output.return_value = structured
+        reasoner = LangChainEvidenceReasoner(model)
+
+        result = await reasoner.assess(
+            "Compare Paper A and Paper B",
+            plan=_qualified_comparison_plan(),
+            observations=(_comparison_observation(),),
+            remaining_steps=2,
+        )
+
+        self.assertEqual(structured.ainvoke.await_count, 2)
+        self.assertEqual(result.ledger[0].status, "sufficient")
+        retry_messages = structured.ainvoke.await_args_list[1].args[0]
+        retry_payload = json.loads(retry_messages[1].content)
+        self.assertEqual(
+            [item["requirement_id"] for item in retry_payload["requirements"]],
+            ["a-method"],
+        )
+        self.assertEqual(
+            [
+                item["fact_requirement_id"]
+                for item in retry_payload["requirements"][0]["fact_requirements"]
+            ],
+            ["a-qualified"],
+        )
+        self.assertEqual(
+            retry_payload["repair_errors"]["a-method"],
+            {
+                "code": "required_qualifier_missing",
+                "required_qualifiers_by_fact": {
+                    "a-qualified": ["condition", "method"]
+                },
+            },
+        )
+        self.assertIn("per-fact constraints", retry_messages[0].content)
+        assert result.compilation_audit is not None
+        self.assertEqual(
+            result.compilation_audit.attempts[0].failure_code,
+            "required_qualifier_missing",
+        )
+
+    async def test_valid_fact_survives_invalid_duplicate_for_same_fact_intent(self) -> None:
+        model = Mock()
+        structured = AsyncMock()
+        structured.ainvoke.return_value = {
+            "cells": [
+                {
+                    "requirement_id": "a-method",
+                    "facts": [
+                        {
+                            "statement": "Paper A uses method X under condition Y.",
+                            "chunk_ids": ["chunk-1"],
+                            "fact_requirement_ids": ["a-qualified"],
+                            "qualifiers": [
+                                {"kind": "condition", "value": "Y"},
+                                {"kind": "method", "value": "X"},
+                            ],
+                        },
+                        {
+                            "statement": "Paper A also uses method X.",
+                            "chunk_ids": ["chunk-1"],
+                            "fact_requirement_ids": ["a-qualified"],
+                            "qualifiers": [{"kind": "method", "value": "X"}],
+                        },
+                    ],
+                },
+                {"requirement_id": "b-method", "facts": []},
+            ]
+        }
+        model.with_structured_output.return_value = structured
+        reasoner = LangChainEvidenceReasoner(model)
+
+        result = await reasoner.assess(
+            "Compare Paper A and Paper B",
+            plan=_qualified_comparison_plan(),
+            observations=(_comparison_observation(),),
+            remaining_steps=2,
+        )
+
+        self.assertEqual(structured.ainvoke.await_count, 1)
+        self.assertEqual(len(result.ledger[0].facts), 1)
+        assert result.compilation_audit is not None
+        audit = result.compilation_audit.attempts[0]
+        self.assertEqual(audit.accepted_fact_count, 1)
+        self.assertEqual(audit.rejected_fact_count, 1)
+        self.assertEqual(audit.unresolved_fact_requirement_count, 0)
+
+    async def test_compiler_failure_retains_valid_fact_from_same_cell(self) -> None:
+        model = Mock()
+        structured = AsyncMock()
+        invalid_qualified = {
+            "statement": "Paper A uses method X under condition Y.",
+            "chunk_ids": ["chunk-1"],
+            "fact_requirement_ids": ["a-qualified"],
+            "qualifiers": [{"kind": "method", "value": "X"}],
+        }
+        structured.ainvoke.side_effect = (
+            {
+                "cells": [
+                    {
+                        "requirement_id": "a-method",
+                        "facts": [
+                            {
+                                "statement": "Paper A uses mechanism M.",
+                                "chunk_ids": ["chunk-1"],
+                                "fact_requirement_ids": ["a-mechanism"],
+                            },
+                            invalid_qualified,
+                        ],
+                    },
+                    {"requirement_id": "b-method", "facts": []},
+                ]
+            },
+            {
+                "cells": [
+                    {"requirement_id": "a-method", "facts": [invalid_qualified]}
+                ]
+            },
+        )
+        model.with_structured_output.return_value = structured
+        reasoner = LangChainEvidenceReasoner(model)
+
+        result = await reasoner.assess(
+            "Compare Paper A and Paper B",
+            plan=_qualified_comparison_plan(two_facts=True),
+            observations=(_comparison_observation(),),
+            remaining_steps=2,
+        )
+
+        self.assertEqual(result.status, "compiler_failed")
+        self.assertEqual(len(result.ledger[0].facts), 1)
+        self.assertEqual(
+            result.ledger[0].facts[0].fact_requirement_ids,
+            ("a-mechanism",),
+        )
+        self.assertEqual(
+            result.ledger[0].missing_fact_requirement_ids,
+            ("a-qualified",),
+        )
+        retry_payload = json.loads(
+            structured.ainvoke.await_args_list[1].args[0][1].content
+        )
+        self.assertEqual(
+            [
+                item["fact_requirement_id"]
+                for item in retry_payload["requirements"][0]["fact_requirements"]
+            ],
+            ["a-qualified"],
         )
 
     async def test_repairs_multiple_follow_up_cells_after_retry(self) -> None:

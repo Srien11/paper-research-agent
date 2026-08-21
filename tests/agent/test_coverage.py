@@ -9,12 +9,14 @@ from paper_research_agent.agent.coverage import (
     repair_evidence_assessment_with_audit,
     validate_evidence_assessment,
     validate_evidence_compilation_cell,
+    validate_evidence_compilation_fact,
 )
 from paper_research_agent.agent.models import (
     CompiledEvidenceFact,
     EvidenceAssessment,
     EvidenceCellCompilation,
     EvidenceCoverage,
+    EvidenceFactCompilation,
     EvidenceFactRequirement,
     EvidenceFollowup,
     EvidenceLedgerCell,
@@ -588,6 +590,50 @@ class EvidenceCoverageValidationTests(unittest.TestCase):
                             ),
                         )
                     }
+                ),
+            )
+
+    def test_single_fact_validation_enforces_required_qualifiers(self) -> None:
+        base = _plan()
+        requirement = base.requirements[0].model_copy(
+            update={
+                "fact_requirements": (
+                    EvidenceFactRequirement(
+                        fact_requirement_id="a-qualified",
+                        description="Qualified method",
+                        required_qualifier_kinds=("condition", "method"),
+                    ),
+                )
+            }
+        )
+        plan = base.model_copy(
+            update={"requirements": (requirement, base.requirements[1])}
+        )
+        valid = EvidenceFactCompilation.model_validate(
+            {
+                "statement": "Paper A uses method X under condition Y.",
+                "chunk_ids": ["chunk-a"],
+                "fact_requirement_ids": ["a-qualified"],
+                "qualifiers": [
+                    {"kind": "method", "value": "X"},
+                    {"kind": "condition", "value": "Y"},
+                ],
+            }
+        )
+
+        self.assertIs(
+            validate_evidence_compilation_fact(
+                plan, (_observation(),), requirement, valid
+            ),
+            valid,
+        )
+        with self.assertRaisesRegex(ValueError, "omits a required qualifier"):
+            validate_evidence_compilation_fact(
+                plan,
+                (_observation(),),
+                requirement,
+                valid.model_copy(
+                    update={"qualifiers": (valid.qualifiers[0],)}
                 ),
             )
 

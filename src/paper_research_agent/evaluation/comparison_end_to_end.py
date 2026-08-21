@@ -195,6 +195,9 @@ class CompilationAttemptDiagnostic(FrozenEvaluationModel):
     failure_code: str | None = None
     raw_ledger_cell_count: int | None = Field(default=None, ge=0)
     raw_fact_count: int | None = Field(default=None, ge=0)
+    accepted_fact_count: int = Field(default=0, ge=0)
+    rejected_fact_count: int = Field(default=0, ge=0)
+    unresolved_fact_requirement_count: int = Field(default=0, ge=0)
     requested_requirement_ids: tuple[str, ...] = ()
     accepted_requirement_ids: tuple[str, ...] = ()
     failed_requirement_ids: tuple[str, ...] = ()
@@ -433,6 +436,11 @@ def aggregate_compilation_audits(
             len(item.failed_requirement_ids)
             for item in attempts
             if item.outcome == "contract_invalid"
+        ),
+        "accepted_fact_count": sum(item.accepted_fact_count for item in attempts),
+        "rejected_fact_count": sum(item.rejected_fact_count for item in attempts),
+        "unresolved_fact_requirement_count": sum(
+            item.unresolved_fact_requirement_count for item in attempts
         ),
     }
 

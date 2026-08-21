@@ -16,7 +16,7 @@ from paper_research_agent.agent.coverage import (
     project_evidence_compilation,
     repair_evidence_assessment_with_audit,
     validate_evidence_assessment,
-    validate_evidence_compilation_cell,
+    validate_evidence_compilation_fact,
 )
 from paper_research_agent.agent.models import (
     EvidenceAssessment,
@@ -26,6 +26,7 @@ from paper_research_agent.agent.models import (
     EvidenceCompilationBatch,
     EvidenceCompilationRepairAudit,
     EvidenceCompilationVisibility,
+    EvidenceFactCompilation,
     EvidenceRecord,
     ResearchObservation,
     ResearchPlan,
@@ -248,6 +249,7 @@ class LangChainEvidenceReasoner:
             )
         committed: dict[str, EvidenceCellCompilation] = {}
         errors: dict[str, str] = {}
+        unresolved_fact_ids: dict[str, tuple[str, ...]] = {}
         requested_ids = tuple(item.requirement_id for item in plan.requirements)
         attempt_audits: list[EvidenceCompilationAttemptAudit] = []
         for attempt in range(2):
@@ -257,17 +259,28 @@ class LangChainEvidenceReasoner:
                 evidence=evidence,
                 requested_requirement_ids=requested_ids,
                 repair_errors=errors,
+                requested_fact_requirement_ids=unresolved_fact_ids,
             )
             raw = await self._comparison_model.ainvoke(messages)
-            accepted, errors, raw_cell_count, raw_fact_count, schema_invalid = (
-                _validate_compilation_batch(
-                    raw,
-                    plan=plan,
-                    observations=observations,
-                    requested_requirement_ids=requested_ids,
-                )
+            (
+                accepted,
+                errors,
+                unresolved_fact_ids,
+                raw_cell_count,
+                raw_fact_count,
+                schema_invalid,
+                accepted_fact_count,
+                rejected_fact_count,
+            ) = _validate_compilation_batch(
+                raw,
+                plan=plan,
+                observations=observations,
+                requested_requirement_ids=requested_ids,
             )
-            committed.update(accepted)
+            for requirement_id, cell in accepted.items():
+                committed[requirement_id] = _merge_compilation_cells(
+                    committed.get(requirement_id), cell
+                )
             failed_ids = tuple(
                 requirement_id
                 for requirement_id in requested_ids
@@ -276,7 +289,7 @@ class LangChainEvidenceReasoner:
             accepted_ids = tuple(
                 requirement_id
                 for requirement_id in requested_ids
-                if requirement_id in accepted
+                if requirement_id in accepted and requirement_id not in errors
             )
             attempt_audits.append(
                 EvidenceCompilationAttemptAudit(
@@ -291,6 +304,11 @@ class LangChainEvidenceReasoner:
                     ),
                     raw_ledger_cell_count=raw_cell_count,
                     raw_fact_count=raw_fact_count,
+                    accepted_fact_count=accepted_fact_count,
+                    rejected_fact_count=rejected_fact_count,
+                    unresolved_fact_requirement_count=sum(
+                        len(item) for item in unresolved_fact_ids.values()
+                    ),
                     requested_requirement_ids=requested_ids,
                     accepted_requirement_ids=accepted_ids,
                     failed_requirement_ids=failed_ids,
@@ -303,7 +321,7 @@ class LangChainEvidenceReasoner:
         failed_ids = tuple(
             item.requirement_id
             for item in plan.requirements
-            if item.requirement_id not in committed
+            if item.requirement_id in errors
         )
         assessment = project_evidence_compilation(
             plan,
@@ -343,6 +361,7 @@ def _comparison_compilation_messages(
     evidence: list[dict[str, object]],
     requested_requirement_ids: tuple[str, ...],
     repair_errors: Mapping[str, str],
+    requested_fact_requirement_ids: Mapping[str, tuple[str, ...]],
 ) -> list[SystemMessage | HumanMessage]:
     """Build a fact-only comparison compiler request for the requested cells."""
     requested = set(requested_requirement_ids)
@@ -352,9 +371,19 @@ def _comparison_compilation_messages(
     requirements = []
     for requirement_id in requested_requirement_ids:
         requirement = requirement_by_id[requirement_id]
+        requested_fact_ids = set(
+            requested_fact_requirement_ids.get(requirement_id, ())
+        )
+        requirement_payload = requirement.model_dump(mode="json")
+        if requested_fact_ids:
+            requirement_payload["fact_requirements"] = [
+                item.model_dump(mode="json")
+                for item in requirement.fact_requirements
+                if item.fact_requirement_id in requested_fact_ids
+            ]
         requirements.append(
             {
-                **requirement.model_dump(mode="json"),
+                **requirement_payload,
                 "target": target_by_id[requirement.target_id].model_dump(mode="json"),
                 "dimension": dimension_by_id[requirement.dimension_id].model_dump(
                     mode="json"
@@ -379,7 +408,18 @@ def _comparison_compilation_messages(
         "requirements": requirements,
         "evidence": scoped_evidence,
         "repair_errors": {
-            requirement_id: repair_errors[requirement_id]
+            requirement_id: {
+                "code": repair_errors[requirement_id],
+                "required_qualifiers_by_fact": {
+                    item.fact_requirement_id: list(item.required_qualifier_kinds)
+                    for item in requirement_by_id[
+                        requirement_id
+                    ].fact_requirements
+                    if not requested_fact_requirement_ids.get(requirement_id)
+                    or item.fact_requirement_id
+                    in requested_fact_requirement_ids[requirement_id]
+                },
+            }
             for requirement_id in requested_requirement_ids
             if requirement_id in repair_errors
         },
@@ -395,7 +435,12 @@ def _comparison_compilation_messages(
                 "missing IDs, sufficiency, searches, or follow-ups; the system derives them. Use "
                 "only supplied requirement IDs, their own fact requirement IDs, and chunk IDs "
                 "whose eligible_requirement_ids include that cell. Preserve explicit time, "
-                "dataset, method, metric, scope, and condition qualifiers. Return an empty facts "
+                "dataset, method, metric, scope, and condition qualifiers. Required qualifiers "
+                "are per-fact constraints, not per-cell summaries: every returned fact mapped "
+                "to a fact requirement must include every required kind in its own qualifiers "
+                "array. A qualifier mentioned only in the statement or in a sibling fact does "
+                "not satisfy this contract. Never invent a qualifier value; when visible evidence "
+                "cannot support it, omit that fact. Return an empty facts "
                 "array when visible evidence cannot support a required fact. Never move a fact or "
                 "citation across papers. Return only structured fields, never chain-of-thought."
             )
@@ -420,19 +465,25 @@ def _validate_compilation_batch(
 ) -> tuple[
     dict[str, EvidenceCellCompilation],
     dict[str, str],
+    dict[str, tuple[str, ...]],
     int | None,
     int | None,
     bool,
+    int,
+    int,
 ]:
-    """Validate and commit independent cells without losing valid siblings."""
+    """Validate facts independently while retaining valid facts in failed cells."""
     payload = _recover_compilation_payload(raw)
     if not isinstance(payload, Mapping):
         code = "compilation_batch_schema_invalid"
         return (
             {},
             {item: code for item in requested_requirement_ids},
+            _all_requested_fact_ids(plan, requested_requirement_ids),
             *_raw_cell_compilation_counts(raw),
             True,
+            0,
+            0,
         )
     cells = payload.get("cells")
     if not isinstance(cells, Sequence) or isinstance(cells, (str, bytes)):
@@ -440,8 +491,11 @@ def _validate_compilation_batch(
         return (
             {},
             {item: code for item in requested_requirement_ids},
+            _all_requested_fact_ids(plan, requested_requirement_ids),
             *_raw_cell_compilation_counts(payload),
             True,
+            0,
+            0,
         )
     raw_cells = tuple(
         cell.model_dump(mode="python")
@@ -464,24 +518,127 @@ def _validate_compilation_batch(
 
     accepted: dict[str, EvidenceCellCompilation] = {}
     errors: dict[str, str] = {}
+    unresolved: dict[str, tuple[str, ...]] = {}
     schema_invalid = False
+    accepted_fact_count = 0
+    rejected_fact_count = 0
+    requirement_by_id = {item.requirement_id: item for item in plan.requirements}
     for requirement_id in requested_requirement_ids:
+        requirement = requirement_by_id[requirement_id]
+        planned_fact_ids = tuple(
+            item.fact_requirement_id for item in requirement.fact_requirements
+        )
         candidates = grouped[requirement_id]
         if not candidates:
             errors[requirement_id] = "compilation_unit_missing"
+            unresolved[requirement_id] = planned_fact_ids
             continue
         if len(candidates) != 1:
             errors[requirement_id] = "compilation_unit_duplicate"
+            unresolved[requirement_id] = planned_fact_ids
             continue
-        try:
-            cell = EvidenceCellCompilation.model_validate(candidates[0])
-            accepted[requirement_id] = validate_evidence_compilation_cell(
-                plan, observations, cell
-            )
-        except ValueError as error:
-            errors[requirement_id] = _compilation_failure_code(error)
-            schema_invalid = schema_invalid or isinstance(error, ValidationError)
-    return accepted, errors, raw_cell_count, raw_fact_count, schema_invalid
+        raw_facts = candidates[0].get("facts", ())
+        if not isinstance(raw_facts, Sequence) or isinstance(raw_facts, (str, bytes)):
+            errors[requirement_id] = "compilation_unit_schema_invalid"
+            unresolved[requirement_id] = planned_fact_ids
+            schema_invalid = True
+            continue
+        valid_facts: list[EvidenceFactCompilation] = []
+        rejected_codes: list[str] = []
+        rejected_mapped_ids: set[str] = set()
+        for raw_fact in raw_facts:
+            try:
+                fact = EvidenceFactCompilation.model_validate(raw_fact)
+                validate_evidence_compilation_fact(
+                    plan, observations, requirement, fact
+                )
+                valid_facts.append(fact)
+                accepted_fact_count += 1
+            except ValueError as error:
+                rejected_fact_count += 1
+                rejected_codes.append(_compilation_failure_code(error))
+                schema_invalid = schema_invalid or isinstance(error, ValidationError)
+                if isinstance(raw_fact, Mapping):
+                    raw_ids = raw_fact.get("fact_requirement_ids", ())
+                    if isinstance(raw_ids, Sequence) and not isinstance(
+                        raw_ids, (str, bytes)
+                    ):
+                        rejected_mapped_ids.update(
+                            item
+                            for item in raw_ids
+                            if isinstance(item, str) and item in planned_fact_ids
+                        )
+        cell = EvidenceCellCompilation(
+            requirement_id=requirement_id,
+            facts=tuple(valid_facts),
+        )
+        accepted[requirement_id] = cell
+        satisfied_ids = {
+            fact_requirement_id
+            for fact in valid_facts
+            for fact_requirement_id in fact.fact_requirement_ids
+        }
+        if rejected_codes:
+            retry_ids = (
+                rejected_mapped_ids or (set(planned_fact_ids) - satisfied_ids)
+            ) - satisfied_ids
+            if retry_ids:
+                unresolved[requirement_id] = tuple(
+                    item for item in planned_fact_ids if item in retry_ids
+                )
+                errors[requirement_id] = (
+                    rejected_codes[0]
+                    if len(set(rejected_codes)) == 1
+                    else "compilation_facts_invalid"
+                )
+    return (
+        accepted,
+        errors,
+        unresolved,
+        raw_cell_count,
+        raw_fact_count,
+        schema_invalid,
+        accepted_fact_count,
+        rejected_fact_count,
+    )
+
+
+def _all_requested_fact_ids(
+    plan: ResearchPlan,
+    requested_requirement_ids: tuple[str, ...],
+) -> dict[str, tuple[str, ...]]:
+    requested = set(requested_requirement_ids)
+    return {
+        requirement.requirement_id: tuple(
+            item.fact_requirement_id for item in requirement.fact_requirements
+        )
+        for requirement in plan.requirements
+        if requirement.requirement_id in requested
+    }
+
+
+def _merge_compilation_cells(
+    existing: EvidenceCellCompilation | None,
+    incoming: EvidenceCellCompilation,
+) -> EvidenceCellCompilation:
+    """Merge accepted facts using stable fact-mapping and chunk identity."""
+    if existing is None:
+        return incoming
+    facts = (*existing.facts, *incoming.facts)
+    deduplicated = tuple(
+        next(
+            fact
+            for fact in facts
+            if (fact.fact_requirement_ids, fact.chunk_ids) == key
+        )
+        for key in dict.fromkeys(
+            (fact.fact_requirement_ids, fact.chunk_ids) for fact in facts
+        )
+    )
+    return EvidenceCellCompilation(
+        requirement_id=incoming.requirement_id,
+        facts=deduplicated,
+    )
 
 
 def _recover_compilation_payload(raw: Any) -> object:

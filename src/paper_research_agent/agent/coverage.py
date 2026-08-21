@@ -12,12 +12,49 @@ from paper_research_agent.agent.models import (
     EvidenceCellCompilation,
     EvidenceCompilationRepairAudit,
     EvidenceCoverage,
+    EvidenceFactCompilation,
     EvidenceFollowup,
     EvidenceLedgerCell,
     EvidenceRequirement,
     ResearchObservation,
     ResearchPlan,
 )
+
+
+def validate_evidence_compilation_fact(
+    plan: ResearchPlan,
+    observations: tuple[ResearchObservation, ...],
+    requirement: EvidenceRequirement,
+    fact: EvidenceFactCompilation,
+) -> EvidenceFactCompilation:
+    """Validate one model-authored fact against trusted cell scope."""
+    if plan.task_type != "comparison":
+        raise ValueError("evidence fact compilation requires a comparison plan")
+    requirement_by_id = {item.requirement_id: item for item in plan.requirements}
+    trusted_requirement = requirement_by_id.get(requirement.requirement_id)
+    if trusted_requirement != requirement:
+        raise ValueError("compiled evidence fact references an unknown requirement")
+    allowed_chunks = _available_chunks_by_requirement(plan, observations)[
+        requirement.requirement_id
+    ]
+    if not set(fact.chunk_ids) <= allowed_chunks:
+        raise ValueError(
+            "compiled evidence fact references evidence outside its comparison cell"
+        )
+    expected_fact_ids = {
+        item.fact_requirement_id for item in requirement.fact_requirements
+    }
+    if not set(fact.fact_requirement_ids) <= expected_fact_ids:
+        raise ValueError("compiled evidence fact references an unknown fact requirement")
+    required_qualifiers = {
+        kind
+        for item in requirement.fact_requirements
+        if item.fact_requirement_id in fact.fact_requirement_ids
+        for kind in item.required_qualifier_kinds
+    }
+    if not required_qualifiers <= {item.kind for item in fact.qualifiers}:
+        raise ValueError("compiled evidence fact omits a required qualifier")
+    return fact
 
 
 def validate_evidence_compilation_cell(
@@ -32,29 +69,8 @@ def validate_evidence_compilation_cell(
     requirement = requirement_by_id.get(cell.requirement_id)
     if requirement is None:
         raise ValueError("compiled evidence cell references an unknown requirement")
-    allowed_chunks = _available_chunks_by_requirement(plan, observations)[
-        cell.requirement_id
-    ]
-    expected_fact_ids = {
-        item.fact_requirement_id for item in requirement.fact_requirements
-    }
     for fact in cell.facts:
-        if not set(fact.chunk_ids) <= allowed_chunks:
-            raise ValueError(
-                "compiled evidence fact references evidence outside its comparison cell"
-            )
-        if not set(fact.fact_requirement_ids) <= expected_fact_ids:
-            raise ValueError(
-                "compiled evidence fact references an unknown fact requirement"
-            )
-        required_qualifiers = {
-            kind
-            for item in requirement.fact_requirements
-            if item.fact_requirement_id in fact.fact_requirement_ids
-            for kind in item.required_qualifier_kinds
-        }
-        if not required_qualifiers <= {item.kind for item in fact.qualifiers}:
-            raise ValueError("compiled evidence fact omits a required qualifier")
+        validate_evidence_compilation_fact(plan, observations, requirement, fact)
     return cell
 
 
@@ -74,9 +90,6 @@ def project_evidence_compilation(
     failed_ids = set(compiler_failed_requirement_ids)
     if failed_ids - expected_ids:
         raise ValueError("compiler failure references an unknown requirement")
-    if failed_ids & set(committed_cells):
-        raise ValueError("a compilation unit cannot be both committed and failed")
-
     coverage: list[EvidenceCoverage] = []
     ledger: list[EvidenceLedgerCell] = []
     for requirement in plan.requirements:
