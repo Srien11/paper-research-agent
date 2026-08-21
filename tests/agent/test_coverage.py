@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from paper_research_agent.agent.coverage import (
+    ensure_incomplete_followups,
     project_evidence_compilation,
     repair_evidence_assessment,
     repair_evidence_assessment_with_audit,
@@ -147,6 +148,400 @@ def _two_dimension_plan() -> ResearchPlan:
 
 
 class EvidenceCoverageValidationTests(unittest.TestCase):
+    def test_structured_missing_fact_followup_reuses_deterministic_query(self) -> None:
+        base = _plan()
+        requirements = list(base.requirements)
+        requirements[0] = requirements[0].model_copy(
+            update={
+                "fact_requirements": (
+                    EvidenceFactRequirement(
+                        fact_requirement_id="a-reasoning-failure",
+                        description="Reasoning failure",
+                        protected_anchors=("推理", "失败"),
+                        retrieval_expansions=("reasoning", "failure"),
+                    ),
+                )
+            }
+        )
+        plan = base.model_copy(update={"requirements": tuple(requirements)})
+        assessment = EvidenceAssessment(
+            evidence_sufficient=False,
+            status="missing_coverage",
+            coverage=(
+                EvidenceCoverage(requirement_id="a-method", covered=False),
+                EvidenceCoverage(requirement_id="b-method", covered=False),
+            ),
+            ledger=(
+                EvidenceLedgerCell(
+                    requirement_id="a-method",
+                    status="missing",
+                    missing_fact_requirement_ids=("a-reasoning-failure",),
+                ),
+                EvidenceLedgerCell(
+                    requirement_id="b-method",
+                    status="missing",
+                    missing_fact_requirement_ids=("b-method-primary",),
+                ),
+            ),
+        )
+
+        refined = ensure_incomplete_followups(
+            plan,
+            (_observation(),),
+            assessment,
+            remaining_steps=1,
+        )
+
+        self.assertEqual(
+            refined.followups[0].query,
+            "Paper A 推理 失败 reasoning failure",
+        )
+
+    def test_sufficient_assessment_requires_every_structured_fact_query_to_run(
+        self,
+    ) -> None:
+        plan = ResearchPlan(
+            task_type="comparison",
+            targets=(
+                ResearchTarget(target_id="a", label="Paper A", corpus_id="C001"),
+                ResearchTarget(target_id="b", label="Paper B", corpus_id="T001"),
+            ),
+            dimensions=(ResearchDimension(dimension_id="method", label="Method"),),
+            requirements=(
+                EvidenceRequirement(
+                    requirement_id="a-method",
+                    target_id="a",
+                    dimension_id="method",
+                    description="Paper A method",
+                    fact_requirements=(
+                        EvidenceFactRequirement(
+                            fact_requirement_id="a-reasoning",
+                            description="Reasoning failure",
+                            protected_anchors=("推理", "失败"),
+                        ),
+                        EvidenceFactRequirement(
+                            fact_requirement_id="a-mitigation",
+                            description="Mitigation",
+                            protected_anchors=("缓解",),
+                        ),
+                    ),
+                ),
+                EvidenceRequirement(
+                    requirement_id="b-method",
+                    target_id="b",
+                    dimension_id="method",
+                    description="Paper B method",
+                ),
+            ),
+            steps=(
+                ResearchStep(
+                    step_id="fact-a-reasoning",
+                    objective="Find reasoning failure",
+                    query="Paper A 推理 失败",
+                    corpus_id="C001",
+                    target_ids=("a",),
+                    dimension_ids=("method",),
+                    fact_requirement_id="a-reasoning",
+                ),
+                ResearchStep(
+                    step_id="fact-a-mitigation",
+                    objective="Find mitigation",
+                    query="Paper A 缓解",
+                    corpus_id="C001",
+                    target_ids=("a",),
+                    dimension_ids=("method",),
+                    fact_requirement_id="a-mitigation",
+                ),
+                ResearchStep(
+                    step_id="b-method",
+                    objective="Find Paper B method",
+                    query="Paper B method",
+                    corpus_id="T001",
+                    target_ids=("b",),
+                    dimension_ids=("method",),
+                ),
+            ),
+        )
+
+        def observation(step_id: str, query: str, chunk_id: str, corpus_id: str):
+            record = EvidenceRecord(
+                chunk_id=chunk_id,
+                corpus_id=corpus_id,
+                page_start=1,
+                page_end=1,
+                text=f"Evidence for {chunk_id}",
+                text_sha256=("a" if corpus_id == "C001" else "b") * 64,
+                storage_class="internal_research_only",
+            )
+            return ResearchObservation(
+                step_id=step_id,
+                objective=step_id,
+                search=SearchCorpusResult(
+                    query=query,
+                    corpus_id=corpus_id,
+                    index_id="idx-test",
+                    degraded=False,
+                    hits=(),
+                ),
+                evidence=GetEvidenceResult(records=(record,)),
+            )
+
+        observations = (
+            observation(
+                "fact-a-reasoning", "Paper A 推理 失败", "chunk-a", "C001"
+            ),
+            observation("b-method", "Paper B method", "chunk-b", "T001"),
+        )
+        assessment = EvidenceAssessment(
+            evidence_sufficient=True,
+            status="sufficient",
+            coverage=(
+                EvidenceCoverage(
+                    requirement_id="a-method", covered=True, chunk_ids=("chunk-a",)
+                ),
+                EvidenceCoverage(
+                    requirement_id="b-method", covered=True, chunk_ids=("chunk-b",)
+                ),
+            ),
+            ledger=(
+                EvidenceLedgerCell(
+                    requirement_id="a-method",
+                    status="sufficient",
+                    facts=(
+                        CompiledEvidenceFact(
+                            fact_id="a-fact",
+                            statement="Paper A facts",
+                            chunk_ids=("chunk-a",),
+                            fact_requirement_ids=("a-reasoning", "a-mitigation"),
+                        ),
+                    ),
+                ),
+                EvidenceLedgerCell(
+                    requirement_id="b-method",
+                    status="sufficient",
+                    facts=(
+                        CompiledEvidenceFact(
+                            fact_id="b-fact",
+                            statement="Paper B fact",
+                            chunk_ids=("chunk-b",),
+                            fact_requirement_ids=("b-method-primary",),
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        with self.assertRaisesRegex(ValueError, "not been executed"):
+            validate_evidence_assessment(plan, observations, assessment)
+
+        completed = (
+            *observations,
+            observation(
+                "fact-a-mitigation", "Paper A 缓解", "chunk-a-extra", "C001"
+            ),
+        )
+        self.assertEqual(
+            validate_evidence_assessment(plan, completed, assessment),
+            assessment,
+        )
+
+    def test_generated_followups_query_one_missing_atomic_fact_at_a_time(self) -> None:
+        base = _plan()
+        requirements = list(base.requirements)
+        requirements[0] = requirements[0].model_copy(
+            update={
+                "fact_requirements": (
+                    EvidenceFactRequirement(
+                        fact_requirement_id="a-method-mechanism",
+                        description="Explain the core mechanism in full",
+                        search_query="mechanism retrieval terms",
+                    ),
+                    EvidenceFactRequirement(
+                        fact_requirement_id="a-method-input",
+                        description="Identify the required input dependency in full",
+                        search_query="input retrieval terms",
+                    ),
+                )
+            }
+        )
+        plan = base.model_copy(update={"requirements": tuple(requirements)})
+        assessment = EvidenceAssessment(
+            evidence_sufficient=False,
+            status="missing_coverage",
+            coverage=(
+                EvidenceCoverage(requirement_id="a-method", covered=False),
+                EvidenceCoverage(requirement_id="b-method", covered=False),
+            ),
+            ledger=(
+                EvidenceLedgerCell(
+                    requirement_id="a-method",
+                    status="missing",
+                    missing_fact_requirement_ids=(
+                        "a-method-mechanism",
+                        "a-method-input",
+                    ),
+                ),
+                EvidenceLedgerCell(
+                    requirement_id="b-method",
+                    status="missing",
+                    missing_fact_requirement_ids=("b-method-primary",),
+                ),
+            ),
+        )
+
+        refined = ensure_incomplete_followups(
+            plan,
+            (_observation(),),
+            assessment,
+            remaining_steps=2,
+        )
+
+        self.assertEqual(len(refined.followups), 2)
+        self.assertEqual(
+            [item.requirement_id for item in refined.followups],
+            ["a-method", "a-method"],
+        )
+        self.assertEqual(
+            [item.fact_requirement_id for item in refined.followups],
+            ["a-method-mechanism", "a-method-input"],
+        )
+        self.assertEqual(
+            refined.followups[0].query,
+            "Paper A Method: mechanism retrieval terms",
+        )
+        self.assertNotIn("input retrieval terms", refined.followups[0].query)
+        self.assertIn("input retrieval terms", refined.followups[1].query)
+        self.assertNotIn("mechanism retrieval terms", refined.followups[1].query)
+        self.assertTrue(
+            all("Paper A" in item.query and "Method" in item.query for item in refined.followups)
+        )
+
+    def test_generated_followup_falls_back_for_legacy_fact_requirement(self) -> None:
+        base = _plan()
+        requirements = list(base.requirements)
+        requirements[0] = requirements[0].model_copy(
+            update={
+                "fact_requirements": (
+                    EvidenceFactRequirement(
+                        fact_requirement_id="a-method-legacy",
+                        description="Legacy input dependency description",
+                        origin="derived",
+                    ),
+                )
+            }
+        )
+        plan = base.model_copy(update={"requirements": tuple(requirements)})
+        assessment = EvidenceAssessment(
+            evidence_sufficient=False,
+            status="missing_coverage",
+            coverage=(
+                EvidenceCoverage(requirement_id="a-method", covered=False),
+                EvidenceCoverage(requirement_id="b-method", covered=False),
+            ),
+            ledger=(
+                EvidenceLedgerCell(
+                    requirement_id="a-method",
+                    status="missing",
+                    missing_fact_requirement_ids=("a-method-legacy",),
+                ),
+                EvidenceLedgerCell(
+                    requirement_id="b-method",
+                    status="missing",
+                    missing_fact_requirement_ids=("b-method-primary",),
+                ),
+            ),
+        )
+
+        refined = ensure_incomplete_followups(
+            plan,
+            (_observation(),),
+            assessment,
+            remaining_steps=1,
+        )
+
+        self.assertEqual(refined.followups[0].fact_requirement_id, "a-method-legacy")
+        self.assertIn(
+            "Legacy input dependency description",
+            refined.followups[0].query,
+        )
+
+    def test_fact_bound_followup_must_target_a_missing_fact_in_its_cell(self) -> None:
+        base = _plan()
+        requirements = list(base.requirements)
+        requirements[0] = requirements[0].model_copy(
+            update={
+                "fact_requirements": (
+                    EvidenceFactRequirement(
+                        fact_requirement_id="a-method-mechanism",
+                        description="Core mechanism",
+                        search_query="Paper A core mechanism",
+                    ),
+                    EvidenceFactRequirement(
+                        fact_requirement_id="a-method-input",
+                        description="Input dependency",
+                        search_query="Paper A input dependency",
+                    ),
+                )
+            }
+        )
+        plan = base.model_copy(update={"requirements": tuple(requirements)})
+        assessment = EvidenceAssessment(
+            evidence_sufficient=False,
+            status="missing_coverage",
+            coverage=(
+                EvidenceCoverage(
+                    requirement_id="a-method",
+                    covered=True,
+                    chunk_ids=("chunk-a",),
+                ),
+                EvidenceCoverage(requirement_id="b-method", covered=False),
+            ),
+            ledger=(
+                EvidenceLedgerCell(
+                    requirement_id="a-method",
+                    status="partial",
+                    facts=(
+                        CompiledEvidenceFact(
+                            fact_id="a-method-f1",
+                            statement="Paper A uses method X.",
+                            chunk_ids=("chunk-a",),
+                            fact_requirement_ids=("a-method-mechanism",),
+                        ),
+                    ),
+                    missing_fact_requirement_ids=("a-method-input",),
+                ),
+                EvidenceLedgerCell(
+                    requirement_id="b-method",
+                    status="missing",
+                    missing_fact_requirement_ids=("b-method-primary",),
+                ),
+            ),
+        )
+        invalid_cases = (
+            ("a-method", "unknown-fact", "does not belong"),
+            ("a-method", "a-method-mechanism", "not missing"),
+            ("a-method", "b-method-primary", "does not belong"),
+            ("b-method", "a-method-input", "does not belong"),
+        )
+
+        for requirement_id, fact_requirement_id, message in invalid_cases:
+            with self.subTest(
+                requirement_id=requirement_id,
+                fact_requirement_id=fact_requirement_id,
+            ):
+                followup = EvidenceFollowup(
+                    requirement_id=requirement_id,
+                    fact_requirement_id=fact_requirement_id,
+                    query="atomic query",
+                    objective="Find one fact",
+                )
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_evidence_assessment(
+                        plan,
+                        (_observation(),),
+                        assessment.model_copy(update={"followups": (followup,)}),
+                    )
+
     def test_minimal_cell_validation_enforces_plan_fact_and_chunk_scope(self) -> None:
         valid = EvidenceCellCompilation.model_validate(
             {

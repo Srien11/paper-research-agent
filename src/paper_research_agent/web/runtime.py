@@ -1361,6 +1361,26 @@ def _environment_float(name: str, default: float) -> float:
 def _research_policy_from_environment() -> object:
     from paper_research_agent.agent.policy import ResearchRuntimePolicy
 
+    legacy_name = "PRA_RESEARCH_AGENT_EVIDENCE_PER_STEP"
+    cutoff_names = (
+        "PRA_RESEARCH_AGENT_INITIAL_EVIDENCE_PER_STEP",
+        "PRA_RESEARCH_AGENT_FIRST_FOLLOWUP_EVIDENCE_PER_STEP",
+        "PRA_RESEARCH_AGENT_LATER_FOLLOWUP_EVIDENCE_PER_STEP",
+    )
+    legacy_configured = bool(os.getenv(legacy_name, "").strip())
+    if legacy_configured and any(os.getenv(name, "").strip() for name in cutoff_names):
+        raise ValueError(
+            "legacy and adaptive research evidence cutoff variables cannot be combined"
+        )
+    if legacy_configured:
+        initial_evidence = _environment_int(legacy_name, 4)
+        first_followup_evidence = initial_evidence
+        later_followup_evidence = initial_evidence
+    else:
+        initial_evidence = _environment_int(cutoff_names[0], 4)
+        first_followup_evidence = _environment_int(cutoff_names[1], 6)
+        later_followup_evidence = _environment_int(cutoff_names[2], 10)
+
     return ResearchRuntimePolicy(
         max_steps=_environment_int("PRA_RESEARCH_AGENT_MAX_STEPS", 24),
         max_followup_steps=_environment_int(
@@ -1371,10 +1391,13 @@ def _research_policy_from_environment() -> object:
             "PRA_COMPARISON_SEARCH_CONCURRENCY",
             2,
         ),
-        evidence_per_step=_environment_int(
-            "PRA_RESEARCH_AGENT_EVIDENCE_PER_STEP",
-            4,
+        adaptive_evidence_hydration_enabled=_environment_flag(
+            "PRA_RESEARCH_AGENT_ADAPTIVE_EVIDENCE_HYDRATION_ENABLED",
+            default=False,
         ),
+        initial_evidence_per_step=initial_evidence,
+        first_followup_evidence_per_step=first_followup_evidence,
+        later_followup_evidence_per_step=later_followup_evidence,
         max_tool_calls=_environment_int("PRA_RESEARCH_AGENT_MAX_TOOL_CALLS", 48),
         timeout_seconds=_environment_float(
             "PRA_RESEARCH_AGENT_TIMEOUT_SECONDS",

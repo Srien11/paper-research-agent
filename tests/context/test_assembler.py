@@ -175,6 +175,12 @@ class ContextAssemblerTests(unittest.TestCase):
                 evidence=(
                     evidence("a-1", "RAW_SECRET_A", 1, corpus_id="C001"),
                     evidence("b-1", "RAW_SECRET_B", 2, corpus_id="C002"),
+                    evidence(
+                        "uncompiled-rank-5",
+                        "FORBIDDEN_UNCOMPILED_FACT",
+                        5,
+                        corpus_id="C001",
+                    ),
                 ),
                 token_budget=4000,
             ),
@@ -185,8 +191,13 @@ class ContextAssemblerTests(unittest.TestCase):
         prompt = "\n".join(item.content for item in context.messages)
         self.assertNotIn("RAW_SECRET_A", prompt)
         self.assertNotIn("RAW_SECRET_B", prompt)
+        self.assertNotIn("FORBIDDEN_UNCOMPILED_FACT", prompt)
         self.assertIn("a uses a verified method", prompt)
         self.assertEqual({item.citation_id for item in context.citations}, {"E1", "E2"})
+        self.assertNotIn(
+            "uncompiled-rank-5",
+            {item.chunk_id for item in context.citations},
+        )
 
     def test_comparison_task_state_has_a_trusted_synthesis_policy(self) -> None:
         context = assemble_context(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+from paper_research_agent.agent.fact_queries import compose_fact_search_query
 from paper_research_agent.agent.models import (
     AssessmentStatus,
     CompiledEvidenceFact,
@@ -163,6 +164,25 @@ def validate_evidence_assessment(
             raise ValueError("direct assessment cannot declare comparison coverage")
         return assessment
 
+    if assessment.evidence_sufficient:
+        required_structured_fact_ids = {
+            fact.fact_requirement_id
+            for requirement in plan.requirements
+            for fact in requirement.fact_requirements
+            if fact.origin == "planned" and fact.protected_anchors
+        }
+        step_by_id = {step.step_id: step for step in plan.steps}
+        executed_fact_ids = {
+            step.fact_requirement_id
+            for observation in observations
+            if (step := step_by_id.get(observation.step_id)) is not None
+            and step.fact_requirement_id is not None
+        }
+        if not required_structured_fact_ids <= executed_fact_ids:
+            raise ValueError(
+                "structured fact query has not been executed before sufficiency"
+            )
+
     expected_ids = {item.requirement_id for item in plan.requirements}
     actual_ids = {item.requirement_id for item in assessment.coverage}
     if actual_ids != expected_ids or len(assessment.coverage) != len(expected_ids):
@@ -259,9 +279,37 @@ def validate_evidence_assessment(
         raise ValueError("comparison follow-up query requires missing requirement IDs")
     if len(assessment.next_requirement_ids) > 1:
         raise ValueError("comparison follow-up must target one requirement cell")
-    followup_ids = {item.requirement_id for item in assessment.followups}
-    if not followup_ids <= missing_ids:
+    followup_requirement_ids = {item.requirement_id for item in assessment.followups}
+    if not followup_requirement_ids <= missing_ids:
         raise ValueError("follow-ups must reference uncovered requirements")
+    requirement_by_id = {item.requirement_id: item for item in plan.requirements}
+    ledger_by_id = {item.requirement_id: item for item in assessment.ledger}
+    for followup in assessment.followups:
+        if followup.fact_requirement_id is None:
+            continue
+        requirement = requirement_by_id[followup.requirement_id]
+        expected_fact_ids = {
+            item.fact_requirement_id for item in requirement.fact_requirements
+        }
+        if followup.fact_requirement_id not in expected_fact_ids:
+            raise ValueError(
+                "follow-up fact requirement does not belong to its requirement cell"
+            )
+        followup_cell = ledger_by_id.get(followup.requirement_id)
+        if followup_cell is None:
+            raise ValueError("fact-bound follow-up requires a comparison ledger cell")
+        missing_fact_ids = set(followup_cell.missing_fact_requirement_ids)
+        if not missing_fact_ids and all(
+            item.origin == "derived" for item in requirement.fact_requirements
+        ):
+            satisfied_fact_ids = {
+                fact_requirement_id
+                for fact in followup_cell.facts
+                for fact_requirement_id in _fact_requirement_ids(fact, requirement)
+            }
+            missing_fact_ids = expected_fact_ids - satisfied_fact_ids
+        if followup.fact_requirement_id not in missing_fact_ids:
+            raise ValueError("follow-up fact requirement is not missing")
     return assessment
 
 
@@ -475,25 +523,57 @@ def ensure_incomplete_followups(
             continue
         requirement = requirement_by_id[cell.requirement_id]
         missing_ids = set(cell.missing_fact_requirement_ids)
-        missing_descriptions = [
-            item.description
+        if not missing_ids and all(
+            item.origin == "derived" for item in requirement.fact_requirements
+        ):
+            satisfied_ids = {
+                fact_requirement_id
+                for fact in cell.facts
+                for fact_requirement_id in _fact_requirement_ids(fact, requirement)
+            }
+            missing_ids = {
+                item.fact_requirement_id for item in requirement.fact_requirements
+            } - satisfied_ids
+        missing_fact_requirements = [
+            item
             for item in requirement.fact_requirements
             if item.fact_requirement_id in missing_ids
         ]
-        if not missing_descriptions:
-            missing_descriptions = [requirement.description]
         target = target_by_id[requirement.target_id]
         dimension = dimension_by_id[requirement.dimension_id]
-        focus = "; ".join(missing_descriptions)
-        followups.append(
-            EvidenceFollowup(
-                requirement_id=requirement.requirement_id,
-                query=f"{target.label} {dimension.label}: {focus}"[:2000],
-                objective=f"Find missing facts for {target.label} {dimension.label}: {focus}"[
-                    :500
-                ],
+        missing_facts: tuple[tuple[str | None, str, str], ...]
+        if not missing_fact_requirements:
+            focus = requirement.description
+            missing_facts = (
+                (None, f"{target.label} {dimension.label}: {focus}"[:2000], focus),
             )
-        )
+        else:
+            missing_facts = tuple(
+                (
+                    item.fact_requirement_id,
+                    (
+                        compose_fact_search_query(target.label, item)
+                        if item.protected_anchors
+                        else f"{target.label} {dimension.label}: "
+                        f"{item.search_query or item.description}"[:2000]
+                    ),
+                    item.search_query or item.description,
+                )
+                for item in missing_fact_requirements
+            )
+        for fact_requirement_id, query, focus in missing_facts:
+            followups.append(
+                EvidenceFollowup(
+                    requirement_id=requirement.requirement_id,
+                    fact_requirement_id=fact_requirement_id,
+                    query=query,
+                    objective=(
+                        f"Find missing fact for {target.label} {dimension.label}: {focus}"
+                    )[:500],
+                )
+            )
+            if len(followups) >= min(remaining_steps, 4):
+                break
         if len(followups) >= min(remaining_steps, 4):
             break
     if not followups:

@@ -47,6 +47,87 @@ def _hit(*, rank: int = 1) -> SearchCorpusHit:
 
 
 class ResearchToolModelTests(unittest.TestCase):
+    def test_fact_requirement_normalizes_structured_query_terms(self) -> None:
+        item = EvidenceFactRequirement(
+            fact_requirement_id="a-method-input",
+            description="Input dependency",
+            protected_anchor_ids=(2, 3),
+            protected_anchors=("  深度理解  ", "推理"),
+            retrieval_expansions=("  deep understanding ", "reasoning"),
+        )
+
+        self.assertEqual(item.protected_anchors, ("深度理解", "推理"))
+        self.assertEqual(item.protected_anchor_ids, (2, 3))
+        self.assertEqual(
+            item.retrieval_expansions,
+            ("deep understanding", "reasoning"),
+        )
+
+    def test_fact_requirement_rejects_blank_or_duplicate_structured_terms(self) -> None:
+        for field_name, values in (
+            ("protected_anchors", ("推理", "  推理  ")),
+            ("retrieval_expansions", ("reasoning", "   ")),
+        ):
+            with self.subTest(field_name=field_name), self.assertRaises(ValidationError):
+                EvidenceFactRequirement(
+                    fact_requirement_id="a-method-input",
+                    description="Input dependency",
+                    **{field_name: values},
+                )
+
+    def test_legacy_search_query_is_not_exposed_in_provider_schema(self) -> None:
+        schema = EvidenceFactRequirement.model_json_schema()
+
+        self.assertNotIn("search_query", schema["properties"])
+        self.assertNotIn("protected_anchors", schema["properties"])
+        self.assertNotIn("protected_anchor_fallback", schema["properties"])
+        self.assertIn("protected_anchor_ids", schema["properties"])
+        self.assertIn("retrieval_expansions", schema["properties"])
+
+    def test_legacy_fact_requirement_without_search_query_remains_readable(self) -> None:
+        item = EvidenceFactRequirement(
+            fact_requirement_id="a-method-input",
+            description="Input dependency",
+            origin="derived",
+        )
+
+        self.assertIsNone(item.search_query)
+
+    def test_fact_requirement_normalizes_atomic_search_query(self) -> None:
+        item = EvidenceFactRequirement(
+            fact_requirement_id="a-method-input",
+            description="Input dependency and required input source",
+            search_query="  required input source dependency  ",
+        )
+
+        self.assertEqual(item.search_query, "required input source dependency")
+
+    def test_fact_requirement_rejects_blank_or_oversized_search_query(self) -> None:
+        for invalid_query in ("   ", "x" * 501):
+            with (
+                self.subTest(invalid_query_length=len(invalid_query)),
+                self.assertRaises(ValidationError),
+            ):
+                EvidenceFactRequirement(
+                    fact_requirement_id="a-method-input",
+                    description="Input dependency",
+                    search_query=invalid_query,
+                )
+
+    def test_fact_requirement_search_query_is_frozen_and_round_trips(self) -> None:
+        item = EvidenceFactRequirement(
+            fact_requirement_id="a-method-input",
+            description="Input dependency",
+            search_query="Paper A required input dependency",
+        )
+
+        restored = EvidenceFactRequirement.model_validate(item.model_dump())
+
+        self.assertEqual(restored, item)
+        self.assertEqual(restored.search_query, "Paper A required input dependency")
+        with self.assertRaises(ValidationError):
+            item.search_query = "replacement"  # type: ignore[misc]
+
     def test_minimal_compilation_contract_excludes_all_derived_state(self) -> None:
         cell = EvidenceCellCompilation.model_validate(
             {

@@ -61,6 +61,10 @@ class RetrievalDiagnostic(FrozenEvaluationModel):
     step_id_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     target_ids: tuple[str, ...]
     dimension_ids: tuple[str, ...]
+    fact_requirement_id: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$",
+    )
     corpus_id_filter: str | None = Field(default=None, pattern=r"^[CT]\d{3}$")
     search_count: int = Field(default=1, ge=1)
     search_hit_chunk_ids: tuple[str, ...]
@@ -101,6 +105,11 @@ class FactLineageDiagnostic(FrozenEvaluationModel):
     expressed: bool
     citation_correct: bool
     loss_stage: FactLossStage
+    best_final_rank: int | None = Field(default=None, ge=1)
+    best_stage_ranks: dict[str, int] = Field(default_factory=dict)
+    search_occurrences: int = Field(default=0, ge=0)
+    same_page_top4: bool = False
+    same_section_top4: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -135,6 +144,17 @@ class FactLineageDiagnostic(FrozenEvaluationModel):
         )
         if self.loss_stage != expected:
             raise ValueError("fact lineage loss stage is inconsistent with stage flags")
+        if any(
+            not stage.strip() or rank <= 0
+            for stage, rank in self.best_stage_ranks.items()
+        ):
+            raise ValueError("fact lineage stage ranks must be positive")
+        if self.best_final_rank is not None and self.best_stage_ranks.get(
+            "final", self.best_final_rank
+        ) != self.best_final_rank:
+            raise ValueError("best final rank must match the selected stage lineage")
+        if self.search_occurrences == 0 and self.best_final_rank is not None:
+            raise ValueError("ranked fact lineage requires a search occurrence")
         return self
 
 
@@ -218,6 +238,8 @@ class ComparisonCaseDiagnostic(FrozenEvaluationModel):
     compilation_audit: CompilationAuditDiagnostic | None = None
     tool_call_count: int = Field(default=0, ge=0)
     tool_call_budget: int | None = Field(default=None, ge=1)
+    generation_input_tokens: int = Field(default=0, ge=0)
+    generation_output_tokens: int = Field(default=0, ge=0)
     citations: tuple[CitationDiagnostic, ...]
     fact_lineage: tuple[FactLineageDiagnostic, ...] = ()
     answer_status: Literal[
@@ -255,6 +277,11 @@ def classify_fact_lineage(
     in_generation_input: bool,
     expressed: bool,
     citation_correct: bool,
+    best_final_rank: int | None = None,
+    best_stage_ranks: dict[str, int] | None = None,
+    search_occurrences: int = 0,
+    same_page_top4: bool = False,
+    same_section_top4: bool = False,
 ) -> FactLineageDiagnostic:
     """Classify one gold fact without copying gold or evidence text into diagnostics."""
     expected = set(gold_chunk_ids)
@@ -302,6 +329,11 @@ def classify_fact_lineage(
         expressed=output_present,
         citation_correct=citation_valid,
         loss_stage=stage,
+        best_final_rank=best_final_rank,
+        best_stage_ranks={} if best_stage_ranks is None else best_stage_ranks,
+        search_occurrences=search_occurrences,
+        same_page_top4=same_page_top4,
+        same_section_top4=same_section_top4,
     )
 
 

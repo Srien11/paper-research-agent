@@ -21,6 +21,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from paper_research_agent.agent.policy import ResearchRuntimePolicy
 from paper_research_agent.answering.config import load_answering_config
+from paper_research_agent.chunking.chunker import canonical_sha256
 from paper_research_agent.evaluation.candidate_gold import load_candidate_paper_gold
 from paper_research_agent.evaluation.comparison_end_to_end import (
     CitationDiagnostic,
@@ -38,6 +39,7 @@ from paper_research_agent.evaluation.comparison_end_to_end import (
     question_sha256,
     score_deterministic_case,
 )
+from paper_research_agent.retrieval.contracts import BilingualRetrievalRun, SearchHit
 from paper_research_agent.web.runtime import RAGRuntime
 
 
@@ -283,9 +285,13 @@ def _load_answer_gold(path: Path) -> dict[str, ComparisonEndToEndGold]:
 
 
 class _QueryRecorder:
-    def __init__(self, inner: Any) -> None:
+    def __init__(self, inner: Any, *, rerank_mode: str = "current") -> None:
+        if rerank_mode not in {"current", "off"}:
+            raise ValueError("unsupported rerank mode")
         self.inner = inner
+        self.rerank_mode = rerank_mode
         self.calls: list[dict[str, object]] = []
+        self.retrieval_runs: list[BilingualRetrievalRun] = []
 
     async def resolve_query(self, question: str):
         started = time.perf_counter()
@@ -300,7 +306,11 @@ class _QueryRecorder:
         return trace
 
     async def search(self, *args: Any, **kwargs: Any):
-        return await self.inner.search(*args, **kwargs)
+        if self.rerank_mode == "off":
+            kwargs["rerank"] = False
+        run = await self.inner.search(*args, **kwargs)
+        self.retrieval_runs.append(BilingualRetrievalRun.model_validate(run))
+        return run
 
     async def aclose(self) -> None:
         await self.inner.aclose()
@@ -361,6 +371,7 @@ def _diagnostic(
     candidate_call: dict[str, object] | None,
     research: Any | None,
     answer: Any | None,
+    generation: Any | None,
     elapsed_ms: float,
     error: Exception | None,
 ) -> ComparisonCaseDiagnostic:
@@ -386,6 +397,7 @@ def _diagnostic(
                     step_id_hash=hashlib.sha256(step.step_id.encode("utf-8")).hexdigest(),
                     target_ids=step.target_ids,
                     dimension_ids=step.dimension_ids,
+                    fact_requirement_id=step.fact_requirement_id,
                     corpus_id_filter=observation.search.corpus_id,
                     search_hit_chunk_ids=tuple(
                         hit.chunk_id for hit in observation.search.hits
@@ -451,6 +463,8 @@ def _diagnostic(
         tool_call_budget=(
             int(research.tool_call_budget) if research is not None else None
         ),
+        generation_input_tokens=int(getattr(generation, "input_tokens", 0)),
+        generation_output_tokens=int(getattr(generation, "output_tokens", 0)),
         citations=tuple(citations),
         answer_status=(answer.status if answer is not None else None),
         total_latency_ms=elapsed_ms,
@@ -471,6 +485,7 @@ def _fact_lineage(
     research: Any | None,
     answer: Any | None,
     model_judge_score: ComparisonModelJudgeScore | None,
+    retrieval_runs: tuple[BilingualRetrievalRun, ...] = (),
 ) -> tuple[object, ...]:
     retrieved = tuple(
         hit.chunk_id
@@ -559,6 +574,7 @@ def _fact_lineage(
             if chunk_id not in gold_chunks
             and chunk_corpus_ids.get(chunk_id) == gold_claim.corpus_id
         )
+        ranking = _fact_ranking(relation.chunk_ids, retrieval_runs)
         result.append(
             classify_fact_lineage(
                 gold_claim.claim_id,
@@ -578,19 +594,77 @@ def _fact_lineage(
                     if semantic_match is not None
                     else exact_citation_correct
                 ),
+                **ranking,
             )
         )
     return tuple(result)
 
 
+def _fact_ranking(
+    gold_chunk_ids: tuple[str, ...],
+    retrieval_runs: tuple[BilingualRetrievalRun, ...],
+) -> dict[str, object]:
+    """Select one real best-ranked path and diagnose body-free Top 4 competition."""
+    gold = set(gold_chunk_ids)
+    occurrences: list[tuple[BilingualRetrievalRun, SearchHit]] = []
+    for run in retrieval_runs:
+        matching = tuple(hit for hit in run.hits if hit.chunk_id in gold)
+        if matching:
+            occurrences.append((run, min(matching, key=lambda hit: hit.final_rank)))
+    if not occurrences:
+        return {
+            "best_final_rank": None,
+            "best_stage_ranks": {},
+            "search_occurrences": 0,
+            "same_page_top4": False,
+            "same_section_top4": False,
+        }
+
+    best_run, best_hit = min(occurrences, key=lambda item: item[1].final_rank)
+    competitors = tuple(hit for hit in best_run.hits[:4] if hit.chunk_id not in gold)
+    same_page = any(
+        hit.corpus_id == best_hit.corpus_id
+        and hit.page_start <= best_hit.page_end
+        and best_hit.page_start <= hit.page_end
+        for hit in competitors
+    )
+    same_section = best_hit.section_id is not None and any(
+        hit.corpus_id == best_hit.corpus_id and hit.section_id == best_hit.section_id
+        for hit in competitors
+    )
+    return {
+        "best_final_rank": best_hit.final_rank,
+        "best_stage_ranks": {**best_hit.ranks, "final": best_hit.final_rank},
+        "search_occurrences": len(occurrences),
+        "same_page_top4": same_page,
+        "same_section_top4": same_section,
+    }
+
+
 async def run(args: argparse.Namespace) -> dict[str, object]:
-    questions = load_candidate_paper_gold(args.gold)[: args.limit]
+    available_questions = load_candidate_paper_gold(args.gold)
+    requested_question_ids = tuple(getattr(args, "question_ids", ()))
+    if len(requested_question_ids) != len(set(requested_question_ids)):
+        raise ValueError("question IDs must be unique")
+    if requested_question_ids:
+        requested = set(requested_question_ids)
+        available_ids = {item.question_id for item in available_questions}
+        if unknown_ids := requested - available_ids:
+            raise ValueError(
+                f"unknown question IDs: {', '.join(sorted(unknown_ids))}"
+            )
+        questions = tuple(
+            item for item in available_questions if item.question_id in requested
+        )[: args.limit]
+    else:
+        questions = available_questions[: args.limit]
     answer_gold = _load_answer_gold(args.answer_gold)
     missing_gold = {question.question_id for question in questions} - set(answer_gold)
     if missing_gold:
         raise ValueError("answer gold does not cover every selected question")
     runtime = RAGRuntime.from_environment()
-    query_recorder = _QueryRecorder(runtime._retriever)
+    experiment = _experiment_metadata(args, runtime._retriever)
+    query_recorder = _QueryRecorder(runtime._retriever, rerank_mode=args.rerank_mode)
     candidate_recorder = _CandidateRecorder(runtime._paper_candidate_retriever)
     runtime._retriever = query_recorder
     runtime._paper_candidate_retriever = candidate_recorder
@@ -598,7 +672,12 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
     await runtime.enable_research_agent(
         model_id=answer_config.model,
         checkpoint_path=args.checkpoint,
-        policy=ResearchRuntimePolicy(timeout_seconds=args.timeout),
+        policy=ResearchRuntimePolicy(
+            timeout_seconds=args.timeout,
+            initial_evidence_per_step=args.evidence_per_step,
+            first_followup_evidence_per_step=args.evidence_per_step,
+            later_followup_evidence_per_step=args.evidence_per_step,
+        ),
         mode="always",
     )
     research_recorder = _ResearchRecorder(runtime._research_agent)
@@ -616,19 +695,19 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
     chunk_corpus_ids = {chunk.chunk_id: chunk.corpus_id for chunk in runtime._chunks}
     cases: list[ComparisonCaseDiagnostic] = []
     if args.resume and args.output.is_file():
-        previous = json.loads(args.output.read_text(encoding="utf-8"))
         selected_ids = {question.question_id for question in questions}
-        cases = [
-            ComparisonCaseDiagnostic.model_validate(item)
-            for item in previous.get("cases", ())
-            if item.get("question_id") in selected_ids
-        ]
+        cases = _load_resumed_cases(
+            args.output,
+            experiment_fingerprint=str(experiment["experiment_fingerprint"]),
+            selected_ids=selected_ids,
+        )
     completed_ids = {case.question_id for case in cases}
     try:
         for index, question in enumerate(questions, start=1):
             if question.question_id in completed_ids:
                 continue
             query_index = len(query_recorder.calls)
+            retrieval_index = len(query_recorder.retrieval_runs)
             candidate_index = len(candidate_recorder.calls)
             research_index = len(research_recorder.results)
             started = time.perf_counter()
@@ -663,6 +742,7 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
                 candidate_call=candidate_call,
                 research=research,
                 answer=(result.answer if result is not None else None),
+                generation=(result.generation if result is not None else None),
                 elapsed_ms=(time.perf_counter() - started) * 1000,
                 error=error,
             )
@@ -688,6 +768,9 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
                         research=research,
                         answer=(result.answer if result is not None else None),
                         model_judge_score=model_judge_score,
+                        retrieval_runs=tuple(
+                            query_recorder.retrieval_runs[retrieval_index:]
+                        ),
                     ),
                 }
             )
@@ -695,7 +778,7 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(
                 json.dumps(
-                    {"schema_version": "comparison-e2e-run-v1", "cases": [
+                    {"schema_version": "comparison-e2e-run-v1", **experiment, "cases": [
                         item.model_dump(mode="json") for item in cases
                     ]},
                     ensure_ascii=False,
@@ -765,7 +848,7 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
     }
     payload = {
         "schema_version": "comparison-e2e-run-v1",
-        "code_revision": _git_revision(),
+        **experiment,
         "question_count": len(cases),
         "split_counts": dict(split_counts),
         "summary": summary,
@@ -783,8 +866,43 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
     return payload
 
 
-def main() -> None:
-    _load_local_env()
+def _experiment_metadata(args: argparse.Namespace, retriever: Any) -> dict[str, object]:
+    """Build a body-free identity for one reproducible ablation variant."""
+    retrieval_config_sha256 = canonical_sha256(
+        {
+            "retrieval": retriever.retrieval_config.model_dump(mode="json"),
+            "bilingual": retriever.bilingual_config.model_dump(mode="json"),
+        }
+    )
+    values = {
+        "code_revision": _git_revision(),
+        "retrieval_config_sha256": retrieval_config_sha256,
+        "evidence_per_step": args.evidence_per_step,
+        "rerank_mode": args.rerank_mode,
+        "checkpoint_id": hashlib.sha256(
+            str(args.checkpoint.resolve()).encode("utf-8")
+        ).hexdigest(),
+    }
+    return {**values, "experiment_fingerprint": canonical_sha256(values)}
+
+
+def _load_resumed_cases(
+    output: Path,
+    *,
+    experiment_fingerprint: str,
+    selected_ids: set[str],
+) -> list[ComparisonCaseDiagnostic]:
+    previous = json.loads(output.read_text(encoding="utf-8"))
+    if previous.get("experiment_fingerprint") != experiment_fingerprint:
+        raise ValueError("resume experiment fingerprint does not match")
+    return [
+        ComparisonCaseDiagnostic.model_validate(item)
+        for item in previous.get("cases", ())
+        if item.get("question_id") in selected_ids
+    ]
+
+
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run private comparison E2E evaluation.")
     parser.add_argument(
         "--gold",
@@ -815,9 +933,28 @@ def main() -> None:
         default=PROJECT_ROOT / "data/evaluations/runs/comparison-end-to-end-smoke5-v1.json",
     )
     parser.add_argument("--limit", type=int, default=5)
+    parser.add_argument(
+        "--question-id",
+        dest="question_ids",
+        action="append",
+        default=[],
+        help="Run only the selected question ID; repeat for multiple IDs.",
+    )
     parser.add_argument("--timeout", type=float, default=180)
+    parser.add_argument(
+        "--evidence-per-step",
+        type=int,
+        choices=(4, 6, 8, 10),
+        default=4,
+    )
+    parser.add_argument("--rerank-mode", choices=("current", "off"), default="current")
     parser.add_argument("--resume", action="store_true")
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    _load_local_env()
+    args = _build_parser().parse_args()
     if args.limit <= 0:
         raise ValueError("limit must be positive")
     result = asyncio.run(run(args))

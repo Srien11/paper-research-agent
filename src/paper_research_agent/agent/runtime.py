@@ -31,7 +31,10 @@ from paper_research_agent.agent.observability import (
     emit_agent_event,
     safe_fingerprint,
 )
-from paper_research_agent.agent.policy import ResearchRuntimePolicy
+from paper_research_agent.agent.policy import (
+    ResearchRuntimePolicy,
+    evidence_cutoff_after_assessments,
+)
 from paper_research_agent.agent.tooling.contracts import ToolExecutionResult
 from paper_research_agent.chunking.models import EvidenceChunk
 from paper_research_agent.context.models import ContextEvidence
@@ -454,9 +457,20 @@ class ResearchAgentRuntime:
         expected_get_actions = tuple(
             (
                 item.step_id,
-                tuple(hit.chunk_id for hit in item.search.hits[: self._policy.evidence_per_step]),
+                tuple(
+                    hit.chunk_id
+                    for hit in item.search.hits[
+                        : evidence_cutoff_after_assessments(
+                            self._policy,
+                            assessment_count=sum(
+                                limit <= index for limit in assessment_limits
+                            ),
+                            is_comparison=plan.task_type == "comparison",
+                        )
+                    ]
+                ),
             )
-            for item in observations
+            for index, item in enumerate(observations)
             if item.search.hits
         )
         get_actions = tuple(item for item in action_history if item.action == "get_evidence")

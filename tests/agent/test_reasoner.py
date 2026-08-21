@@ -136,11 +136,13 @@ class LangChainEvidenceReasonerTests(unittest.IsolatedAsyncioTestCase):
                 "fact_requirements": (
                     EvidenceFactRequirement(
                         fact_requirement_id="a-method-mechanism",
-                        description="Core mechanism",
+                        description="Explain the core mechanism",
+                        search_query="Paper A mechanism retrieval terms",
                     ),
                     EvidenceFactRequirement(
                         fact_requirement_id="a-method-input",
-                        description="Input dependency",
+                        description="Identify the input dependency",
+                        search_query="Paper A input retrieval terms",
                     ),
                 )
             }
@@ -178,7 +180,12 @@ class LangChainEvidenceReasonerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(result.followups), 1)
         self.assertEqual(result.followups[0].requirement_id, "a-method")
-        self.assertIn("Input dependency", result.followups[0].query)
+        self.assertEqual(
+            result.followups[0].fact_requirement_id,
+            "a-method-input",
+        )
+        self.assertIn("Paper A input retrieval terms", result.followups[0].query)
+        self.assertNotIn("mechanism retrieval terms", result.followups[0].query)
 
     async def test_balances_compiler_evidence_and_reuses_only_within_paper(self) -> None:
         base = _comparison_plan()
@@ -268,6 +275,52 @@ class LangChainEvidenceReasonerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("a-method-1", visibility_by_id["a-limit"].visible_chunk_ids)
         self.assertNotIn("b-method-1", visibility_by_id["a-limit"].visible_chunk_ids)
         self.assertTrue(visibility_by_id["b-limit"].visible_chunk_ids)
+
+    def test_followup_hydration_is_visible_or_diagnosed_at_compiler_limit(self) -> None:
+        plan = _comparison_plan()
+        observations = []
+        for step, corpus_id, count in (
+            (plan.steps[0], "C001", 10),
+            (plan.steps[1], "T001", 1),
+        ):
+            records = tuple(
+                EvidenceRecord(
+                    chunk_id=f"{step.step_id}-rank-{rank}",
+                    corpus_id=corpus_id,
+                    page_start=rank,
+                    page_end=rank,
+                    text=(f"{step.step_id} evidence " * 250),
+                    text_sha256=f"{rank:x}"[-1] * 64,
+                    storage_class="internal_research_only",
+                )
+                for rank in range(1, count + 1)
+            )
+            observations.append(
+                ResearchObservation(
+                    step_id=step.step_id,
+                    objective=step.objective,
+                    search=SearchCorpusResult(
+                        query=step.query,
+                        corpus_id=corpus_id,
+                        index_id="idx-test",
+                        degraded=False,
+                        hits=(),
+                    ),
+                    evidence=GetEvidenceResult(records=records),
+                )
+            )
+
+        _, visibility = _bounded_evidence(plan, tuple(observations))
+        visibility_by_id = {item.requirement_id: item for item in visibility}
+        a_visibility = visibility_by_id["a-method"]
+
+        for rank in range(5, 11):
+            self.assertIn(f"a-rank-{rank}", a_visibility.available_chunk_ids)
+        self.assertTrue(a_visibility.truncated_chunk_ids)
+        self.assertTrue(
+            set(a_visibility.truncated_chunk_ids) <= set(a_visibility.visible_chunk_ids)
+        )
+        self.assertNotIn("b-rank-1", a_visibility.available_chunk_ids)
 
     async def test_accepts_multiple_atomic_followups_in_one_assessment(self) -> None:
         model = Mock()

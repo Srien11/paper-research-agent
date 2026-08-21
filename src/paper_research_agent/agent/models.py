@@ -233,6 +233,18 @@ class EvidenceFactRequirement(FrozenContract):
         pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$"
     )
     description: str = Field(min_length=1, max_length=500)
+    protected_anchor_ids: tuple[int, ...] = Field(default=(), max_length=12)
+    protected_anchors: SkipJsonSchema[tuple[str, ...]] = Field(
+        default=(),
+        max_length=12,
+    )
+    protected_anchor_fallback: SkipJsonSchema[bool] = False
+    retrieval_expansions: tuple[str, ...] = Field(default=(), max_length=12)
+    search_query: SkipJsonSchema[str | None] = Field(
+        default=None,
+        min_length=1,
+        max_length=500,
+    )
     required_qualifier_kinds: tuple[EvidenceQualifierKind, ...] = Field(
         default=(), max_length=7
     )
@@ -245,6 +257,34 @@ class EvidenceFactRequirement(FrozenContract):
         if not normalized:
             raise ValueError("fact requirement description must not be blank")
         return normalized
+
+    @field_validator("search_query")
+    @classmethod
+    def normalize_search_query(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = " ".join(value.split())
+        if not normalized:
+            raise ValueError("fact requirement search query must not be blank")
+        return normalized
+
+    @field_validator("protected_anchors", "retrieval_expansions")
+    @classmethod
+    def normalize_query_terms(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(" ".join(value.split()) for value in values)
+        if any(not value for value in normalized):
+            raise ValueError("fact query terms must not be blank")
+        deduplication_keys = tuple(value.casefold() for value in normalized)
+        if len(deduplication_keys) != len(set(deduplication_keys)):
+            raise ValueError("fact query terms must be unique")
+        return normalized
+
+    @field_validator("protected_anchor_ids")
+    @classmethod
+    def unique_protected_anchor_ids(cls, values: tuple[int, ...]) -> tuple[int, ...]:
+        if len(values) != len(set(values)):
+            raise ValueError("protected anchor IDs must be unique")
+        return values
 
     @field_validator("required_qualifier_kinds")
     @classmethod
@@ -582,6 +622,10 @@ class EvidenceFollowup(FrozenContract):
     """One atomic retry query for one uncovered comparison requirement."""
 
     requirement_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+    fact_requirement_id: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$",
+    )
     query: str = Field(min_length=1, max_length=2000)
     objective: str = Field(min_length=1, max_length=500)
 
@@ -604,6 +648,10 @@ class ResearchStep(FrozenContract):
     corpus_id: str | None = Field(default=None, pattern=r"^[CT]\d{3}$")
     target_ids: tuple[str, ...] = Field(default=(), max_length=4)
     dimension_ids: tuple[str, ...] = Field(default=(), max_length=5)
+    fact_requirement_id: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$",
+    )
 
     @field_validator("objective", "query")
     @classmethod
@@ -660,6 +708,8 @@ class ResearchPlan(FrozenContract):
                 raise ValueError("direct research plan cannot declare comparison metadata")
             if any(step.target_ids or step.dimension_ids for step in self.steps):
                 raise ValueError("direct research steps cannot reference comparison metadata")
+            if any(step.fact_requirement_id is not None for step in self.steps):
+                raise ValueError("direct research steps cannot reference fact requirements")
             return self
         if len(self.targets) < 2:
             raise ValueError("comparison research plan requires at least two targets")
@@ -696,10 +746,28 @@ class ResearchPlan(FrozenContract):
                 "comparison research steps require one target and one dimension"
             )
         target_corpus_ids = {target.target_id: target.corpus_id for target in self.targets}
+        requirement_by_pair = {
+            (item.target_id, item.dimension_id): item for item in self.requirements
+        }
+        bound_fact_ids: list[str] = []
         for step in self.steps:
             expected_corpus_id = target_corpus_ids[step.target_ids[0]]
             if step.corpus_id != expected_corpus_id:
                 raise ValueError("comparison research step corpus scope does not match its target")
+            if step.fact_requirement_id is not None:
+                requirement = requirement_by_pair[
+                    (step.target_ids[0], step.dimension_ids[0])
+                ]
+                if step.fact_requirement_id not in {
+                    item.fact_requirement_id
+                    for item in requirement.fact_requirements
+                }:
+                    raise ValueError(
+                        "comparison research step fact does not belong to its cell"
+                    )
+                bound_fact_ids.append(step.fact_requirement_id)
+        if len(bound_fact_ids) != len(set(bound_fact_ids)):
+            raise ValueError("comparison fact-bound research steps must be unique")
         planned_pairs = {
             (target_id, dimension_id)
             for step in self.steps
@@ -796,9 +864,12 @@ class EvidenceAssessment(FrozenContract):
                 has_next_query or has_next_objective or self.next_requirement_ids
             ):
                 raise ValueError("followups cannot be mixed with legacy next-query fields")
-            followup_ids = [item.requirement_id for item in self.followups]
-            if len(followup_ids) != len(set(followup_ids)):
-                raise ValueError("follow-up requirement IDs must be unique")
+            followup_keys = [
+                (item.requirement_id, item.fact_requirement_id)
+                for item in self.followups
+            ]
+            if len(followup_keys) != len(set(followup_keys)):
+                raise ValueError("follow-up requirement and fact IDs must be unique")
         return self
 
 

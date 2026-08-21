@@ -605,7 +605,10 @@ class RAGRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(policy.max_steps, 24)
         self.assertEqual(policy.max_followup_steps, 4)
         self.assertEqual(policy.comparison_search_concurrency, 2)
+        self.assertFalse(policy.adaptive_evidence_hydration_enabled)
         self.assertEqual(policy.evidence_per_step, 4)
+        self.assertEqual(policy.first_followup_evidence_per_step, 6)
+        self.assertEqual(policy.later_followup_evidence_per_step, 10)
         self.assertEqual(policy.max_tool_calls, 48)
         self.assertEqual(policy.timeout_seconds, 180)
 
@@ -703,9 +706,33 @@ class RAGRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["policy"].max_steps, 24)
         self.assertEqual(kwargs["policy"].comparison_search_concurrency, 3)
         self.assertEqual(kwargs["policy"].evidence_per_step, 3)
+        self.assertEqual(kwargs["policy"].first_followup_evidence_per_step, 3)
+        self.assertEqual(kwargs["policy"].later_followup_evidence_per_step, 3)
         self.assertEqual(kwargs["policy"].max_tool_calls, 48)
         self.assertEqual(kwargs["policy"].timeout_seconds, 45)
         self.assertEqual(kwargs["mode"], "auto")
+
+    def test_adaptive_evidence_cutoffs_are_explicit_and_legacy_mix_fails(self) -> None:
+        environment = {
+            "PRA_RESEARCH_AGENT_ADAPTIVE_EVIDENCE_HYDRATION_ENABLED": "true",
+            "PRA_RESEARCH_AGENT_INITIAL_EVIDENCE_PER_STEP": "5",
+            "PRA_RESEARCH_AGENT_FIRST_FOLLOWUP_EVIDENCE_PER_STEP": "7",
+            "PRA_RESEARCH_AGENT_LATER_FOLLOWUP_EVIDENCE_PER_STEP": "11",
+        }
+        with patch.dict("os.environ", environment, clear=True):
+            policy = _research_policy_from_environment()
+
+        self.assertEqual(policy.initial_evidence_per_step, 5)
+        self.assertTrue(policy.adaptive_evidence_hydration_enabled)
+        self.assertEqual(policy.first_followup_evidence_per_step, 7)
+        self.assertEqual(policy.later_followup_evidence_per_step, 11)
+
+        environment["PRA_RESEARCH_AGENT_EVIDENCE_PER_STEP"] = "5"
+        with (
+            patch.dict("os.environ", environment, clear=True),
+            self.assertRaisesRegex(ValueError, "cannot be combined"),
+        ):
+            _research_policy_from_environment()
 
     async def test_enable_agent_forwards_paper_candidate_retriever(self) -> None:
         runtime, _, _ = _runtime()

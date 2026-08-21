@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 ResearchToolName = Literal["search_corpus", "get_evidence"]
 MAX_INITIAL_PLAN_STEPS = 20
@@ -32,7 +32,18 @@ class ResearchRuntimePolicy(BaseModel):
     max_followup_steps: int = Field(default=MAX_FOLLOWUP_STEPS, ge=0, le=MAX_FOLLOWUP_STEPS)
     max_dynamic_tool_steps: int = Field(default=6, ge=1, le=12)
     comparison_search_concurrency: int = Field(default=2, ge=1, le=4)
-    evidence_per_step: int = Field(default=4, ge=1, le=20)
+    adaptive_evidence_hydration_enabled: bool = False
+    initial_evidence_per_step: int = Field(
+        default=4,
+        ge=1,
+        le=20,
+        validation_alias=AliasChoices(
+            "initial_evidence_per_step",
+            "evidence_per_step",
+        ),
+    )
+    first_followup_evidence_per_step: int = Field(default=6, ge=1, le=20)
+    later_followup_evidence_per_step: int = Field(default=10, ge=1, le=20)
     max_tool_calls: int = Field(
         default=ABSOLUTE_MAX_TOOL_CALLS,
         ge=1,
@@ -49,6 +60,21 @@ class ResearchRuntimePolicy(BaseModel):
         if not value:
             raise ValueError("research tool allowlist cannot be empty")
         return value
+
+    @model_validator(mode="after")
+    def require_monotonic_evidence_cutoffs(self) -> ResearchRuntimePolicy:
+        if not (
+            self.initial_evidence_per_step
+            <= self.first_followup_evidence_per_step
+            <= self.later_followup_evidence_per_step
+        ):
+            raise ValueError("evidence hydration cutoffs must be non-decreasing")
+        return self
+
+    @property
+    def evidence_per_step(self) -> int:
+        """Compatibility view for callers that only need the initial cutoff."""
+        return self.initial_evidence_per_step
 
     def consume(self, tool_name: ResearchToolName, current_calls: int) -> int:
         """Authorize one exact tool call and return the updated invocation count."""
@@ -72,3 +98,23 @@ class ResearchRuntimePolicy(BaseModel):
         if step_budget < initial_steps or tool_call_budget < initial_steps:
             raise ValueError("initial plan cannot fit the frozen invocation budget")
         return step_budget, tool_call_budget
+
+
+def evidence_cutoff_after_assessments(
+    policy: ResearchRuntimePolicy,
+    *,
+    assessment_count: int,
+    is_comparison: bool,
+) -> int:
+    """Select a deterministic hydration cutoff without adding model decisions."""
+    if assessment_count < 0:
+        raise ValueError("assessment_count must be non-negative")
+    if (
+        not policy.adaptive_evidence_hydration_enabled
+        or not is_comparison
+        or assessment_count == 0
+    ):
+        return policy.initial_evidence_per_step
+    if assessment_count == 1:
+        return policy.first_followup_evidence_per_step
+    return policy.later_followup_evidence_per_step

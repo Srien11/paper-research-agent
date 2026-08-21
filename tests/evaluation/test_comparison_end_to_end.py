@@ -98,6 +98,81 @@ def test_fact_lineage_splits_exact_chunk_from_semantic_alternative() -> None:
     assert summary["semantic_fact_recall"] == 1
 
 
+def test_fact_lineage_preserves_one_search_path_ranking_without_bodies() -> None:
+    diagnostic = classify_fact_lineage(
+        "ranked",
+        gold_chunk_ids=("gold-c1",),
+        retrieved_chunk_ids=("gold-c1",),
+        hydrated_chunk_ids=(),
+        compiled_chunk_ids=(),
+        in_generation_input=False,
+        expressed=False,
+        citation_correct=False,
+        best_final_rank=6,
+        best_stage_ranks={
+            "zh.bm25": 9,
+            "zh.vector": 4,
+            "cross_route_rrf": 5,
+            "final": 6,
+        },
+        search_occurrences=3,
+        same_page_top4=True,
+        same_section_top4=True,
+    )
+
+    assert diagnostic.loss_stage == "not_hydrated"
+    assert diagnostic.best_final_rank == 6
+    assert diagnostic.search_occurrences == 3
+    assert diagnostic.best_stage_ranks["zh.bm25"] == 9
+    assert diagnostic.same_page_top4 is True
+    assert "text" not in diagnostic.model_dump()
+
+
+def test_legacy_fact_lineage_remains_readable_without_ranking_fields() -> None:
+    current = classify_fact_lineage(
+        "legacy",
+        gold_chunk_ids=("c1",),
+        retrieved_chunk_ids=(),
+        hydrated_chunk_ids=(),
+        compiled_chunk_ids=(),
+        in_generation_input=False,
+        expressed=False,
+        citation_correct=False,
+    )
+    legacy = current.model_dump()
+    for field in (
+        "best_final_rank",
+        "best_stage_ranks",
+        "search_occurrences",
+        "same_page_top4",
+        "same_section_top4",
+    ):
+        legacy.pop(field)
+
+    restored = type(current).model_validate(legacy)
+
+    assert restored.best_final_rank is None
+    assert restored.best_stage_ranks == {}
+    assert restored.search_occurrences == 0
+
+
+def test_retrieval_diagnostic_tracks_fact_query_and_reads_legacy_rows() -> None:
+    current = RetrievalDiagnostic(
+        step_id_hash=question_sha256("a-method"),
+        target_ids=("a",),
+        dimension_ids=("method",),
+        fact_requirement_id="a-reasoning-failure",
+        corpus_id_filter="C001",
+        search_hit_chunk_ids=("c1",),
+        evidence_chunk_ids=("c1",),
+    )
+    legacy = current.model_dump()
+    legacy.pop("fact_requirement_id")
+
+    assert current.fact_requirement_id == "a-reasoning-failure"
+    assert RetrievalDiagnostic.model_validate(legacy).fact_requirement_id is None
+
+
 def _case(**updates: object) -> ComparisonCaseDiagnostic:
     values: dict[str, object] = {
         "question_id": "CPG001",

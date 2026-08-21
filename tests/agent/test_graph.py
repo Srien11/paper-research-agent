@@ -14,9 +14,12 @@ from paper_research_agent.agent.graph import (
 from paper_research_agent.agent.models import (
     EvidenceAssessment,
     EvidenceCoverage,
+    EvidenceFactRequirement,
     EvidenceFollowup,
+    EvidenceLedgerCell,
     EvidenceRecord,
     EvidenceRequirement,
+    GetEvidenceInput,
     GetEvidenceResult,
     ResearchDimension,
     ResearchObservation,
@@ -167,6 +170,133 @@ class ResearchGraphTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(reserve, 45.0)
+
+    async def test_structured_fact_queries_all_run_before_first_compiler_call(
+        self,
+    ) -> None:
+        targets = (
+            ResearchTarget(target_id="a", label="Paper A", corpus_id="C001"),
+            ResearchTarget(target_id="b", label="Paper B", corpus_id="T001"),
+        )
+        dimension = ResearchDimension(dimension_id="limits", label="Limits")
+        requirements = tuple(
+            EvidenceRequirement(
+                requirement_id=f"{target.target_id}-limits",
+                target_id=target.target_id,
+                dimension_id="limits",
+                description=f"{target.label} limits",
+                fact_requirements=(
+                    EvidenceFactRequirement(
+                        fact_requirement_id=f"{target.target_id}-reasoning-failure",
+                        description="Long-context reasoning failure",
+                        protected_anchors=("长上下文", "推理", "失败"),
+                        retrieval_expansions=("long-context", "reasoning", "failure"),
+                    ),
+                    EvidenceFactRequirement(
+                        fact_requirement_id=f"{target.target_id}-mitigation",
+                        description="Mitigation",
+                        protected_anchors=("缓解方法",),
+                        retrieval_expansions=("mitigation",),
+                    ),
+                ),
+            )
+            for target in targets
+        )
+        planner = FakePlanner(
+            ResearchPlan(
+                task_type="comparison",
+                targets=targets,
+                dimensions=(dimension,),
+                requirements=requirements,
+                steps=tuple(
+                    ResearchStep(
+                        step_id=f"{target.target_id}-limits",
+                        objective=f"Discover {target.label} limits",
+                        query=f"broad {target.label} query",
+                        corpus_id=target.corpus_id,
+                        target_ids=(target.target_id,),
+                        dimension_ids=("limits",),
+                    )
+                    for target in targets
+                ),
+            )
+        )
+        reasoner = FakeReasoner(
+            EvidenceAssessment(
+                evidence_sufficient=False,
+                status="compiler_failed",
+                coverage=tuple(
+                    EvidenceCoverage(
+                        requirement_id=requirement.requirement_id,
+                        covered=False,
+                    )
+                    for requirement in requirements
+                ),
+            )
+        )
+        query_scope = {
+            "Paper A 长上下文 推理 失败 long-context reasoning failure": "C001",
+            "Paper A 缓解方法 mitigation": "C001",
+            "Paper B 长上下文 推理 失败 long-context reasoning failure": "T001",
+            "Paper B 缓解方法 mitigation": "T001",
+        }
+        service = AsyncMock()
+
+        async def search(request: SearchCorpusInput) -> SearchCorpusResult:
+            corpus_id = query_scope[request.query]
+            self.assertEqual(request.corpus_id, corpus_id)
+            prefix = f"{corpus_id}-{len(service.search_corpus.await_args_list)}"
+            return SearchCorpusResult(
+                query=request.query,
+                corpus_id=corpus_id,
+                index_id="idx-test",
+                degraded=False,
+                hits=tuple(
+                    _hit(f"{prefix}-{rank}", corpus_id, rank) for rank in range(1, 6)
+                ),
+            )
+
+        async def hydrate(request: GetEvidenceInput) -> GetEvidenceResult:
+            self.assertEqual(len(request.chunk_ids), 4)
+            records = tuple(
+                _record(
+                    chunk_id,
+                    "C001" if chunk_id.startswith("C001") else "T001",
+                )
+                for chunk_id in request.chunk_ids
+            )
+            return GetEvidenceResult(records=records)
+
+        service.search_corpus.side_effect = search
+        service.get_evidence.side_effect = hydrate
+        graph = build_research_graph(
+            planner=planner,
+            reasoner=reasoner,
+            service=service,
+            policy=ResearchRuntimePolicy(max_steps=8, max_tool_calls=16),
+        )
+
+        state = await graph.ainvoke({"question": "比较长上下文推理失败及缓解方法"})
+
+        self.assertEqual(service.search_corpus.await_count, 4)
+        self.assertEqual(service.get_evidence.await_count, 4)
+        self.assertEqual(len(reasoner.calls), 1)
+        self.assertEqual(len(reasoner.calls[0][2]), 4)
+        executed_plan = reasoner.calls[0][1]
+        self.assertEqual(
+            [step.fact_requirement_id for step in executed_plan.steps],
+            [
+                "a-reasoning-failure",
+                "a-mitigation",
+                "b-reasoning-failure",
+                "b-mitigation",
+            ],
+        )
+        self.assertTrue(
+            all("broad" not in observation.search.query for observation in reasoner.calls[0][2])
+        )
+        self.assertEqual(state["assessment_observation_counts"], [4])
+        self.assertEqual(state["termination_reason"], "compiler_failed")
 
     async def test_comparison_executes_each_planned_target_before_dynamic_replan(self) -> None:
         planner = FakePlanner(
@@ -696,6 +826,329 @@ class ResearchGraphTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(reasoner.calls), 2)
         self.assertEqual([len(call[2]) for call in reasoner.calls], [2, 3])
         self.assertEqual(state["assessment_observation_counts"], [2, 3])
+
+    async def test_comparison_executes_fact_bound_atomic_followups_at_fixed_top_four(
+        self,
+    ) -> None:
+        targets = (
+            ResearchTarget(target_id="a", label="Paper A", corpus_id="C001"),
+            ResearchTarget(target_id="b", label="Paper B", corpus_id="T001"),
+        )
+        dimension = ResearchDimension(dimension_id="method", label="Method")
+        requirements = (
+            EvidenceRequirement(
+                requirement_id="a-method",
+                target_id="a",
+                dimension_id="method",
+                description="Paper A method",
+                fact_requirements=(
+                    EvidenceFactRequirement(
+                        fact_requirement_id="a-method-mechanism",
+                        description="Explain the mechanism",
+                        search_query="Paper A mechanism retrieval terms",
+                    ),
+                    EvidenceFactRequirement(
+                        fact_requirement_id="a-method-input",
+                        description="Identify the input dependency",
+                        search_query="Paper A input retrieval terms",
+                    ),
+                ),
+            ),
+            EvidenceRequirement(
+                requirement_id="b-method",
+                target_id="b",
+                dimension_id="method",
+                description="Paper B method",
+            ),
+        )
+        planner = FakePlanner(
+            ResearchPlan(
+                task_type="comparison",
+                targets=targets,
+                dimensions=(dimension,),
+                requirements=requirements,
+                steps=(
+                    ResearchStep(
+                        step_id="a-method",
+                        objective="Discover Paper A method",
+                        query="initial A discovery",
+                        corpus_id="C001",
+                        target_ids=("a",),
+                        dimension_ids=("method",),
+                    ),
+                    ResearchStep(
+                        step_id="b-method",
+                        objective="Discover Paper B method",
+                        query="initial B discovery",
+                        corpus_id="T001",
+                        target_ids=("b",),
+                        dimension_ids=("method",),
+                    ),
+                ),
+            )
+        )
+        missing_coverage = (
+            EvidenceCoverage(requirement_id="a-method", covered=False),
+            EvidenceCoverage(requirement_id="b-method", covered=False),
+        )
+        missing_ledger = (
+            EvidenceLedgerCell(
+                requirement_id="a-method",
+                status="missing",
+                missing_fact_requirement_ids=(
+                    "a-method-mechanism",
+                    "a-method-input",
+                ),
+            ),
+            EvidenceLedgerCell(
+                requirement_id="b-method",
+                status="missing",
+                missing_fact_requirement_ids=("b-method-primary",),
+            ),
+        )
+        reasoner = FakeReasoner(
+            EvidenceAssessment(
+                evidence_sufficient=False,
+                status="missing_coverage",
+                coverage=missing_coverage,
+                ledger=missing_ledger,
+                followups=(
+                    EvidenceFollowup(
+                        requirement_id="a-method",
+                        fact_requirement_id="a-method-mechanism",
+                        query="Paper A Method: Paper A mechanism retrieval terms",
+                        objective="Find the Paper A mechanism",
+                    ),
+                    EvidenceFollowup(
+                        requirement_id="a-method",
+                        fact_requirement_id="a-method-input",
+                        query="Paper A Method: Paper A input retrieval terms",
+                        objective="Find the Paper A input dependency",
+                    ),
+                ),
+            ),
+            EvidenceAssessment(
+                evidence_sufficient=False,
+                status="missing_coverage",
+                coverage=missing_coverage,
+                ledger=missing_ledger,
+            ),
+        )
+        query_scope = {
+            "initial A discovery": ("C001", "a-initial"),
+            "initial B discovery": ("T001", "b-initial"),
+            "Paper A Method: Paper A mechanism retrieval terms": (
+                "C001",
+                "a-mechanism",
+            ),
+            "Paper A Method: Paper A input retrieval terms": ("C001", "a-input"),
+        }
+        service = AsyncMock()
+
+        async def search(request: SearchCorpusInput) -> SearchCorpusResult:
+            corpus_id, prefix = query_scope[request.query]
+            self.assertEqual(request.corpus_id, corpus_id)
+            return SearchCorpusResult(
+                query=request.query,
+                corpus_id=corpus_id,
+                index_id="idx-test",
+                degraded=False,
+                hits=tuple(
+                    _hit(f"{prefix}-{rank}", corpus_id, rank)
+                    for rank in range(1, 7)
+                ),
+            )
+
+        async def hydrate(request: GetEvidenceInput) -> GetEvidenceResult:
+            records = tuple(
+                _record(
+                    chunk_id,
+                    "T001" if chunk_id.startswith("b-") else "C001",
+                )
+                for chunk_id in request.chunk_ids
+            )
+            return GetEvidenceResult(records=records)
+
+        service.search_corpus.side_effect = search
+        service.get_evidence.side_effect = hydrate
+        policy = ResearchRuntimePolicy()
+        graph = build_research_graph(
+            planner=planner,
+            reasoner=reasoner,
+            service=service,
+            policy=policy,
+        )
+
+        state = await graph.ainvoke({"question": "Compare methods"})
+
+        self.assertEqual(
+            [call.args[0].query for call in service.search_corpus.await_args_list],
+            list(query_scope),
+        )
+        requested_chunks = [
+            tuple(call.args[0].chunk_ids)
+            for call in service.get_evidence.await_args_list
+        ]
+        self.assertEqual([len(chunk_ids) for chunk_ids in requested_chunks], [4] * 4)
+        self.assertTrue(
+            all(chunk_id.startswith("a-") for chunk_id in requested_chunks[2])
+        )
+        self.assertTrue(
+            all(chunk_id.startswith("a-") for chunk_id in requested_chunks[3])
+        )
+        first_followups = state["assessments"][0]["followups"]
+        self.assertEqual(
+            [item["fact_requirement_id"] for item in first_followups],
+            ["a-method-mechanism", "a-method-input"],
+        )
+        self.assertEqual(planner.calls, [("Compare methods", 20, False)])
+        self.assertEqual([len(call[2]) for call in reasoner.calls], [2, 4])
+        self.assertFalse(policy.adaptive_evidence_hydration_enabled)
+        self.assertEqual((policy.max_steps, policy.max_tool_calls, policy.timeout_seconds), (24, 48, 180))
+        self.assertEqual((state["step_budget"], state["tool_call_budget"]), (4, 8))
+        self.assertEqual((state["current_step"], state["tool_call_count"]), (4, 8))
+
+    async def test_comparison_hydration_expands_from_four_to_six_to_ten(self) -> None:
+        targets = (
+            ResearchTarget(target_id="a", label="Paper A", corpus_id="C001"),
+            ResearchTarget(target_id="b", label="Paper B", corpus_id="T001"),
+        )
+        dimension = ResearchDimension(dimension_id="method", label="Method")
+        requirements = (
+            EvidenceRequirement(
+                requirement_id="a-method",
+                target_id="a",
+                dimension_id="method",
+                description="Paper A method",
+            ),
+            EvidenceRequirement(
+                requirement_id="b-method",
+                target_id="b",
+                dimension_id="method",
+                description="Paper B method",
+            ),
+        )
+        planner = FakePlanner(
+            ResearchPlan(
+                task_type="comparison",
+                targets=targets,
+                dimensions=(dimension,),
+                requirements=requirements,
+                steps=(
+                    ResearchStep(
+                        step_id="a-method",
+                        objective="Find A method",
+                        query="initial A",
+                        corpus_id="C001",
+                        target_ids=("a",),
+                        dimension_ids=("method",),
+                    ),
+                    ResearchStep(
+                        step_id="b-method",
+                        objective="Find B method",
+                        query="initial B",
+                        corpus_id="T001",
+                        target_ids=("b",),
+                        dimension_ids=("method",),
+                    ),
+                ),
+            )
+        )
+        missing_coverage = (
+            EvidenceCoverage(requirement_id="a-method", covered=False),
+            EvidenceCoverage(requirement_id="b-method", covered=False),
+        )
+        reasoner = FakeReasoner(
+            EvidenceAssessment(
+                evidence_sufficient=False,
+                status="missing_coverage",
+                coverage=missing_coverage,
+                followups=(
+                    EvidenceFollowup(
+                        requirement_id="a-method",
+                        query="followup A one",
+                        objective="Retry A method",
+                    ),
+                ),
+            ),
+            EvidenceAssessment(
+                evidence_sufficient=False,
+                status="missing_coverage",
+                coverage=missing_coverage,
+                followups=(
+                    EvidenceFollowup(
+                        requirement_id="a-method",
+                        query="followup A two",
+                        objective="Retry A method again",
+                    ),
+                ),
+            ),
+            EvidenceAssessment(
+                evidence_sufficient=False,
+                status="missing_coverage",
+                coverage=missing_coverage,
+                followups=(
+                    EvidenceFollowup(
+                        requirement_id="a-method",
+                        query="followup A three",
+                        objective="Retry A method a third time",
+                    ),
+                ),
+            ),
+        )
+        searches = (
+            ("initial A", "C001", "a-initial"),
+            ("initial B", "T001", "b-initial"),
+            ("followup A one", "C001", "a-followup-one"),
+            ("followup A two", "C001", "a-followup-two"),
+        )
+        service = AsyncMock()
+        service.search_corpus.side_effect = tuple(
+            SearchCorpusResult(
+                query=query,
+                corpus_id=corpus_id,
+                index_id="idx-test",
+                degraded=False,
+                hits=tuple(
+                    _hit(f"{prefix}-{rank}", corpus_id, rank)
+                    for rank in range(1, 13)
+                ),
+            )
+            for query, corpus_id, prefix in searches
+        )
+
+        async def hydrate(request: GetEvidenceInput) -> GetEvidenceResult:
+            chunk_ids = tuple(request.chunk_ids)
+            records = tuple(
+                _record(
+                    chunk_id,
+                    "T001" if chunk_id.startswith("b-") else "C001",
+                )
+                for chunk_id in chunk_ids
+            )
+            return GetEvidenceResult(records=records)
+
+        service.get_evidence.side_effect = hydrate
+        graph = build_research_graph(
+            planner=planner,
+            reasoner=reasoner,
+            service=service,
+            policy=ResearchRuntimePolicy(
+                adaptive_evidence_hydration_enabled=True
+            ),
+        )
+
+        state = await graph.ainvoke({"question": "Compare methods"})
+
+        requested = [
+            tuple(call.args[0].chunk_ids) for call in service.get_evidence.await_args_list
+        ]
+        self.assertEqual([len(chunk_ids) for chunk_ids in requested], [4, 4, 6, 10])
+        self.assertTrue(all(item.startswith("a-") for item in requested[2]))
+        self.assertTrue(all(item.startswith("a-") for item in requested[3]))
+        self.assertEqual(state["step_budget"], 4)
+        self.assertEqual(state["tool_call_budget"], 8)
+        self.assertEqual(state["termination_reason"], "step_budget")
 
     async def test_stops_early_when_first_observation_is_sufficient(self) -> None:
         planner = FakePlanner(

@@ -192,6 +192,14 @@ class LangChainResearchPlannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("比较对象", messages[0].content)
         self.assertIn("逐对象", messages[0].content)
         self.assertIn("完整证据网格", messages[0].content)
+        self.assertIn("protected_anchor_ids", messages[0].content)
+        self.assertIn("retrieval_expansions", messages[0].content)
+        self.assertIn("select the shortest available catalog spans", messages[0].content)
+        self.assertIn("augment", messages[0].content)
+        self.assertIn("Do not replace", messages[0].content)
+        self.assertIn("VERBATIM_ANCHOR_SOURCE_JSON", messages[0].content)
+        self.assertIn("do not answer the question", messages[0].content)
+        self.assertIn("one bounded discovery step per target-by-dimension cell", messages[0].content)
         self.assertIn('"C001":"Paper A"', messages[0].content)
         self.assertEqual(messages[1].content, "比较 RAG 评测方法")
 
@@ -243,10 +251,14 @@ class LangChainResearchPlannerTests(unittest.IsolatedAsyncioTestCase):
                             {
                                 "fact_requirement_id": "a-method-mechanism",
                                 "description": "Paper A core mechanism",
+                                "protected_anchor_ids": [2],
+                                "retrieval_expansions": ["mechanism", "architecture"],
                             },
                             {
                                 "fact_requirement_id": "a-method-input",
                                 "description": "Paper A input dependency",
+                                "protected_anchor_ids": [3],
+                                "retrieval_expansions": ["required input"],
                             },
                         ],
                     },
@@ -259,6 +271,8 @@ class LangChainResearchPlannerTests(unittest.IsolatedAsyncioTestCase):
                             {
                                 "fact_requirement_id": "b-method-mechanism",
                                 "description": "Paper B core mechanism",
+                                "protected_anchor_ids": [2],
+                                "retrieval_expansions": ["mechanism", "architecture"],
                             }
                         ],
                     },
@@ -287,8 +301,8 @@ class LangChainResearchPlannerTests(unittest.IsolatedAsyncioTestCase):
         planner = LangChainResearchPlanner(model)
 
         plan = await planner.plan(
-            "Compare Paper A and Paper B",
-            max_steps=2,
+            "Compare Paper A and Paper B: core mechanism; input dependency.",
+            max_steps=3,
             planning_required=True,
         )
 
@@ -301,7 +315,104 @@ class LangChainResearchPlannerTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         self.assertEqual(len(plan.requirements[0].fact_requirements), 2)
+        a_anchors = [
+            item.protected_anchors for item in plan.requirements[0].fact_requirements
+        ]
+        self.assertEqual(
+            a_anchors,
+            [("core mechanism",), ("input dependency",)],
+        )
+        self.assertTrue(
+            all(
+                item.search_query is None
+                for requirement in plan.requirements
+                for item in requirement.fact_requirements
+            )
+        )
         self.assertEqual(structured.ainvoke.await_count, 2)
+
+    async def test_required_comparison_falls_back_for_unknown_anchor_catalog_ids(self) -> None:
+        model = Mock()
+        structured = AsyncMock()
+        structured.ainvoke.return_value = {
+            "task_type": "comparison",
+            "targets": [
+                {"target_id": "a", "label": "Paper A", "corpus_id": "C001"},
+                {"target_id": "b", "label": "Paper B", "corpus_id": "T001"},
+            ],
+            "dimensions": [{"dimension_id": "method", "label": "Method"}],
+            "requirements": [
+                {
+                    "requirement_id": "a-method",
+                    "target_id": "a",
+                    "dimension_id": "method",
+                    "description": "Paper A method",
+                    "fact_requirements": [
+                        {
+                            "fact_requirement_id": "a-method-mechanism",
+                            "description": "Paper A core mechanism",
+                            "protected_anchor_ids": [99],
+                            "retrieval_expansions": ["mechanism"],
+                        }
+                    ],
+                },
+                {
+                    "requirement_id": "b-method",
+                    "target_id": "b",
+                    "dimension_id": "method",
+                    "description": "Paper B method",
+                    "fact_requirements": [
+                        {
+                            "fact_requirement_id": "b-method-mechanism",
+                            "description": "Paper B core mechanism",
+                            "protected_anchor_ids": [99],
+                            "retrieval_expansions": ["mechanism"],
+                        }
+                    ],
+                },
+            ],
+            "steps": [
+                {
+                    "step_id": "a-method",
+                    "objective": "Paper A method",
+                    "query": "Paper A method",
+                    "corpus_id": "C001",
+                    "target_ids": ["a"],
+                    "dimension_ids": ["method"],
+                },
+                {
+                    "step_id": "b-method",
+                    "objective": "Paper B method",
+                    "query": "Paper B method",
+                    "corpus_id": "T001",
+                    "target_ids": ["b"],
+                    "dimension_ids": ["method"],
+                },
+            ],
+        }
+        model.with_structured_output.return_value = structured
+        planner = LangChainResearchPlanner(model)
+
+        plan = await planner.plan(
+            "Compare Paper A and Paper B reasoning failures",
+            max_steps=2,
+            planning_required=True,
+        )
+
+        facts = tuple(
+            fact
+            for requirement in plan.requirements
+            for fact in requirement.fact_requirements
+        )
+        self.assertTrue(all(fact.protected_anchor_fallback for fact in facts))
+        self.assertTrue(
+            all(
+                fact.protected_anchors
+                == ("Compare Paper A and Paper B reasoning failures",)
+                for fact in facts
+            )
+        )
+        self.assertEqual(structured.ainvoke.await_count, 1)
 
     async def test_required_comparison_fails_closed_after_two_invalid_plans(self) -> None:
         model = Mock()

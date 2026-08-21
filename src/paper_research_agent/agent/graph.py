@@ -13,6 +13,7 @@ from langgraph.graph.state import CompiledStateGraph
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from paper_research_agent.agent.coverage import validate_evidence_assessment
+from paper_research_agent.agent.fact_queries import materialize_atomic_fact_steps
 from paper_research_agent.agent.langchain_tools import build_langchain_tools
 from paper_research_agent.agent.models import (
     TERMINATION_REASONS,
@@ -36,6 +37,7 @@ from paper_research_agent.agent.policy import (
     MAX_INITIAL_PLAN_STEPS,
     ResearchRuntimePolicy,
     ResearchToolName,
+    evidence_cutoff_after_assessments,
 )
 from paper_research_agent.agent.service import ResearchToolService
 
@@ -135,7 +137,9 @@ def build_research_graph(
         raise ValueError("evidence_per_step must be between 1 and 20")
     runtime_policy = policy or ResearchRuntimePolicy(
         max_steps=max_steps,
-        evidence_per_step=evidence_per_step,
+        initial_evidence_per_step=evidence_per_step,
+        first_followup_evidence_per_step=evidence_per_step,
+        later_followup_evidence_per_step=evidence_per_step,
     )
     initial_plan_steps = max(
         1,
@@ -145,7 +149,6 @@ def build_research_graph(
             runtime_policy.max_tool_calls // 2,
         ),
     )
-    evidence_per_step = runtime_policy.evidence_per_step
     tools = {tool.name: tool for tool in build_langchain_tools(service, extended_toolkit)}
     search_tool = tools["search_corpus"]
     evidence_tool = tools["get_evidence"]
@@ -165,6 +168,7 @@ def build_research_graph(
             max_steps=initial_plan_steps,
             planning_required=graph_input.planning_required,
         )
+        plan = materialize_atomic_fact_steps(plan)
         if len(plan.steps) > initial_plan_steps:
             raise ValueError("research plan exceeds the graph step budget")
         if plan.task_type == "comparison":
@@ -302,7 +306,17 @@ def build_research_graph(
                     step_id=f"replan-{replan_count}",
                     objective=followup.objective,
                     query=followup.query,
-                    top_k=min(20, max(10, evidence_per_step)),
+                    top_k=min(
+                        20,
+                        max(
+                            10,
+                            evidence_cutoff_after_assessments(
+                                runtime_policy,
+                                assessment_count=len(assessments),
+                                is_comparison=True,
+                            ),
+                        ),
+                    ),
                     corpus_id=corpus_id,
                     target_ids=(requested.target_id,),
                     dimension_ids=(requested.dimension_id,),
@@ -367,7 +381,17 @@ def build_research_graph(
                     top_k=(
                         planned_next.top_k
                         if planned_next is not None
-                        else min(20, max(10, evidence_per_step))
+                        else min(
+                            20,
+                            max(
+                                10,
+                                evidence_cutoff_after_assessments(
+                                    runtime_policy,
+                                    assessment_count=len(assessments),
+                                    is_comparison=is_comparison,
+                                ),
+                            ),
+                        )
                     ),
                     corpus_id=replan_corpus_id,
                     target_ids=replan_target_ids,
@@ -482,8 +506,9 @@ def build_research_graph(
         search: SearchCorpusResult,
         *,
         tool_call_count: int,
+        evidence_cutoff: int,
     ) -> GetEvidenceResult:
-        selected_ids = tuple(hit.chunk_id for hit in search.hits[:evidence_per_step])
+        selected_ids = tuple(hit.chunk_id for hit in search.hits[:evidence_cutoff])
         if not selected_ids:
             return GetEvidenceResult(records=())
         evidence_started = time.perf_counter()
@@ -590,6 +615,11 @@ def build_research_graph(
                 evidence_call_counts.append(tool_call_count)
             else:
                 evidence_call_counts.append(None)
+        evidence_cutoff = evidence_cutoff_after_assessments(
+            runtime_policy,
+            assessment_count=len(state.get("assessments", [])),
+            is_comparison=plan.task_type == "comparison",
+        )
         evidence_results = await asyncio.gather(
             *(
                 run_evidence(
@@ -597,6 +627,7 @@ def build_research_graph(
                     step,
                     search,
                     tool_call_count=call_count or tool_call_count,
+                    evidence_cutoff=evidence_cutoff,
                 )
                 for step, search, call_count in zip(
                     steps, searches, evidence_call_counts, strict=True
@@ -619,7 +650,7 @@ def build_research_graph(
                 query=result.step.query,
             )
             selected_ids = tuple(
-                hit.chunk_id for hit in result.search.hits[:evidence_per_step]
+                hit.chunk_id for hit in result.search.hits[:evidence_cutoff]
             )
             if selected_ids:
                 action_history = _append_action_from_history(

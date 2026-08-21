@@ -10,6 +10,11 @@ from typing import Protocol
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from paper_research_agent.agent.fact_queries import (
+    bind_question_anchors,
+    question_anchor_catalog,
+    validate_question_anchors,
+)
 from paper_research_agent.agent.models import ResearchPlan, ResearchStep
 from paper_research_agent.agent.policy import MAX_INITIAL_PLAN_STEPS
 from paper_research_agent.retrieval.contracts import QueryRewriteTrace
@@ -33,6 +38,15 @@ class ComparisonTargetResolver(Protocol):
 
 class ComparisonQueryResolver(Protocol):
     async def resolve_query(self, question: str) -> QueryRewriteTrace: ...
+
+
+def _planner_contract_reason(error: ValueError) -> str:
+    message = str(error)
+    if "protected anchor" in message or "protected_anchor_ids" in message:
+        return "planner_anchor_selection_invalid"
+    if "fact requirements exceed" in message:
+        return "planner_fact_budget_invalid"
+    return "planner_contract_invalid"
 
 
 def parse_explicit_corpus_ids(question: str) -> tuple[str, ...]:
@@ -138,6 +152,15 @@ class LangChainResearchPlanner:
             sort_keys=True,
             separators=(",", ":"),
         )
+        anchor_source = question_anchor_catalog(question)
+        anchor_catalog = json.dumps(
+            [
+                {"anchor_id": index, "text": text}
+                for index, text in enumerate(anchor_source)
+            ],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
         system = SystemMessage(
             content=(
                 "你是论文研究任务规划器。只拆分需要在现有本地论文库中检索的子问题，"
@@ -165,8 +188,23 @@ class LangChainResearchPlanner:
                 "applicability condition when the question asks for them. Include "
                 "required_qualifier_kinds when omission would change the meaning. Do not use "
                 "private references, gold answers, or facts not requested by the question. Keep "
-                "one search step per target-by-dimension cell; its query and objective must cover "
-                "all fact requirements in that cell. "
+                "one bounded discovery step per target-by-dimension cell. For every planned "
+                "fact_requirement, emit protected_anchor_ids and retrieval_expansions, but do not "
+                "emit protected anchor text or a final search query. For protected_anchor_ids, "
+                "select the shortest available catalog spans that together identify exactly that "
+                "fact; use multiple IDs when a relation or qualifier would otherwise be lost. "
+                "Preserve requested entities, numbers, datasets, metrics, conditions, comparison "
+                "directions, causal relations, failures, limitations, mitigations, reasoning, "
+                "understanding, and explicit qualifiers. retrieval_expansions may add the paper "
+                "name, English translations, academic synonyms, method names, dataset names, and "
+                "related retrieval terms. Use an augment strategy: selected catalog text remains intact "
+                "and expansions are only appended. Do not replace a protected anchor with a broader "
+                "concept, do not combine sibling fact requirements, do not answer the question, "
+                "and do not add facts absent from the user's request. Across the full plan, the "
+                f"number of fact_requirements must not exceed {max_steps}. The cell-level discovery "
+                "query and objective may cover all fact requirements in that cell, but the initial "
+                "target-by-dimension grid must not expand. "
+                f"\nVERBATIM_ANCHOR_SOURCE_JSON={anchor_catalog}"
                 f"\nLOCAL_CORPUS_CATALOG_JSON={catalog}"
                 + (
                     "上游语义路由已确认本题必须进行多对象研究规划，因此必须返回 "
@@ -177,6 +215,7 @@ class LangChainResearchPlanner:
             )
         )
         messages = [system, HumanMessage(content=question)]
+        failure_reason = "planner_contract_invalid"
         for attempt in range(2):
             try:
                 raw = await self._structured_model.ainvoke(messages)
@@ -193,12 +232,26 @@ class LangChainResearchPlanner:
                     raise ValueError(
                         "comparison plan requires explicit atomic fact requirements"
                     )
+                if plan.task_type == "comparison":
+                    plan = bind_question_anchors(plan, anchor_source)
+                    planned_facts = tuple(
+                        fact_requirement
+                        for requirement in plan.requirements
+                        for fact_requirement in requirement.fact_requirements
+                    )
+                    if len(planned_facts) > max_steps:
+                        raise ValueError(
+                            "comparison fact requirements exceed the requested step budget"
+                        )
+                    for fact_requirement in planned_facts:
+                        validate_question_anchors(question, fact_requirement)
                 if planning_required and self._target_resolver is not None:
                     planned_corpora = {target.corpus_id for target in plan.targets}
                     if not planned_corpora <= set(resolved_catalog):
                         raise ValueError("comparison plan left the resolved candidate set")
                 return plan
-            except ValueError:
+            except ValueError as exc:
+                failure_reason = _planner_contract_reason(exc)
                 if attempt == 0:
                     messages = [
                         *messages,
@@ -211,13 +264,18 @@ class LangChainResearchPlanner:
                                 "every comparison dimension required by the question; never "
                                 "return a partial grid. Every requirement must include one to six "
                                 "explicit, question-derived atomic fact_requirements with globally "
-                                "unique IDs; do not rely on a derived compatibility intent."
+                                "unique IDs and non-empty protected_anchor_ids selected from "
+                                "VERBATIM_ANCHOR_SOURCE_JSON. Do not emit anchor text. Put "
+                                "translations and academic synonyms only in "
+                                "retrieval_expansions. Do not replace anchors with broader concepts, "
+                                "rely on a derived compatibility intent, or copy sibling facts. The "
+                                f"total fact_requirement count must not exceed {max_steps}."
                             )
                         ),
                     ]
 
         if planning_required:
-            raise ComparisonTargetResolutionError("planner_contract_invalid")
+            raise ComparisonTargetResolutionError(failure_reason)
         return ResearchPlan(
             steps=(
                 ResearchStep(
