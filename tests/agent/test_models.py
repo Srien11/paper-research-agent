@@ -5,6 +5,7 @@ import unittest
 from pydantic import ValidationError
 
 from paper_research_agent.agent.models import (
+    ComparisonPlanProposal,
     CompiledEvidenceFact,
     EvidenceAssessment,
     EvidenceCellCompilation,
@@ -48,6 +49,22 @@ def _hit(*, rank: int = 1) -> SearchCorpusHit:
 
 
 class ResearchToolModelTests(unittest.TestCase):
+    def test_comparison_proposal_schema_excludes_control_plane_ids(self) -> None:
+        schema = str(ComparisonPlanProposal.model_json_schema())
+
+        self.assertIn("selected_corpus_ids", schema)
+        self.assertIn("dimension_index", schema)
+        for excluded in (
+            "target_id",
+            "dimension_id",
+            "requirement_id",
+            "fact_requirement_id",
+            "step_id",
+            "query",
+            "objective",
+        ):
+            self.assertNotIn(excluded, schema)
+
     def test_planner_attempt_audit_is_local_only_and_consecutive(self) -> None:
         attempts = (
             PlannerAttemptAudit(

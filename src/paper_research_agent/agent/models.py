@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -692,6 +693,82 @@ class PlannerAttemptAudit(FrozenContract):
         if self.outcome != "validated" and self.failure_code is None:
             raise ValueError("failed planner attempt requires a failure code")
         return self
+
+
+class ComparisonFactProposal(FrozenContract):
+    """Provider-authored fact semantics without control-plane identifiers."""
+
+    corpus_id: str = Field(pattern=r"^[CT]\d{3}$")
+    dimension_index: int = Field(ge=0, le=4)
+    description: str = Field(min_length=1, max_length=500)
+    protected_anchor_ids: tuple[int, ...] = Field(min_length=1, max_length=12)
+    retrieval_expansions: tuple[str, ...] = Field(default=(), max_length=12)
+    required_qualifier_kinds: tuple[EvidenceQualifierKind, ...] = Field(
+        default=(), max_length=7
+    )
+
+    @field_validator("description")
+    @classmethod
+    def normalize_description(cls, value: str) -> str:
+        normalized = " ".join(value.split())
+        if not normalized:
+            raise ValueError("comparison fact proposal description must not be blank")
+        return normalized
+
+    @field_validator("protected_anchor_ids")
+    @classmethod
+    def unique_anchor_ids(cls, values: tuple[int, ...]) -> tuple[int, ...]:
+        if len(values) != len(set(values)):
+            raise ValueError("protected anchor IDs must be unique")
+        return values
+
+    @field_validator("retrieval_expansions")
+    @classmethod
+    def normalize_expansions(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(" ".join(value.split()) for value in values)
+        if any(not value for value in normalized):
+            raise ValueError("retrieval expansions must not be blank")
+        keys = tuple(value.casefold() for value in normalized)
+        if len(keys) != len(set(keys)):
+            raise ValueError("retrieval expansions must be unique")
+        return normalized
+
+    @field_validator("required_qualifier_kinds")
+    @classmethod
+    def unique_required_qualifiers(
+        cls, values: tuple[EvidenceQualifierKind, ...]
+    ) -> tuple[EvidenceQualifierKind, ...]:
+        if len(values) != len(set(values)):
+            raise ValueError("required qualifier kinds must be unique")
+        return values
+
+
+class ComparisonPlanProposal(FrozenContract):
+    """Provider schema limited to semantic choices for a comparison plan."""
+
+    selected_corpus_ids: tuple[str, ...] = Field(min_length=2, max_length=4)
+    dimension_labels: tuple[str, ...] = Field(min_length=1, max_length=5)
+    facts: tuple[ComparisonFactProposal, ...] = Field(min_length=1, max_length=24)
+
+    @field_validator("selected_corpus_ids")
+    @classmethod
+    def unique_selected_corpora(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if any(re.fullmatch(r"[CT]\d{3}", value) is None for value in values):
+            raise ValueError("comparison target corpus IDs must be valid")
+        if len(values) != len(set(values)):
+            raise ValueError("comparison targets must use distinct corpus IDs")
+        return values
+
+    @field_validator("dimension_labels")
+    @classmethod
+    def normalize_dimension_labels(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(" ".join(value.split()) for value in values)
+        if any(not value for value in normalized):
+            raise ValueError("comparison research plan requires valid dimensions")
+        keys = tuple(value.casefold() for value in normalized)
+        if len(keys) != len(set(keys)):
+            raise ValueError("comparison research plan requires unique dimensions")
+        return normalized
 
 
 class ResearchPlan(FrozenContract):

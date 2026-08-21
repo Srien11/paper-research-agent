@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping
-from typing import Protocol
+from typing import Any, Protocol
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -17,9 +17,15 @@ from paper_research_agent.agent.fact_queries import (
     validate_question_anchors,
 )
 from paper_research_agent.agent.models import (
+    ComparisonFactProposal,
+    ComparisonPlanProposal,
+    EvidenceFactRequirement,
+    EvidenceRequirement,
     PlannerAttemptAudit,
+    ResearchDimension,
     ResearchPlan,
     ResearchStep,
+    ResearchTarget,
 )
 from paper_research_agent.agent.policy import MAX_INITIAL_PLAN_STEPS
 from paper_research_agent.retrieval.contracts import QueryRewriteTrace
@@ -123,12 +129,12 @@ def _planner_failure_code(error: ValueError) -> str:
             diagnostics.append(str(item.get("type", "")))
             location = tuple(str(part) for part in item.get("loc", ()))
             error_type = str(item.get("type", ""))
-            if location == ("targets",) and error_type in {
+            if location in {("targets",), ("selected_corpus_ids",)} and error_type in {
                 "too_short",
                 "too_long",
             }:
                 return "planner_target_count_invalid"
-            if location == ("dimensions",) and error_type in {
+            if location in {("dimensions",), ("dimension_labels",)} and error_type in {
                 "too_short",
                 "too_long",
             }:
@@ -153,6 +159,115 @@ def parse_explicit_corpus_ids(question: str) -> tuple[str, ...]:
                 flags=re.IGNORECASE,
             )
         )
+    )
+
+
+def build_comparison_research_plan(
+    proposal: ComparisonPlanProposal,
+    *,
+    resolved_catalog: Mapping[str, str],
+    max_steps: int,
+) -> ResearchPlan:
+    """Build all comparison control-plane IDs and scopes deterministically."""
+    if len(proposal.selected_corpus_ids) < 2:
+        raise ValueError("comparison research plan requires at least two targets")
+    if not set(proposal.selected_corpus_ids) <= set(resolved_catalog):
+        raise ValueError("comparison plan left the resolved candidate set")
+    if not proposal.dimension_labels:
+        raise ValueError("comparison research plan requires at least one dimension")
+    cell_count = len(proposal.selected_corpus_ids) * len(proposal.dimension_labels)
+    if cell_count > max_steps:
+        raise ValueError("research plan exceeds the requested step budget")
+    if len(proposal.facts) > max_steps:
+        raise ValueError(
+            "comparison fact requirements exceed the requested step budget"
+        )
+
+    selected = set(proposal.selected_corpus_ids)
+    grouped: dict[tuple[str, int], list[ComparisonFactProposal]] = {}
+    for fact in proposal.facts:
+        if fact.corpus_id not in selected:
+            raise ValueError(
+                "comparison requirement references an unknown target or dimension"
+            )
+        if fact.dimension_index >= len(proposal.dimension_labels):
+            raise ValueError(
+                "comparison requirement references an unknown target or dimension"
+            )
+        grouped.setdefault((fact.corpus_id, fact.dimension_index), []).append(fact)
+    required_keys = {
+        (corpus_id, dimension_index)
+        for corpus_id in proposal.selected_corpus_ids
+        for dimension_index in range(len(proposal.dimension_labels))
+    }
+    if set(grouped) != required_keys:
+        raise ValueError(
+            "comparison requirements must form a complete target-dimension grid"
+        )
+
+    targets = tuple(
+        ResearchTarget(
+            target_id=f"target-{target_index:02d}",
+            label=resolved_catalog[corpus_id],
+            corpus_id=corpus_id,
+        )
+        for target_index, corpus_id in enumerate(proposal.selected_corpus_ids, 1)
+    )
+    dimensions = tuple(
+        ResearchDimension(
+            dimension_id=f"dimension-{dimension_index:02d}",
+            label=label,
+        )
+        for dimension_index, label in enumerate(proposal.dimension_labels, 1)
+    )
+    requirements: list[EvidenceRequirement] = []
+    steps: list[ResearchStep] = []
+    for target_index, target in enumerate(targets, 1):
+        assert target.corpus_id is not None
+        for dimension_offset, dimension in enumerate(dimensions):
+            requirement_id = (
+                f"requirement-{target_index:02d}-{dimension_offset + 1:02d}"
+            )
+            fact_requirements = tuple(
+                EvidenceFactRequirement(
+                    fact_requirement_id=(
+                        f"fact-{target_index:02d}-{dimension_offset + 1:02d}-"
+                        f"{fact_index:02d}"
+                    ),
+                    description=fact.description,
+                    protected_anchor_ids=fact.protected_anchor_ids,
+                    retrieval_expansions=fact.retrieval_expansions,
+                    required_qualifier_kinds=fact.required_qualifier_kinds,
+                )
+                for fact_index, fact in enumerate(
+                    grouped[(target.corpus_id, dimension_offset)], 1
+                )
+            )
+            requirements.append(
+                EvidenceRequirement(
+                    requirement_id=requirement_id,
+                    target_id=target.target_id,
+                    dimension_id=dimension.dimension_id,
+                    description=f"{target.label}: {dimension.label}",
+                    fact_requirements=fact_requirements,
+                )
+            )
+            steps.append(
+                ResearchStep(
+                    step_id=f"discovery-{target_index:02d}-{dimension_offset + 1:02d}",
+                    objective=f"Find {target.label}: {dimension.label}"[:500],
+                    query=f"{target.label} {dimension.label}"[:2000],
+                    corpus_id=target.corpus_id,
+                    target_ids=(target.target_id,),
+                    dimension_ids=(dimension.dimension_id,),
+                )
+            )
+    return ResearchPlan(
+        task_type="comparison",
+        targets=targets,
+        dimensions=dimensions,
+        requirements=tuple(requirements),
+        steps=tuple(steps),
     )
 
 
@@ -218,10 +333,12 @@ class LangChainResearchPlanner:
         corpus_catalog: Mapping[str, str] | None = None,
         target_resolver: ComparisonTargetResolver | None = None,
     ):
+        self._model = model
         self._structured_model = model.with_structured_output(
             ResearchPlan,
             method="function_calling",
         )
+        self._comparison_model: Any | None = None
         self._corpus_catalog = dict(sorted((corpus_catalog or {}).items()))
         self._target_resolver = target_resolver
 
@@ -307,13 +424,51 @@ class LangChainResearchPlanner:
                 )
             )
         )
+        if planning_required:
+            system = SystemMessage(
+                content=(
+                    "You propose only semantic content for a private-paper comparison plan. "
+                    f"Select two to four corpus IDs only from LOCAL_CORPUS_CATALOG_JSON and "
+                    f"use no more than {max_steps} total fact proposals. Return a distinct "
+                    "dimension label for every explicit comparison topic, clue cluster, method, "
+                    "result, limitation, condition, or manipulation requested by the user; do "
+                    "not merge separate requested topics. Return at least one atomic fact for "
+                    "every selected corpus_id by zero-based dimension_index pair, even when the "
+                    "question gives most detail for only one target. Each fact description must "
+                    "come only from the user's question. Select non-empty protected_anchor_ids "
+                    "from VERBATIM_ANCHOR_SOURCE_JSON and put translations or academic synonyms "
+                    "only in retrieval_expansions. Include required_qualifier_kinds when omission "
+                    "would change meaning. Do not generate target IDs, dimension IDs, requirement "
+                    "IDs, fact IDs, step IDs, corpus scopes, queries, objectives, or a ResearchPlan; "
+                    "local deterministic code creates them. Do not answer the question and do not "
+                    "use private references or gold answers."
+                    f"\nVERBATIM_ANCHOR_SOURCE_JSON={anchor_catalog}"
+                    f"\nLOCAL_CORPUS_CATALOG_JSON={catalog}"
+                )
+            )
         messages = [system, HumanMessage(content=question)]
         failure_reason = "planner_schema_invalid"
         attempt_audits: list[PlannerAttemptAudit] = []
+        structured_model = self._structured_model
+        if planning_required:
+            if self._comparison_model is None:
+                self._comparison_model = self._model.with_structured_output(
+                    ComparisonPlanProposal,
+                    method="function_calling",
+                )
+            structured_model = self._comparison_model
         for attempt in range(2):
             try:
-                raw = await self._structured_model.ainvoke(messages)
-                plan = ResearchPlan.model_validate(raw)
+                raw = await structured_model.ainvoke(messages)
+                if planning_required:
+                    proposal = ComparisonPlanProposal.model_validate(raw)
+                    plan = build_comparison_research_plan(
+                        proposal,
+                        resolved_catalog=resolved_catalog,
+                        max_steps=max_steps,
+                    )
+                else:
+                    plan = ResearchPlan.model_validate(raw)
                 if len(plan.steps) > max_steps:
                     raise ValueError("research plan exceeds the requested step budget")
                 if planning_required and plan.task_type != "comparison":
