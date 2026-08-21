@@ -179,6 +179,17 @@ class LangChainResearchPlannerTests(unittest.IsolatedAsyncioTestCase):
             ),
             ("一项讨论偏差", "以竞技场验证", "另一项展示顺序操纵"),
         )
+        self.assertEqual(
+            comparison_dimension_hints(
+                "在逻辑推理自我修正研究中，一篇认为没有外部反馈时经常无效，"
+                "另一篇区分找错与改错，指出给出错误位置后能够纠正。请找出论文。"
+            ),
+            (
+                "一篇认为没有外部反馈时经常无效",
+                "另一篇区分找错与改错",
+                "指出给出错误位置后能够纠正",
+            ),
+        )
 
     def test_builds_comparison_control_plane_deterministically(self) -> None:
         proposal = ComparisonPlanProposal.model_validate(

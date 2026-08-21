@@ -182,6 +182,11 @@ def comparison_dimension_hints(question: str) -> tuple[str, ...]:
             part,
         )
         hints.extend(item.strip() for item in subparts if item.strip())
+    if len(hints) > 1 and re.match(
+        r"^(?:在|关于|针对).*(?:中|领域|研究中)$",
+        hints[0],
+    ):
+        hints.pop(0)
     return tuple(dict.fromkeys(hints))[:5] or (normalized,)
 
 
