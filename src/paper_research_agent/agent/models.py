@@ -698,7 +698,6 @@ class PlannerAttemptAudit(FrozenContract):
 class ComparisonFactProposal(FrozenContract):
     """Provider-authored fact semantics without control-plane identifiers."""
 
-    corpus_id: str = Field(pattern=r"^[CT]\d{3}$")
     dimension_index: int = Field(ge=0, le=4)
     description: str = Field(min_length=1, max_length=500)
     protected_anchor_ids: tuple[int, ...] = Field(min_length=1, max_length=12)

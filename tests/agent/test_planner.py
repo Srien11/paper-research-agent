@@ -187,12 +187,10 @@ class LangChainResearchPlannerTests(unittest.IsolatedAsyncioTestCase):
                 "dimension_labels": ["Method", "Result"],
                 "facts": [
                     {
-                        "corpus_id": corpus_id,
                         "dimension_index": dimension_index,
-                        "description": f"Fact {corpus_id} {dimension_index}",
+                        "description": f"Fact {dimension_index}",
                         "protected_anchor_ids": [dimension_index],
                     }
-                    for corpus_id in ("C001", "T001")
                     for dimension_index in (0, 1)
                 ],
             }
@@ -382,7 +380,6 @@ class LangChainResearchPlannerTests(unittest.IsolatedAsyncioTestCase):
                 "dimension_labels": ["Method"],
                 "facts": [
                     {
-                        "corpus_id": "C001",
                         "dimension_index": 0,
                         "description": "Paper A mechanism",
                         "protected_anchor_ids": [2],
@@ -394,30 +391,14 @@ class LangChainResearchPlannerTests(unittest.IsolatedAsyncioTestCase):
                 "dimension_labels": ["Mechanism", "Input dependency"],
                 "facts": [
                     {
-                        "corpus_id": "C001",
                         "dimension_index": 0,
                         "description": "Paper A core mechanism",
                         "protected_anchor_ids": [2],
                         "retrieval_expansions": ["mechanism", "architecture"],
                     },
                     {
-                        "corpus_id": "C001",
                         "dimension_index": 1,
                         "description": "Paper A input dependency",
-                        "protected_anchor_ids": [3],
-                        "retrieval_expansions": ["required input"],
-                    },
-                    {
-                        "corpus_id": "T001",
-                        "dimension_index": 0,
-                        "description": "Paper B core mechanism",
-                        "protected_anchor_ids": [2],
-                        "retrieval_expansions": ["mechanism", "architecture"],
-                    },
-                    {
-                        "corpus_id": "T001",
-                        "dimension_index": 1,
-                        "description": "Paper B input dependency",
                         "protected_anchor_ids": [3],
                         "retrieval_expansions": ["required input"],
                     },
@@ -480,22 +461,13 @@ class LangChainResearchPlannerTests(unittest.IsolatedAsyncioTestCase):
             "dimension_labels": ["Method"],
             "facts": [
                 {
-                    "corpus_id": "C001",
                     "dimension_index": 0,
                     "description": "Paper A core mechanism",
                     "protected_anchor_ids": [99],
                     "retrieval_expansions": ["mechanism"],
                 },
-                {
-                    "corpus_id": "C001",
-                    "dimension_index": 0,
-                    "description": "Paper B core mechanism",
-                    "protected_anchor_ids": [99],
-                    "retrieval_expansions": ["mechanism"],
-                },
             ],
         }
-        structured.ainvoke.return_value["facts"][1]["corpus_id"] = "T001"
         model.with_structured_output.return_value = structured
         planner = LangChainResearchPlanner(
             model,
@@ -531,7 +503,6 @@ class LangChainResearchPlannerTests(unittest.IsolatedAsyncioTestCase):
             "dimension_labels": ["Method"],
             "facts": [
                 {
-                    "corpus_id": "C001",
                     "dimension_index": 0,
                     "description": "Method",
                     "protected_anchor_ids": [0],
@@ -563,13 +534,6 @@ class LangChainResearchPlannerTests(unittest.IsolatedAsyncioTestCase):
             "facts": [
                 {
                     "description": "Paper A method",
-                    "corpus_id": "C001",
-                    "dimension_index": 0,
-                    "protected_anchor_ids": [0],
-                },
-                {
-                    "description": "Paper X method",
-                    "corpus_id": "T999",
                     "dimension_index": 0,
                     "protected_anchor_ids": [0],
                 },

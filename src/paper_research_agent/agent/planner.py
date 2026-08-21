@@ -207,29 +207,20 @@ def build_comparison_research_plan(
     cell_count = len(proposal.selected_corpus_ids) * len(proposal.dimension_labels)
     if cell_count > max_steps:
         raise ValueError("research plan exceeds the requested step budget")
-    if len(proposal.facts) > max_steps:
+    materialized_fact_count = len(proposal.facts) * len(proposal.selected_corpus_ids)
+    if materialized_fact_count > max_steps:
         raise ValueError(
             "comparison fact requirements exceed the requested step budget"
         )
 
-    selected = set(proposal.selected_corpus_ids)
-    grouped: dict[tuple[str, int], list[ComparisonFactProposal]] = {}
+    grouped: dict[int, list[ComparisonFactProposal]] = {}
     for fact in proposal.facts:
-        if fact.corpus_id not in selected:
-            raise ValueError(
-                "comparison requirement references an unknown target or dimension"
-            )
         if fact.dimension_index >= len(proposal.dimension_labels):
             raise ValueError(
                 "comparison requirement references an unknown target or dimension"
             )
-        grouped.setdefault((fact.corpus_id, fact.dimension_index), []).append(fact)
-    required_keys = {
-        (corpus_id, dimension_index)
-        for corpus_id in proposal.selected_corpus_ids
-        for dimension_index in range(len(proposal.dimension_labels))
-    }
-    if set(grouped) != required_keys:
+        grouped.setdefault(fact.dimension_index, []).append(fact)
+    if set(grouped) != set(range(len(proposal.dimension_labels))):
         raise ValueError(
             "comparison requirements must form a complete target-dimension grid"
         )
@@ -269,7 +260,7 @@ def build_comparison_research_plan(
                     required_qualifier_kinds=fact.required_qualifier_kinds,
                 )
                 for fact_index, fact in enumerate(
-                    grouped[(target.corpus_id, dimension_offset)], 1
+                    grouped[dimension_offset], 1
                 )
             )
             requirements.append(
@@ -473,9 +464,9 @@ class LangChainResearchPlanner:
                     "not merge separate requested topics. Return at least one atomic fact for "
                     f"exactly {len(dimension_hints)} dimensions, preserving the one-to-one order "
                     "of EXPLICIT_DIMENSION_HINTS_JSON. Do not merge, drop, or add hint entries. "
-                    "Return at least one atomic fact for "
-                    "every selected corpus_id by zero-based dimension_index pair, even when the "
-                    "question gives most detail for only one target. Each fact description must "
+                    "Return one or more atomic fact intents for every zero-based dimension_index. "
+                    "Do not repeat facts per corpus: local code applies each dimension's intents "
+                    "symmetrically to every selected corpus. Each fact description must "
                     "come only from the user's question. Select non-empty protected_anchor_ids "
                     "from VERBATIM_ANCHOR_SOURCE_JSON and put translations or academic synonyms "
                     "only in retrieval_expansions. Include required_qualifier_kinds when omission "
