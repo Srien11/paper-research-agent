@@ -462,6 +462,12 @@ class ResearchGraphTests(unittest.IsolatedAsyncioTestCase):
         max_active_searches = 0
         search_timeline: list[tuple[str, str]] = []
         step_by_query = {step.query: step for step in steps}
+        release_by_step = {step.step_id: asyncio.Event() for step in steps}
+
+        async def release_in_reverse_plan_order() -> None:
+            for step in reversed(steps):
+                release_by_step[step.step_id].set()
+                await asyncio.sleep(0.01)
 
         async def tracked_search(request: SearchCorpusInput) -> SearchCorpusResult:
             nonlocal active_searches, max_active_searches
@@ -469,7 +475,9 @@ class ResearchGraphTests(unittest.IsolatedAsyncioTestCase):
             active_searches += 1
             max_active_searches = max(max_active_searches, active_searches)
             search_timeline.append(("start", step.step_id))
-            await asyncio.sleep(0.01)
+            if active_searches == len(steps):
+                asyncio.create_task(release_in_reverse_plan_order())
+            await release_by_step[step.step_id].wait()
             search_timeline.append(("finish", step.step_id))
             active_searches -= 1
             return SearchCorpusResult(
@@ -501,7 +509,7 @@ class ResearchGraphTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["tool_call_count"], 12)
         self.assertEqual(service.search_corpus.await_count, 6)
         self.assertEqual(service.get_evidence.await_count, 6)
-        self.assertEqual(max_active_searches, 2)
+        self.assertEqual(max_active_searches, 6)
         self.assertEqual(
             [item["step_id"] for item in state["observations"]],
             [step.step_id for step in steps],
@@ -514,11 +522,14 @@ class ResearchGraphTests(unittest.IsolatedAsyncioTestCase):
             ],
             [step.step_id for step in steps],
         )
-        for offset in range(0, len(search_timeline), 4):
-            self.assertEqual(
-                [event for event, _step_id in search_timeline[offset : offset + 4]],
-                ["start", "start", "finish", "finish"],
-            )
+        self.assertEqual(
+            [event for event, _step_id in search_timeline[:6]],
+            ["start"] * 6,
+        )
+        self.assertEqual(
+            [step_id for event, step_id in search_timeline[6:] if event == "finish"],
+            [step.step_id for step in reversed(steps)],
+        )
         self.assertEqual(len(reasoner.calls), 1)
         self.assertEqual(len(reasoner.calls[0][2]), 6)
         self.assertTrue(state["evidence_sufficient"])
@@ -673,16 +684,28 @@ class ResearchGraphTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         service = AsyncMock()
-        service.search_corpus.side_effect = tuple(
-            SearchCorpusResult(
+        active_searches = 0
+        search_batch_sizes: list[int] = []
+        step_by_query = {step.query: step for step in steps}
+
+        async def tracked_search(request: SearchCorpusInput) -> SearchCorpusResult:
+            nonlocal active_searches
+            step = step_by_query[request.query]
+            if active_searches == 0:
+                search_batch_sizes.append(0)
+            active_searches += 1
+            search_batch_sizes[-1] = max(search_batch_sizes[-1], active_searches)
+            await asyncio.sleep(0.01)
+            active_searches -= 1
+            return SearchCorpusResult(
                 query=step.query,
                 corpus_id=step.corpus_id,
                 index_id="idx-test",
                 degraded=False,
                 hits=(_hit(f"chunk-{step.step_id}", str(step.corpus_id), 1),),
             )
-            for step in steps
-        )
+
+        service.search_corpus.side_effect = tracked_search
         service.get_evidence.side_effect = tuple(
             GetEvidenceResult(
                 records=(_record(f"chunk-{step.step_id}", str(step.corpus_id)),)
@@ -703,6 +726,8 @@ class ResearchGraphTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["tool_call_budget"], 26)
         self.assertEqual(state["current_step"], 10)
         self.assertEqual(state["tool_call_count"], 20)
+        self.assertEqual(search_batch_sizes, [6, 4])
+        self.assertEqual([len(call[2]) for call in reasoner.calls], [10])
 
     async def test_comparison_followups_stop_at_frozen_dynamic_budget(self) -> None:
         targets = (
@@ -944,10 +969,18 @@ class ResearchGraphTests(unittest.IsolatedAsyncioTestCase):
             "Paper A Method: Paper A input retrieval terms": ("C001", "a-input"),
         }
         service = AsyncMock()
+        active_followups = 0
+        max_active_followups = 0
 
         async def search(request: SearchCorpusInput) -> SearchCorpusResult:
+            nonlocal active_followups, max_active_followups
             corpus_id, prefix = query_scope[request.query]
             self.assertEqual(request.corpus_id, corpus_id)
+            if request.query.startswith("Paper A Method:"):
+                active_followups += 1
+                max_active_followups = max(max_active_followups, active_followups)
+                await asyncio.sleep(0)
+                active_followups -= 1
             return SearchCorpusResult(
                 query=request.query,
                 corpus_id=corpus_id,
@@ -1003,6 +1036,7 @@ class ResearchGraphTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(planner.calls, [("Compare methods", 20, False)])
         self.assertEqual([len(call[2]) for call in reasoner.calls], [2, 4])
+        self.assertEqual(max_active_followups, 2)
         self.assertFalse(policy.adaptive_evidence_hydration_enabled)
         self.assertEqual((policy.max_steps, policy.max_tool_calls, policy.timeout_seconds), (24, 48, 180))
         self.assertEqual((state["step_budget"], state["tool_call_budget"]), (4, 8))

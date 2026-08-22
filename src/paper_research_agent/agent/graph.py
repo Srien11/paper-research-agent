@@ -295,13 +295,30 @@ def build_research_graph(
             requirement_by_id = {
                 item.requirement_id: item for item in plan.requirements
             }
-            while pending_followups:
+            available_steps = min(
+                runtime_policy.comparison_search_concurrency,
+                _state_step_budget(state, runtime_policy) - current_step,
+                (
+                    _state_tool_call_budget(state, runtime_policy)
+                    - state["tool_call_count"]
+                )
+                // 2,
+            )
+            replacements: list[ResearchStep] = []
+            replacement_keys: set[tuple[str, str | None]] = set()
+            action_history = list(state["action_history"])
+            while pending_followups and len(replacements) < available_steps:
                 followup = pending_followups.pop(0)
                 requested = requirement_by_id[followup.requirement_id]
                 corpus_id = _comparison_corpus_id(plan, (requested.target_id,))
-                if _query_scope_key(followup.query, corpus_id) in executed_queries:
+                query_key = _query_scope_key(followup.query, corpus_id)
+                if query_key in executed_queries:
                     continue
-                replan_count = state["replan_count"] + 1
+                if query_key in replacement_keys:
+                    raise ValueError(
+                        "comparison search batch contains a repeated scoped query"
+                    )
+                replan_count = state["replan_count"] + len(replacements) + 1
                 replacement = ResearchStep(
                     step_id=f"replan-{replan_count}",
                     objective=followup.objective,
@@ -321,23 +338,26 @@ def build_research_graph(
                     target_ids=(requested.target_id,),
                     dimension_ids=(requested.dimension_id,),
                 )
-                updated_plan = plan.model_copy(
-                    update={"steps": (*plan.steps, replacement)}
-                )
-                action_history = _append_action(
-                    state,
+                replacements.append(replacement)
+                replacement_keys.add(query_key)
+                action_history = _append_action_from_history(
+                    action_history,
                     action="replan",
                     step_id=replacement.step_id,
                     query=replacement.query,
                 )
+            if replacements:
+                updated_plan = plan.model_copy(
+                    update={"steps": (*plan.steps, *replacements)}
+                )
                 return {
                     "plan": updated_plan.model_dump(mode="json"),
-                    "active_step": replacement.model_dump(mode="json"),
+                    "active_step": replacements[0].model_dump(mode="json"),
                     "pending_followups": [
                         item.model_dump(mode="json") for item in pending_followups
                     ],
                     "action_history": action_history,
-                    "replan_count": replan_count,
+                    "replan_count": state["replan_count"] + len(replacements),
                     "next_action": "execute_tools",
                     "termination_reason": None,
                 }
@@ -566,7 +586,7 @@ def build_research_graph(
         first_step = ResearchStep.model_validate(state.get("active_step"))
         current_step = state["current_step"]
         batch_size = 1
-        if plan.task_type == "comparison" and not state["assessments"]:
+        if plan.task_type == "comparison":
             batch_size = min(
                 runtime_policy.comparison_search_concurrency,
                 len(plan.steps) - current_step,
