@@ -136,6 +136,21 @@ class ResearchToolModelTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, str(serialized))
 
+    def test_planner_fallback_reason_is_local_only(self) -> None:
+        plan = ResearchPlan(
+            steps=(ResearchStep(step_id="one", objective="One", query="one"),),
+            planner_fallback_reason="fact_proposal_repair_exhausted",
+        )
+
+        self.assertEqual(
+            plan.planner_fallback_reason,
+            "fact_proposal_repair_exhausted",
+        )
+        self.assertNotIn(
+            "planner_fallback_reason",
+            ResearchPlan.model_json_schema()["properties"],
+        )
+
     def test_fact_requirement_normalizes_structured_query_terms(self) -> None:
         item = EvidenceFactRequirement(
             fact_requirement_id="a-method-input",

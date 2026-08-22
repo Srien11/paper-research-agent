@@ -249,7 +249,7 @@ class EvidenceFactRequirement(FrozenContract):
     required_qualifier_kinds: tuple[EvidenceQualifierKind, ...] = Field(
         default=(), max_length=7
     )
-    origin: Literal["planned", "derived"] = "planned"
+    origin: Literal["planned", "planned_fallback", "derived"] = "planned"
 
     @field_validator("description")
     @classmethod
@@ -773,6 +773,10 @@ class ResearchPlan(FrozenContract):
     steps: tuple[ResearchStep, ...] = Field(min_length=1, max_length=24)
     planner_attempts: SkipJsonSchema[tuple[PlannerAttemptAudit, ...]] = Field(
         default=(), max_length=2
+    )
+    planner_fallback_reason: SkipJsonSchema[str | None] = Field(
+        default=None,
+        pattern=r"^[a-z][a-z0-9_]{0,95}$",
     )
 
     @model_validator(mode="after")

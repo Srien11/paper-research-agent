@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -94,6 +94,7 @@ _PLANNER_FAILURE_FRAGMENTS: tuple[tuple[str, str], ...] = (
     ("fact-bound research steps must be unique", "planner_id_duplicate"),
     ("exceeds the requested step budget", "planner_step_budget_invalid"),
     ("fact requirements exceed", "planner_fact_budget_invalid"),
+    ("local dimension anchor", "local_dimension_anchor_invalid"),
     ("protected anchor", "planner_anchor_selection_invalid"),
     ("protected_anchor_ids", "planner_anchor_selection_invalid"),
 )
@@ -121,6 +122,9 @@ _PLANNER_REPAIR_INSTRUCTIONS: dict[str, str] = {
     ),
     "planner_fact_proposal_invalid": (
         "Return at least one valid atomic fact intent for every fixed dimension index."
+    ),
+    "local_dimension_anchor_invalid": (
+        "Use only fixed dimension hints that are covered by the local question anchor catalog."
     ),
     "planner_dimension_invalid": (
         "Return one or more unique dimensions explicitly requested by the question."
@@ -224,12 +228,69 @@ def comparison_dimension_hints(question: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(hints))[:5] or (normalized,)
 
 
+def build_fallback_fact_proposals(
+    dimension_hints: tuple[str, ...],
+    anchor_source: tuple[str, ...],
+) -> tuple[ComparisonFactProposal, ...]:
+    """Build one conservative fact intent per locally fixed dimension."""
+    normalized_anchors = tuple(" ".join(anchor.split()) for anchor in anchor_source)
+    proposals: list[ComparisonFactProposal] = []
+    for dimension_index, hint in enumerate(dimension_hints):
+        normalized_hint = " ".join(hint.split())
+        candidates = tuple(
+            (len(anchor), anchor_id)
+            for anchor_id, anchor in enumerate(normalized_anchors)
+            if normalized_hint and normalized_hint in anchor
+        )
+        if not candidates:
+            raise ValueError("local dimension anchor is invalid")
+        _, anchor_id = min(candidates)
+        proposals.append(
+            ComparisonFactProposal(
+                dimension_index=dimension_index,
+                description=normalized_hint,
+                protected_anchor_ids=(anchor_id,),
+                retrieval_expansions=(),
+            )
+        )
+    return tuple(proposals)
+
+
+def _safe_selected_corpus_ids(
+    raw: object,
+    resolved_catalog: Mapping[str, str],
+) -> tuple[str, ...] | None:
+    """Extract only a fully valid provider target selection for local fallback."""
+    if isinstance(raw, ComparisonPlanProposal):
+        values: object = raw.selected_corpus_ids
+    elif isinstance(raw, Mapping):
+        values = raw.get("selected_corpus_ids")
+    else:
+        return None
+    if not isinstance(values, (list, tuple)):
+        return None
+    selected = tuple(values)
+    if (
+        not 2 <= len(selected) <= 4
+        or any(
+            not isinstance(item, str)
+            or re.fullmatch(r"[CT]\d{3}", item) is None
+            for item in selected
+        )
+        or len(selected) != len(set(selected))
+        or not set(selected) <= set(resolved_catalog)
+    ):
+        return None
+    return selected
+
+
 def build_comparison_research_plan(
     proposal: ComparisonPlanProposal,
     *,
     resolved_catalog: Mapping[str, str],
     dimension_labels: tuple[str, ...],
     max_steps: int,
+    fact_origin: Literal["planned", "planned_fallback"] = "planned",
 ) -> ResearchPlan:
     """Build all comparison control-plane IDs and scopes deterministically."""
     if len(proposal.selected_corpus_ids) < 2:
@@ -307,6 +368,7 @@ def build_comparison_research_plan(
                     protected_anchor_ids=fact.protected_anchor_ids,
                     retrieval_expansions=fact.retrieval_expansions,
                     required_qualifier_kinds=fact.required_qualifier_kinds,
+                    origin=fact_origin,
                 )
                 for fact_index, fact in enumerate(
                     grouped[dimension_offset], 1
@@ -531,6 +593,7 @@ class LangChainResearchPlanner:
         messages = [system, HumanMessage(content=question)]
         failure_reason = "planner_schema_invalid"
         attempt_audits: list[PlannerAttemptAudit] = []
+        fallback_selected_corpus_ids: tuple[str, ...] | None = None
         structured_model = self._structured_model
         if planning_required:
             if self._comparison_model is None:
@@ -543,6 +606,12 @@ class LangChainResearchPlanner:
             try:
                 raw = await structured_model.ainvoke(messages)
                 if planning_required:
+                    safe_selection = _safe_selected_corpus_ids(
+                        raw,
+                        resolved_catalog,
+                    )
+                    if safe_selection is not None:
+                        fallback_selected_corpus_ids = safe_selection
                     proposal = ComparisonPlanProposal.model_validate(raw)
                     plan = build_comparison_research_plan(
                         proposal,
@@ -613,6 +682,53 @@ class LangChainResearchPlanner:
                         ),
                     ]
 
+        fallback_failure_codes = {
+            "planner_fact_dimension_reference_invalid",
+            "planner_fact_proposal_invalid",
+            "planner_anchor_selection_invalid",
+        }
+        if (
+            planning_required
+            and fallback_selected_corpus_ids is not None
+            and len(attempt_audits) == 2
+            and all(
+                item.failure_code in fallback_failure_codes
+                for item in attempt_audits
+            )
+        ):
+            try:
+                fallback_facts = build_fallback_fact_proposals(
+                    dimension_hints,
+                    anchor_source,
+                )
+                fallback_plan = build_comparison_research_plan(
+                    ComparisonPlanProposal(
+                        selected_corpus_ids=fallback_selected_corpus_ids,
+                        facts=fallback_facts,
+                    ),
+                    resolved_catalog=resolved_catalog,
+                    dimension_labels=dimension_hints,
+                    max_steps=max_steps,
+                    fact_origin="planned_fallback",
+                )
+                fallback_plan = bind_question_anchors(
+                    fallback_plan,
+                    anchor_source,
+                )
+                for requirement in fallback_plan.requirements:
+                    for fact_requirement in requirement.fact_requirements:
+                        validate_question_anchors(question, fact_requirement)
+            except ValueError as exc:
+                raise ComparisonPlanningError(
+                    _planner_failure_code(exc),
+                    attempts=tuple(attempt_audits),
+                ) from None
+            return fallback_plan.model_copy(
+                update={
+                    "planner_attempts": tuple(attempt_audits),
+                    "planner_fallback_reason": "fact_proposal_repair_exhausted",
+                }
+            )
         if planning_required:
             raise ComparisonPlanningError(
                 failure_reason,

@@ -4,6 +4,7 @@ import copy
 import unittest
 from unittest.mock import AsyncMock, Mock
 
+from paper_research_agent.agent.fact_queries import question_anchor_catalog
 from paper_research_agent.agent.models import (
     ComparisonPlanProposal,
     ResearchPlan,
@@ -16,12 +17,12 @@ from paper_research_agent.agent.planner import (
     LangChainResearchPlanner,
     _planner_failure_code,
     build_comparison_research_plan,
+    build_fallback_fact_proposals,
     comparison_dimension_hints,
     parse_explicit_corpus_ids,
 )
 from paper_research_agent.retrieval.contracts import QueryRewriteTrace
 from paper_research_agent.retrieval.papers import PaperCandidateHit, PaperCandidateQuery
-
 
 CPG020_LIKE_QUESTION = (
     "在逻辑推理自我修正研究中，一篇认为没有外部反馈时经常无效，"
@@ -475,6 +476,133 @@ class LangChainResearchPlannerTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(len(plan.steps), 6)
 
+    def test_fallback_fact_proposals_use_only_dimension_hints_and_question_anchors(
+        self,
+    ) -> None:
+        hints = comparison_dimension_hints(CPG020_LIKE_QUESTION)
+        anchors = question_anchor_catalog(CPG020_LIKE_QUESTION)
+
+        proposals = build_fallback_fact_proposals(hints, anchors)
+
+        self.assertEqual(
+            tuple(item.dimension_index for item in proposals),
+            (0, 1, 2),
+        )
+        self.assertEqual(tuple(item.description for item in proposals), hints)
+        self.assertTrue(all(not item.retrieval_expansions for item in proposals))
+        for proposal in proposals:
+            self.assertTrue(proposal.protected_anchor_ids)
+            self.assertTrue(
+                all(
+                    0 <= anchor_id < len(anchors)
+                    for anchor_id in proposal.protected_anchor_ids
+                )
+            )
+
+    def test_fallback_fact_proposals_fail_when_no_anchor_covers_dimension(self) -> None:
+        with self.assertRaises(ValueError) as raised:
+            build_fallback_fact_proposals(("missing dimension",), ("other text",))
+
+        self.assertEqual(
+            _planner_failure_code(raised.exception),
+            "local_dimension_anchor_invalid",
+        )
+
+    async def test_invalid_fact_repairs_use_question_derived_fallback(self) -> None:
+        model = Mock()
+        structured = AsyncMock()
+        structured.ainvoke.return_value = {
+            "selected_corpus_ids": ["C001", "T001"],
+            "facts": [
+                {
+                    "dimension_index": 0,
+                    "description": "model-authored fact",
+                    "protected_anchor_ids": [2],
+                }
+            ],
+        }
+        model.with_structured_output.return_value = structured
+        planner = LangChainResearchPlanner(
+            model,
+            corpus_catalog={"C001": "Paper A", "T001": "Paper B"},
+        )
+
+        plan = await planner.plan(
+            CPG020_LIKE_QUESTION,
+            max_steps=6,
+            planning_required=True,
+        )
+
+        self.assertEqual(structured.ainvoke.await_count, 2)
+        self.assertEqual(len(plan.dimensions), 3)
+        self.assertEqual(len(plan.steps), 6)
+        self.assertEqual(
+            plan.planner_fallback_reason,
+            "fact_proposal_repair_exhausted",
+        )
+        self.assertEqual(
+            {
+                fact.origin
+                for cell in plan.requirements
+                for fact in cell.fact_requirements
+            },
+            {"planned_fallback"},
+        )
+        self.assertEqual(
+            tuple(
+                fact.description
+                for cell in plan.requirements[:3]
+                for fact in cell.fact_requirements
+            ),
+            comparison_dimension_hints(CPG020_LIKE_QUESTION),
+        )
+
+    async def test_partial_fact_proposal_is_replaced_as_one_atomic_group(self) -> None:
+        model = Mock()
+        structured = AsyncMock()
+        structured.ainvoke.return_value = {
+            "selected_corpus_ids": ["C001", "T001"],
+            "facts": [
+                {
+                    "dimension_index": 0,
+                    "description": "partially valid provider fact",
+                    "protected_anchor_ids": [2],
+                },
+                {
+                    "dimension_index": 1,
+                    "description": "another provider fact",
+                    "protected_anchor_ids": [3],
+                },
+            ],
+        }
+        model.with_structured_output.return_value = structured
+        planner = LangChainResearchPlanner(
+            model,
+            corpus_catalog={"C001": "Paper A", "T001": "Paper B"},
+        )
+
+        plan = await planner.plan(
+            CPG020_LIKE_QUESTION,
+            max_steps=6,
+            planning_required=True,
+        )
+
+        self.assertTrue(
+            all(
+                fact.origin == "planned_fallback"
+                for cell in plan.requirements
+                for fact in cell.fact_requirements
+            )
+        )
+        self.assertNotIn(
+            "partially valid provider fact",
+            {
+                fact.description
+                for cell in plan.requirements
+                for fact in cell.fact_requirements
+            },
+        )
+
     def test_planner_failures_have_stable_body_free_codes(self) -> None:
         base = {
             "task_type": "comparison",
@@ -782,11 +910,11 @@ class LangChainResearchPlannerTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-    async def test_proposal_failure_is_not_reported_as_target_resolution(self) -> None:
+    async def test_local_materialization_failure_is_not_target_resolution(self) -> None:
         model = Mock()
         structured = AsyncMock()
         structured.ainvoke.return_value = {
-            "selected_corpus_ids": ["C001", "T001"],
+            "selected_corpus_ids": ["C001", "T001", "C002"],
             "dimension_labels": ["Method", "Result"],
             "facts": [
                 {
@@ -799,7 +927,11 @@ class LangChainResearchPlannerTests(unittest.IsolatedAsyncioTestCase):
         model.with_structured_output.return_value = structured
         planner = LangChainResearchPlanner(
             model,
-            corpus_catalog={"C001": "Paper A", "T001": "Paper B"},
+            corpus_catalog={
+                "C001": "Paper A",
+                "T001": "Paper B",
+                "C002": "Paper C",
+            },
         )
 
         with self.assertRaises(ComparisonPlanningError) as raised:
@@ -811,7 +943,7 @@ class LangChainResearchPlannerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             raised.exception.reason_code,
-            "planner_fact_proposal_invalid",
+            "planner_step_budget_invalid",
         )
         self.assertNotIsInstance(
             raised.exception,
