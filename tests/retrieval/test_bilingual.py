@@ -76,6 +76,73 @@ class FakeRewriter:
         )
 
 
+class QueryAwareRewriter(FakeRewriter):
+    def __init__(self, *, delay=0.0, error=None):
+        super().__init__(delay=delay, error=error)
+        self.active = 0
+        self.max_active = 0
+
+    async def rewrite(self, query):
+        self.calls.append(query)
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        try:
+            await asyncio.sleep(self.delay)
+            if self.error is not None:
+                raise self.error
+            return QueryRewriteResult(
+                english_query=f"English {query}",
+                actual_model=self.model_id,
+                input_tokens=12,
+                output_tokens=5,
+            )
+        finally:
+            self.active -= 1
+
+
+class BarrierIndex(StaticIndex):
+    def __init__(self, rankings, barrier):
+        super().__init__(rankings)
+        self.barrier = barrier
+        self.active = 0
+        self.max_active = 0
+        self.lock = threading.Lock()
+
+    def search(self, query, top_k, *, filters=None):
+        with self.lock:
+            self.calls.append((query, filters))
+            if query.startswith("query-"):
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+        if query.startswith("query-"):
+            self.barrier.wait(timeout=2)
+        result = list(self.rankings[query][:top_k])
+        if query.startswith("query-"):
+            with self.lock:
+                self.active -= 1
+        return result
+
+
+class BarrierReranker(RecordingReranker):
+    def __init__(self, barrier):
+        super().__init__()
+        self.barrier = barrier
+        self.active = 0
+        self.max_active = 0
+        self.lock = threading.Lock()
+
+    def score(self, query, texts):
+        with self.lock:
+            self.calls.append((query, list(texts)))
+            self.thread_names.append(threading.current_thread().name)
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        self.barrier.wait(timeout=2)
+        with self.lock:
+            self.active -= 1
+        return [float(len(texts) - index) for index, _text in enumerate(texts)]
+
+
 class FailingCache:
     def lookup(self, *args, **kwargs):
         raise sqlite3.OperationalError("cache unavailable")
@@ -252,6 +319,102 @@ class BilingualRetrievalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second.rewrite.status, "cache_hit")
         self.assertEqual(second_rewriter.calls, [])
         self.assertFalse(second.degraded)
+
+    async def test_six_workers_keep_recall_rerank_filters_and_audit_isolated(self) -> None:
+        queries = tuple(f"query-{index}" for index in range(6))
+        chunks = {
+            query: chunk(f"chunk-{index}", f"evidence {index}")
+            for index, query in enumerate(queries)
+        }
+        rankings = {
+            **{query: [(chunks[query], 1.0)] for query in queries},
+            **{
+                f"English {query}": [(chunks[query], 1.0)]
+                for query in queries
+            },
+        }
+        recall_barrier = threading.Barrier(6)
+        rerank_barrier = threading.Barrier(6)
+        sparse = StaticIndex(rankings)
+        vector = BarrierIndex(rankings, recall_barrier)
+        reranker = BarrierReranker(rerank_barrier)
+        rewriter = QueryAwareRewriter(delay=0.01)
+        service = BilingualRetrievalService(
+            sparse,
+            vector,
+            reranker,
+            rewriter,
+            self.cache,
+            self.audit,
+            retrieval_config(),
+            bilingual_config(self.directory),
+            index_id="idx-six",
+            local_workers=6,
+        )
+        self.services.append(service)
+        filters = tuple({"corpus_id": f"C{index:03d}"} for index in range(6))
+
+        runs = await asyncio.gather(
+            *(
+                service.search(query, filters=query_filters)
+                for query, query_filters in zip(queries, filters, strict=True)
+            )
+        )
+
+        self.assertEqual(vector.max_active, 6)
+        self.assertEqual(reranker.max_active, 6)
+        self.assertEqual(
+            [run.hits[0].chunk_id for run in runs],
+            [chunks[query].chunk_id for query in queries],
+        )
+        for query, query_filters in zip(queries, filters, strict=True):
+            self.assertIn((query, query_filters), vector.calls)
+            self.assertIn((f"English {query}", query_filters), vector.calls)
+        self.assertTrue(all(run.audit_persisted for run in runs))
+        with closing(sqlite3.connect(self.directory / "audit.sqlite3")) as connection:
+            audit_queries = {
+                row[0] for row in connection.execute("SELECT original_query FROM runs")
+            }
+            run_count = connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+        self.assertEqual(audit_queries, set(queries))
+        self.assertEqual(run_count, 6)
+
+        await service.aclose()
+        self.assertTrue(service._local_executor._shutdown)
+
+    async def test_six_cache_hits_skip_provider_and_rewrite_flights_stay_independent(
+        self,
+    ) -> None:
+        cached_queries = tuple(f"cached-{index}" for index in range(6))
+        priming_rewriter = QueryAwareRewriter()
+        priming_service = self.service(priming_rewriter)
+        await asyncio.gather(*(priming_service.resolve_query(query) for query in cached_queries))
+
+        forbidden = QueryAwareRewriter(error=AssertionError("must not call provider"))
+        cached_service = self.service(forbidden)
+        cached = await asyncio.gather(
+            *(cached_service.resolve_query(query) for query in cached_queries)
+        )
+        self.assertTrue(all(item.status == "cache_hit" for item in cached))
+        self.assertEqual(forbidden.calls, [])
+
+        uncached = tuple(f"uncached-{index}" for index in range(6))
+        concurrent_rewriter = QueryAwareRewriter(delay=0.02)
+        concurrent_service = self.service(concurrent_rewriter)
+        rewritten = await asyncio.gather(
+            *(concurrent_service.resolve_query(query) for query in uncached)
+        )
+        self.assertEqual(concurrent_rewriter.max_active, 6)
+        self.assertEqual([item.english_query for item in rewritten], [f"English {q}" for q in uncached])
+
+        same_query_results = await asyncio.gather(
+            *(concurrent_service.resolve_query("one-flight") for _ in range(6))
+        )
+        self.assertEqual(concurrent_rewriter.calls.count("one-flight"), 1)
+        self.assertEqual(
+            {item.english_query for item in same_query_results},
+            {"English one-flight"},
+        )
 
     async def test_memory_aware_query_has_per_request_one_day_retention(self) -> None:
         await self.service(FakeRewriter()).search("中文问题", privacy_ttl_days=1)
