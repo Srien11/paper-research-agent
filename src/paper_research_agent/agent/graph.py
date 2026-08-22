@@ -305,7 +305,7 @@ def build_research_graph(
                 // 2,
             )
             replacements: list[ResearchStep] = []
-            replacement_keys: set[tuple[str, str | None]] = set()
+            replacement_keys: set[tuple[str | None, str]] = set()
             action_history = list(state["action_history"])
             while pending_followups and len(replacements) < available_steps:
                 followup = pending_followups.pop(0)
