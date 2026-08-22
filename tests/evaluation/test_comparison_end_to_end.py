@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from paper_research_agent.evaluation.comparison_end_to_end import (
     CitationDiagnostic,
     ComparisonCaseDiagnostic,
@@ -325,6 +327,84 @@ def test_compilation_audit_keeps_failure_when_retry_still_fails() -> None:
     assert summary["final"]["failed_unit_count"] == 1
     assert summary["final"]["contract_failed_unit_count"] == 1
     assert summary["final"]["unresolved_fact_requirement_count"] == 1
+
+
+def test_compilation_attempt_requires_disjoint_accepted_and_failed_ids() -> None:
+    with pytest.raises(ValueError, match="disjoint"):
+        CompilationAttemptDiagnostic(
+            attempt=1,
+            outcome="validated",
+            requested_requirement_ids=("a",),
+            accepted_requirement_ids=("a",),
+            failed_requirement_ids=("a",),
+        )
+
+
+def test_compilation_attempt_requires_a_complete_requested_partition() -> None:
+    with pytest.raises(ValueError, match="partition"):
+        CompilationAttemptDiagnostic(
+            attempt=1,
+            outcome="validated",
+            requested_requirement_ids=("a", "b"),
+            accepted_requirement_ids=("a",),
+            failed_requirement_ids=(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("accepted_ids", "failed_ids"),
+    [
+        (("a", "outside"), ()),
+        (("a",), ("outside",)),
+    ],
+)
+def test_compilation_attempt_rejects_ids_outside_requested_partition(
+    accepted_ids: tuple[str, ...],
+    failed_ids: tuple[str, ...],
+) -> None:
+    with pytest.raises(ValueError, match="partition"):
+        CompilationAttemptDiagnostic(
+            attempt=1,
+            outcome="contract_invalid",
+            failure_code="fact_chunk_scope_invalid",
+            requested_requirement_ids=("a",),
+            accepted_requirement_ids=accepted_ids,
+            failed_requirement_ids=failed_ids,
+        )
+
+
+def test_validated_compilation_attempt_cannot_contain_a_failure() -> None:
+    with pytest.raises(ValueError, match="validated"):
+        CompilationAttemptDiagnostic(
+            attempt=1,
+            outcome="validated",
+            failure_code="fact_chunk_scope_invalid",
+            requested_requirement_ids=("a",),
+            accepted_requirement_ids=("a",),
+        )
+
+
+@pytest.mark.parametrize(
+    ("failure_code", "failed_ids"),
+    [
+        ("fact_chunk_scope_invalid", ()),
+        (None, ("a",)),
+    ],
+)
+def test_invalid_compilation_attempt_requires_failure_details(
+    failure_code: str | None,
+    failed_ids: tuple[str, ...],
+) -> None:
+    accepted_ids = ("a",) if not failed_ids else ()
+    with pytest.raises(ValueError, match="invalid"):
+        CompilationAttemptDiagnostic(
+            attempt=1,
+            outcome="contract_invalid",
+            failure_code=failure_code,
+            requested_requirement_ids=("a",),
+            accepted_requirement_ids=accepted_ids,
+            failed_requirement_ids=failed_ids,
+        )
 
 
 def test_case_diagnostic_persists_and_aggregates_body_free_planner_attempts() -> None:

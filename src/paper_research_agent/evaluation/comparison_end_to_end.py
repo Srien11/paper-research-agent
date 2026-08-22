@@ -202,6 +202,28 @@ class CompilationAttemptDiagnostic(FrozenEvaluationModel):
     accepted_requirement_ids: tuple[str, ...] = ()
     failed_requirement_ids: tuple[str, ...] = ()
 
+    @model_validator(mode="after")
+    def validate_unit_partition(self) -> CompilationAttemptDiagnostic:
+        requested = set(self.requested_requirement_ids)
+        accepted = set(self.accepted_requirement_ids)
+        failed = set(self.failed_requirement_ids)
+        if accepted & failed:
+            raise ValueError("accepted and failed requirement IDs must be disjoint")
+        if accepted | failed != requested:
+            raise ValueError(
+                "accepted and failed requirement IDs must partition requested IDs"
+            )
+        if self.outcome == "validated":
+            if failed or self.failure_code is not None:
+                raise ValueError(
+                    "validated compilation attempt cannot contain failures"
+                )
+        elif not failed or self.failure_code is None:
+            raise ValueError(
+                "invalid compilation attempt requires failed IDs and a failure code"
+            )
+        return self
+
 
 class CompilationRepairDiagnostic(FrozenEvaluationModel):
     applied: bool
