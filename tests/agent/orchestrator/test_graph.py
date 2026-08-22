@@ -6,6 +6,7 @@ from collections import deque
 from collections.abc import Callable
 from datetime import UTC, datetime
 
+from paper_research_agent.agent.observability import AgentEvent
 from paper_research_agent.agent.orchestrator.artifacts import ChatArtifact
 from paper_research_agent.agent.orchestrator.control import RunControlCommand
 from paper_research_agent.agent.orchestrator.graph import build_main_agent_graph
@@ -228,6 +229,7 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
         dispatch_delay_seconds: float = 0,
         recalled_context: tuple[RecalledContext, ...] = (),
         run_event_publisher: object | None = None,
+        event_sink: object | None = None,
         fast_path_enabled: bool = False,
     ) -> tuple[object, InMemoryConversationStore, FakeDispatcher, FakePlanner]:
         resolved_store = store or InMemoryConversationStore()
@@ -248,6 +250,7 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
             dispatcher=dispatcher,
             max_child_calls=max_child_calls,
             run_event_publisher=run_event_publisher,
+            event_sink=event_sink,
             fast_path_enabled=fast_path_enabled,
         )
         return graph, resolved_store, dispatcher, planner
@@ -602,6 +605,67 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(dispatcher.calls), 1)
         self.assertEqual(state["planning_route"], "full_planner")
         self.assertEqual(state["planning_route_reason"], "feature_disabled")
+
+    async def test_planning_routes_emit_body_free_stage_timings(self) -> None:
+        class MemorySink:
+            def __init__(self) -> None:
+                self.events: list[AgentEvent] = []
+
+            def write(self, event: AgentEvent) -> bool:
+                self.events.append(event)
+                return True
+
+        fast_sink = MemorySink()
+        fast_graph, _store, _dispatcher, _planner = self._build(
+            dispatch_results=(_result(task_id="local", source_id="chunk-1"),),
+            event_sink=fast_sink,
+            fast_path_enabled=True,
+        )
+        await self._run(
+            fast_graph,
+            MainAgentRequest(
+                request_id="request-observe-fast",
+                conversation_id="conversation-observe-fast",
+                message="比较 C001 与 T001 的方法",
+                rag_mode="preferred",
+            ),
+        )
+
+        full_sink = MemorySink()
+        full_graph, _store, _dispatcher, _planner = self._build(
+            plan_decisions=(
+                _plan_decision((_task(task_id="local", capability="local_rag"),)),
+            ),
+            dispatch_results=(_result(task_id="local", source_id="chunk-1"),),
+            event_sink=full_sink,
+            fast_path_enabled=False,
+        )
+        await self._run(
+            full_graph,
+            MainAgentRequest(
+                request_id="request-observe-full",
+                conversation_id="conversation-observe-full",
+                message="比较 C001 与 T001 的方法",
+                rag_mode="preferred",
+            ),
+        )
+
+        fast_by_name = {event.name: event for event in fast_sink.events}
+        full_by_name = {event.name: event for event in full_sink.events}
+        self.assertEqual(fast_by_name["main_planning_route"].planning_route, "fast_path")
+        self.assertEqual(
+            fast_by_name["main_planning_route"].reason_code,
+            "clear_single_local_rag",
+        )
+        self.assertIsNotNone(fast_by_name["main_planning_route"].duration_ms)
+        self.assertIsNotNone(fast_by_name["main_fast_path"].duration_ms)
+        self.assertNotIn("main_full_planning", fast_by_name)
+        self.assertEqual(full_by_name["main_planning_route"].planning_route, "full_planner")
+        self.assertEqual(full_by_name["main_planning_route"].reason_code, "feature_disabled")
+        self.assertIsNotNone(full_by_name["main_full_planning"].duration_ms)
+        self.assertNotIn("main_fast_path", full_by_name)
+        rendered = "".join(event.model_dump_json() for event in fast_sink.events)
+        self.assertNotIn("比较 C001", rendered)
 
     async def test_complex_request_matrix_keeps_full_planner_when_fast_enabled(self) -> None:
         cases = (

@@ -460,6 +460,9 @@ def _diagnostic(
         candidate_paper_ids_top8=candidate_ids,
         final_paper_ids=final_ids,
         planned_dimensions=dimensions,
+        planner_fallback_reason=(
+            research.plan.planner_fallback_reason if research is not None else None
+        ),
         planner_attempts=tuple(
             item.model_dump(mode="json") for item in planner_attempts
         ),

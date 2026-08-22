@@ -95,6 +95,11 @@ class AgentEvent(BaseModel):
     recalled_memory_count: int | None = Field(default=None, ge=0)
     context_char_count: int | None = Field(default=None, ge=0)
     estimated_context_tokens: int | None = Field(default=None, ge=0)
+    planning_route: Literal["fast_path", "full_planner"] | None = None
+    fallback_reason: str | None = Field(
+        default=None,
+        pattern=r"^[a-z][a-z0-9_]{0,95}$",
+    )
 
     @field_validator("occurred_at")
     @classmethod
@@ -224,6 +229,8 @@ class SQLiteAgentEventLogger:
         "recalled_memory_count",
         "context_char_count",
         "estimated_context_tokens",
+        "planning_route",
+        "fallback_reason",
     )
 
     def __init__(self, path: Path):
@@ -291,6 +298,8 @@ class SQLiteAgentEventLogger:
                     ,recalled_memory_count INTEGER
                     ,context_char_count INTEGER
                     ,estimated_context_tokens INTEGER
+                    ,planning_route TEXT
+                    ,fallback_reason TEXT
                 );
                 CREATE INDEX IF NOT EXISTS agent_events_run
                     ON agent_events(run_id, event_id);
@@ -313,13 +322,15 @@ class SQLiteAgentEventLogger:
                 "recalled_memory_count": "INTEGER",
                 "context_char_count": "INTEGER",
                 "estimated_context_tokens": "INTEGER",
+                "planning_route": "TEXT",
+                "fallback_reason": "TEXT",
             }
             for column, sql_type in additions.items():
                 if column not in existing:
                     connection.execute(
                         f"ALTER TABLE agent_events ADD COLUMN {column} {sql_type}"
                     )
-            connection.execute("PRAGMA user_version = 3")
+            connection.execute("PRAGMA user_version = 4")
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=5.0)

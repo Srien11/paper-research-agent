@@ -257,6 +257,10 @@ class ComparisonCaseDiagnostic(FrozenEvaluationModel):
     planner_attempts: tuple[PlannerAttemptDiagnostic, ...] = Field(
         default=(), max_length=2
     )
+    planner_fallback_reason: str | None = Field(
+        default=None,
+        pattern=r"^[a-z][a-z0-9_]{0,95}$",
+    )
     retrievals: tuple[RetrievalDiagnostic, ...]
     step_budget: int | None = Field(default=None, ge=1)
     assessment_count: int = Field(default=0, ge=0)
@@ -449,11 +453,25 @@ def aggregate_planner_attempts(
     cases: Iterable[ComparisonCaseDiagnostic],
 ) -> dict[str, object]:
     """Aggregate body-free Planner outcomes and stable failure codes."""
-    attempts = tuple(attempt for case in cases for attempt in case.planner_attempts)
+    materialized = tuple(cases)
+    attempts = tuple(
+        attempt for case in materialized for attempt in case.planner_attempts
+    )
     failure_codes = Counter(
         attempt.failure_code
         for attempt in attempts
         if attempt.failure_code is not None
+    )
+    attempt_counts = Counter(str(len(case.planner_attempts)) for case in materialized)
+    fallback_reasons = Counter(
+        case.planner_fallback_reason
+        for case in materialized
+        if case.planner_fallback_reason is not None
+    )
+    error_reason_codes = Counter(
+        case.error_reason_code
+        for case in materialized
+        if case.error_reason_code is not None
     )
     return {
         "attempt_count": len(attempts),
@@ -467,6 +485,17 @@ def aggregate_planner_attempts(
             attempt.outcome == "contract_invalid" for attempt in attempts
         ),
         "failure_code_counts": dict(sorted(failure_codes.items())),
+        "error_reason_code_counts": dict(sorted(error_reason_codes.items())),
+        "attempt_count_distribution": dict(sorted(attempt_counts.items())),
+        "target_resolution_failure_count": sum(
+            case.error_type == "ComparisonTargetResolutionError"
+            for case in materialized
+        ),
+        "comparison_planning_failure_count": sum(
+            case.error_type == "ComparisonPlanningError" for case in materialized
+        ),
+        "fallback_count": sum(fallback_reasons.values()),
+        "fallback_reason_counts": dict(sorted(fallback_reasons.items())),
     }
 
 

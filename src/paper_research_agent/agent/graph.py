@@ -945,6 +945,13 @@ def _instrument_node(
                 reason_code="node_execution_failed",
             )
             raise
+        fallback_reason = None
+        if name == "plan":
+            raw_plan = update.get("plan")
+            if isinstance(raw_plan, dict):
+                raw_fallback_reason = raw_plan.get("planner_fallback_reason")
+                if isinstance(raw_fallback_reason, str):
+                    fallback_reason = raw_fallback_reason
         _emit_graph_event(
             state,
             sink,
@@ -953,6 +960,7 @@ def _instrument_node(
             component="node",
             name=name,
             duration_ms=_elapsed_ms(started),
+            fallback_reason=fallback_reason,
         )
         return update
 
@@ -1028,6 +1036,7 @@ def _emit_graph_event(
     returned_count: int | None = None,
     tool_call_count: int | None = None,
     max_tool_calls: int | None = None,
+    fallback_reason: str | None = None,
 ) -> bool:
     run_id = state.get("run_id")
     if not isinstance(run_id, str) or len(run_id) != 32:
@@ -1052,6 +1061,7 @@ def _emit_graph_event(
         returned_count=returned_count,
         tool_call_count=tool_call_count,
         max_tool_calls=max_tool_calls,
+        fallback_reason=fallback_reason,
     )
     return emit_agent_event(sink, event)
 

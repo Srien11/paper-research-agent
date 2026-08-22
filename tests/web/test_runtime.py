@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import sqlite3
+import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -52,10 +55,102 @@ from paper_research_agent.web.runtime import (
     SafePaperMetadata,
     _research_policy_from_environment,
 )
+from scripts.smoke_web_runtime import _comparison_stage_trace
 
 
 def _digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+class SmokeTraceTests(unittest.TestCase):
+    def test_comparison_trace_uses_only_events_after_the_run_cursor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.sqlite3"
+            with closing(sqlite3.connect(path)) as connection, connection:
+                connection.execute(
+                    "CREATE TABLE agent_events ("
+                    "event_id INTEGER PRIMARY KEY, event_type TEXT, status TEXT, "
+                    "name TEXT, duration_ms REAL, planning_route TEXT, "
+                    "reason_code TEXT, fallback_reason TEXT)"
+                )
+                connection.executemany(
+                    "INSERT INTO agent_events VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        (
+                            1,
+                            "node_completed",
+                            "succeeded",
+                            "main_planning_route",
+                            99,
+                            "full_planner",
+                            "feature_disabled",
+                            None,
+                        ),
+                        (
+                            2,
+                            "node_completed",
+                            "succeeded",
+                            "main_planning_route",
+                            0.4,
+                            "fast_path",
+                            "clear_single_local_rag",
+                            None,
+                        ),
+                        (
+                            3,
+                            "node_completed",
+                            "succeeded",
+                            "main_fast_path",
+                            0.8,
+                            "fast_path",
+                            None,
+                            None,
+                        ),
+                        (
+                            4,
+                            "node_completed",
+                            "succeeded",
+                            "plan",
+                            12.5,
+                            None,
+                            None,
+                            "fact_proposal_repair_exhausted",
+                        ),
+                        (
+                            5,
+                            "node_completed",
+                            "succeeded",
+                            "execute_tools",
+                            20.0,
+                            None,
+                            None,
+                            None,
+                        ),
+                        (
+                            6,
+                            "node_completed",
+                            "succeeded",
+                            "assess_evidence",
+                            8.0,
+                            None,
+                            None,
+                            None,
+                        ),
+                    ),
+                )
+
+            trace = _comparison_stage_trace(path, 1)
+
+        self.assertEqual(trace["planning_route"], "fast_path")
+        self.assertEqual(trace["planning_route_reason"], "clear_single_local_rag")
+        self.assertEqual(trace["main_route_ms"], 0.4)
+        self.assertEqual(trace["main_fast_path_ms"], 0.8)
+        self.assertIsNone(trace["main_planning_ms"])
+        self.assertEqual(
+            trace["planner_fallback_reason"],
+            "fact_proposal_repair_exhausted",
+        )
+        self.assertEqual(trace["comparison_plan_ms"], 12.5)
 
 
 def _chunk() -> EvidenceChunk:

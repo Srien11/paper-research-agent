@@ -8,7 +8,7 @@ import sqlite3
 import sys
 import time
 import uuid
-from contextlib import suppress
+from contextlib import closing, suppress
 from pathlib import Path
 from statistics import median
 
@@ -206,28 +206,51 @@ def _rag_child_summary(
 def _comparison_stage_trace(
     path: Path,
     after_event_id: int,
-) -> dict[str, float | None]:
-    empty: dict[str, float | None] = {
+) -> dict[str, object]:
+    empty: dict[str, object] = {
+        "planning_route": None,
+        "planning_route_reason": None,
+        "main_route_ms": None,
+        "main_fast_path_ms": None,
+        "main_planning_ms": None,
+        "planner_fallback_reason": None,
         "comparison_plan_ms": None,
         "comparison_search_batch_ms": None,
         "compiler_ms": None,
     }
     try:
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection:
             rows = connection.execute(
-                "SELECT name, duration_ms FROM agent_events "
+                "SELECT name, duration_ms, planning_route, reason_code, "
+                "fallback_reason FROM agent_events "
                 "WHERE event_id > ? "
                 "AND event_type = 'node_completed' AND status = 'succeeded' "
-                "AND name IN ('plan', 'execute_tools', 'assess_evidence')",
+                "AND name IN ('main_planning_route', 'main_fast_path', "
+                "'main_full_planning', 'plan', 'execute_tools', 'assess_evidence') "
+                "ORDER BY event_id",
                 (after_event_id,),
             ).fetchall()
     except (OSError, sqlite3.Error):
         return empty
     totals: dict[str, float] = {}
-    for name, duration_ms in rows:
+    planning_route = None
+    planning_route_reason = None
+    planner_fallback_reason = None
+    for name, duration_ms, route, reason_code, fallback_reason in rows:
         if isinstance(duration_ms, (int, float)):
             totals[str(name)] = totals.get(str(name), 0.0) + float(duration_ms)
+        if name == "main_planning_route":
+            planning_route = route
+            planning_route_reason = reason_code
+        if name == "plan" and fallback_reason is not None:
+            planner_fallback_reason = fallback_reason
     return {
+        "planning_route": planning_route,
+        "planning_route_reason": planning_route_reason,
+        "main_route_ms": _optional_milliseconds(totals.get("main_planning_route")),
+        "main_fast_path_ms": _optional_milliseconds(totals.get("main_fast_path")),
+        "main_planning_ms": _optional_milliseconds(totals.get("main_full_planning")),
+        "planner_fallback_reason": planner_fallback_reason,
         "comparison_plan_ms": _optional_milliseconds(totals.get("plan")),
         "comparison_search_batch_ms": _optional_milliseconds(
             totals.get("execute_tools")
@@ -242,7 +265,7 @@ def _optional_milliseconds(value: float | None) -> float | None:
 
 def _latest_agent_event_id(path: Path) -> int:
     try:
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection:
             row = connection.execute("SELECT MAX(event_id) FROM agent_events").fetchone()
     except (OSError, sqlite3.Error):
         return 0
@@ -252,7 +275,7 @@ def _latest_agent_event_id(path: Path) -> int:
 
 def _hydration_trace(path: Path, run_id: str) -> dict[str, object]:
     try:
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection:
             rows = connection.execute(
                 "SELECT name, duration_ms, returned_count, recent_message_count, "
                 "recalled_conversation_count, recalled_memory_count, context_char_count, "

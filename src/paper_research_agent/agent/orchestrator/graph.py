@@ -11,6 +11,12 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
 from paper_research_agent.agent.dynamic.models import PendingApproval
+from paper_research_agent.agent.observability import (
+    AgentEvent,
+    AgentEventSink,
+    emit_agent_event,
+    safe_fingerprint,
+)
 from paper_research_agent.agent.orchestrator.children import ChildGraphDispatcher
 from paper_research_agent.agent.orchestrator.control import task_budget_exhausted
 from paper_research_agent.agent.orchestrator.evaluator import (
@@ -76,6 +82,7 @@ def build_main_agent_graph(
     max_replans: int = MAX_REPLANS_PER_RUN,
     checkpointer: Any | None = None,
     run_event_publisher: Any | None = None,
+    event_sink: AgentEventSink | None = None,
     fast_path_enabled: bool = False,
 ) -> CompiledStateGraph[Any, Any, Any, Any]:
     """Assemble the graph; only commit_turn and abort_turn write storage."""
@@ -84,6 +91,40 @@ def build_main_agent_graph(
     if max_replans <= 0 or max_replans > 3:
         raise ValueError("max_replans must be between 1 and 3")
     answer_synthesizer = synthesizer or AnswerSynthesizer()
+    full_planning_started: dict[str, float] = {}
+
+    def emit_planning_event(
+        state: MainAgentGraphState,
+        *,
+        name: Literal[
+            "main_planning_route",
+            "main_fast_path",
+            "main_full_planning",
+        ],
+        started: float,
+        planning_route: Literal["fast_path", "full_planner"],
+        reason_code: str | None = None,
+    ) -> None:
+        run_id = state.get("run_id")
+        if not isinstance(run_id, str) or len(run_id) != 32:
+            return
+        request = MainAgentRequest.model_validate(state["request"])
+        emit_agent_event(
+            event_sink,
+            AgentEvent(
+                run_id=run_id,
+                occurred_at=datetime.now(UTC),
+                event_type="node_completed",
+                status="succeeded",
+                component="node",
+                name=name,
+                duration_ms=max(0.0, (time.perf_counter() - started) * 1000),
+                question_sha256=safe_fingerprint(request.message),
+                thread_sha256=safe_fingerprint(request.conversation_id),
+                reason_code=reason_code,
+                planning_route=planning_route,
+            ),
+        )
 
     async def publish_product_event(
         state: MainAgentGraphState,
@@ -241,10 +282,18 @@ def build_main_agent_graph(
     async def classify_planning_route(
         state: MainAgentGraphState,
     ) -> MainAgentGraphState:
+        started = time.perf_counter()
         envelope = AgentContextEnvelope.model_validate(state["context"])
         decision = classify_planning_route_pure(
             envelope,
             enabled=fast_path_enabled,
+        )
+        emit_planning_event(
+            state,
+            name="main_planning_route",
+            started=started,
+            planning_route=decision.route,
+            reason_code=decision.reason_code,
         )
         return {
             "planning_route": decision.route,
@@ -254,6 +303,7 @@ def build_main_agent_graph(
     async def materialize_fast_path(
         state: MainAgentGraphState,
     ) -> MainAgentGraphState:
+        started = time.perf_counter()
         envelope = AgentContextEnvelope.model_validate(state["context"])
         interpretation, goal_decision, plan_decision = (
             build_single_local_rag_decisions(envelope)
@@ -286,6 +336,12 @@ def build_main_agent_graph(
             detail=SafeRunEventDetail(plan_action="create"),
             idempotency_key="plan:update:1",
         )
+        emit_planning_event(
+            state,
+            name="main_fast_path",
+            started=started,
+            planning_route="fast_path",
+        )
         return {
             "interpretation": interpretation,
             "goal_decision": goal_decision,
@@ -294,6 +350,8 @@ def build_main_agent_graph(
         }
 
     async def interpret_turn(state: MainAgentGraphState) -> MainAgentGraphState:
+        run_id = str(state.get("run_id", ""))
+        full_planning_started.setdefault(run_id, time.perf_counter())
         envelope = AgentContextEnvelope.model_validate(state["context"])
         interpretation = await interpreter.interpret(envelope)
         await publish_product_event(
@@ -352,6 +410,14 @@ def build_main_agent_graph(
             detail=SafeRunEventDetail(plan_action=decision.action),
             idempotency_key=f"plan:update:{decision.plan.revision if decision.plan else 0}",
         )
+        run_id = str(state.get("run_id", ""))
+        if (started := full_planning_started.pop(run_id, None)) is not None:
+            emit_planning_event(
+                state,
+                name="main_full_planning",
+                started=started,
+                planning_route="full_planner",
+            )
         return {"workspace_draft": workspace, "plan_decision": decision}
 
     async def select_next_task(state: MainAgentGraphState) -> MainAgentGraphState:

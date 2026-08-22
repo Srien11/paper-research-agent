@@ -9,6 +9,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
+from paper_research_agent.agent.graph import _instrument_node
 from paper_research_agent.agent.observability import (
     AgentEvent,
     AgentEventTap,
@@ -140,6 +141,30 @@ class AgentEventTests(unittest.TestCase):
         self.assertNotIn("memory_id", rendered)
         self.assertNotIn("database", rendered)
 
+    def test_planning_route_and_fallback_fields_are_body_free_safe_codes(self) -> None:
+        route = _event(
+            event_type="node_completed",
+            component="node",
+            name="main_planning_route",
+            planning_route="fast_path",
+            reason_code="clear_single_local_rag",
+        )
+        fallback = _event(
+            event_type="node_completed",
+            component="node",
+            name="plan",
+            fallback_reason="fact_proposal_repair_exhausted",
+        )
+
+        rendered = route.model_dump_json() + fallback.model_dump_json()
+        self.assertEqual(route.planning_route, "fast_path")
+        self.assertEqual(fallback.fallback_reason, "fact_proposal_repair_exhausted")
+        self.assertNotIn("private question", rendered)
+        with self.assertRaises(ValidationError):
+            _event(planning_route="direct_chat")
+        with self.assertRaises(ValidationError):
+            _event(fallback_reason="private question")
+
     def test_contract_rejects_unknown_payload_and_raw_identifiers(self) -> None:
         with self.assertRaises(ValidationError):
             AgentEvent.model_validate(
@@ -228,8 +253,14 @@ class AgentEventTests(unittest.TestCase):
                     "SELECT endpoint FROM agent_events"
                 ).fetchone()
                 version = connection.execute("PRAGMA user_version").fetchone()
+                columns = {
+                    item[1]
+                    for item in connection.execute("PRAGMA table_info(agent_events)")
+                }
             self.assertEqual(row, ("ask",))
-            self.assertEqual(version, (3,))
+            self.assertIn("planning_route", columns)
+            self.assertIn("fallback_reason", columns)
+            self.assertEqual(version, (4,))
 
     def test_best_effort_emit_never_breaks_the_agent(self) -> None:
         class BrokenSink:
@@ -239,6 +270,38 @@ class AgentEventTests(unittest.TestCase):
 
         self.assertFalse(emit_agent_event(BrokenSink(), _event()))
         self.assertFalse(emit_agent_event(None, _event()))
+
+
+class ResearchPlanningEventTests(unittest.IsolatedAsyncioTestCase):
+    async def test_plan_completion_copies_only_fixed_fallback_reason(self) -> None:
+        class MemorySink:
+            def __init__(self) -> None:
+                self.events: list[AgentEvent] = []
+
+            def write(self, event: AgentEvent) -> bool:
+                self.events.append(event)
+                return True
+
+        async def plan(_state: object) -> dict[str, object]:
+            return {
+                "plan": {
+                    "planner_fallback_reason": "fact_proposal_repair_exhausted",
+                    "private_question": "must not be copied",
+                }
+            }
+
+        sink = MemorySink()
+        instrumented = _instrument_node("plan", plan, sink)  # type: ignore[arg-type]
+
+        await instrumented({"run_id": "a" * 32, "question": "private question"})
+
+        completed = sink.events[-1]
+        self.assertEqual(completed.name, "plan")
+        self.assertEqual(
+            completed.fallback_reason,
+            "fact_proposal_repair_exhausted",
+        )
+        self.assertNotIn("private question", completed.model_dump_json())
 
 
 if __name__ == "__main__":

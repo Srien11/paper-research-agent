@@ -265,7 +265,17 @@ def test_case_diagnostic_persists_and_aggregates_body_free_planner_attempts() ->
         PlannerAttemptDiagnostic(attempt=2, outcome="validated"),
     )
 
-    case = _case(planner_attempts=attempts)
+    case = _case(
+        planner_attempts=attempts,
+        planner_fallback_reason="fact_proposal_repair_exhausted",
+        error_type="ComparisonPlanningError",
+        error_reason_code="planner_fact_proposal_invalid",
+    )
+    target_failure = _case(
+        planner_attempts=(),
+        error_type="ComparisonTargetResolutionError",
+        error_reason_code="insufficient_retrieval_candidates",
+    )
     serialized = case.model_dump(mode="json")
 
     assert serialized["planner_attempts"] == [
@@ -281,6 +291,18 @@ def test_case_diagnostic_persists_and_aggregates_body_free_planner_attempts() ->
     summary = aggregate_planner_attempts((case,))
     assert summary["attempt_count"] == 2
     assert summary["failure_code_counts"] == {"planner_grid_incomplete": 1}
+    assert summary["attempt_count_distribution"] == {"2": 1}
+    assert summary["comparison_planning_failure_count"] == 1
+    assert summary["target_resolution_failure_count"] == 0
+    assert summary["fallback_count"] == 1
+    assert summary["fallback_reason_counts"] == {
+        "fact_proposal_repair_exhausted": 1
+    }
+
+    combined = aggregate_planner_attempts((case, target_failure))
+    assert combined["attempt_count_distribution"] == {"0": 1, "2": 1}
+    assert combined["comparison_planning_failure_count"] == 1
+    assert combined["target_resolution_failure_count"] == 1
 
 
 def test_rewrite_retention_preserves_identifiers_numbers_and_metrics() -> None:

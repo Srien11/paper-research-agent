@@ -68,6 +68,7 @@ def build_main_agent_runtime(
         max_replans=max_replans,
         checkpointer=checkpointer,
         run_event_publisher=run_event_publisher,
+        event_sink=event_sink,
         fast_path_enabled=fast_path_enabled,
     )
     resolved_resumer = approval_resumer or MainAgentApprovalResumer(
