@@ -50,6 +50,7 @@ Candidate: TypeAlias = tuple[
     dict[str, float],
 ]
 RankedChunks: TypeAlias = list[tuple[EvidenceChunk, float]]
+DEFAULT_LOCAL_RETRIEVAL_WORKERS = 6
 
 
 @dataclass(frozen=True)
@@ -84,7 +85,7 @@ class BilingualRetrievalService:
         index_id: str,
         rights: CorpusRightsMap | None = None,
         local_executor: Executor | None = None,
-        local_workers: int = 2,
+        local_workers: int = DEFAULT_LOCAL_RETRIEVAL_WORKERS,
     ):
         if rewriter.model_id != bilingual_config.rewrite_model:
             raise ValueError("rewriter model does not match bilingual configuration")

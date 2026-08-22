@@ -152,7 +152,8 @@ class BilingualRetrievalTests(unittest.IsolatedAsyncioTestCase):
             service.close()
         self.temp.cleanup()
 
-    def service(self, rewriter, *, timeout=2.0, local_workers=2):
+    def service(self, rewriter, *, timeout=2.0, local_workers=None):
+        kwargs = {} if local_workers is None else {"local_workers": local_workers}
         service = BilingualRetrievalService(
             self.sparse,
             self.vector,
@@ -164,10 +165,17 @@ class BilingualRetrievalTests(unittest.IsolatedAsyncioTestCase):
             bilingual_config(self.directory, timeout=timeout),
             index_id="idx",
             rights=CorpusRightsMap({"C001": "redistributable", "T001": "internal_research_only"}),
-            local_workers=local_workers,
+            **kwargs,
         )
         self.services.append(service)
         return service
+
+    def test_local_worker_default_is_six_and_lower_override_is_supported(self) -> None:
+        default_service = self.service(FakeRewriter())
+        lower_service = self.service(FakeRewriter(), local_workers=2)
+
+        self.assertEqual(default_service._local_executor._max_workers, 6)
+        self.assertEqual(lower_service._local_executor._max_workers, 2)
 
     async def test_success_runs_two_level_rrf_then_one_english_rerank(self) -> None:
         rewriter = FakeRewriter()

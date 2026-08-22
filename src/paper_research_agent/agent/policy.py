@@ -11,6 +11,7 @@ MAX_INITIAL_PLAN_STEPS = 20
 ABSOLUTE_MAX_RESEARCH_STEPS = 24
 ABSOLUTE_MAX_TOOL_CALLS = 48
 MAX_FOLLOWUP_STEPS = 4
+DEFAULT_COMPARISON_SEARCH_CONCURRENCY = 6
 READ_ONLY_RESEARCH_TOOLS: frozenset[ResearchToolName] = frozenset(
     {"search_corpus", "get_evidence"}
 )
@@ -31,7 +32,11 @@ class ResearchRuntimePolicy(BaseModel):
     )
     max_followup_steps: int = Field(default=MAX_FOLLOWUP_STEPS, ge=0, le=MAX_FOLLOWUP_STEPS)
     max_dynamic_tool_steps: int = Field(default=6, ge=1, le=12)
-    comparison_search_concurrency: int = Field(default=2, ge=1, le=4)
+    comparison_search_concurrency: int = Field(
+        default=DEFAULT_COMPARISON_SEARCH_CONCURRENCY,
+        ge=1,
+        le=DEFAULT_COMPARISON_SEARCH_CONCURRENCY,
+    )
     adaptive_evidence_hydration_enabled: bool = False
     initial_evidence_per_step: int = Field(
         default=4,

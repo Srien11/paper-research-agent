@@ -14,7 +14,7 @@ def test_default_policy_leaves_room_for_maximum_grid_and_followups() -> None:
 
     assert policy.max_steps == 24
     assert policy.max_followup_steps == 4
-    assert policy.comparison_search_concurrency == 2
+    assert policy.comparison_search_concurrency == 6
     assert policy.adaptive_evidence_hydration_enabled is False
     assert policy.evidence_per_step == 4
     assert policy.initial_evidence_per_step == 4
@@ -25,6 +25,15 @@ def test_default_policy_leaves_room_for_maximum_grid_and_followups() -> None:
     assert policy.freeze_invocation_budget(2) == (4, 8)
     assert policy.freeze_invocation_budget(10) == (13, 26)
     assert policy.freeze_invocation_budget(20) == (24, 48)
+
+
+def test_comparison_search_concurrency_accepts_six_and_rejects_seven() -> None:
+    assert (
+        ResearchRuntimePolicy(comparison_search_concurrency=6).comparison_search_concurrency
+        == 6
+    )
+    with pytest.raises(ValidationError):
+        ResearchRuntimePolicy(comparison_search_concurrency=7)
 
 
 def test_adaptive_hydration_cutoff_is_deterministic_and_bounded() -> None:

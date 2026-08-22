@@ -604,7 +604,7 @@ class RAGRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(policy.max_steps, 24)
         self.assertEqual(policy.max_followup_steps, 4)
-        self.assertEqual(policy.comparison_search_concurrency, 2)
+        self.assertEqual(policy.comparison_search_concurrency, 6)
         self.assertFalse(policy.adaptive_evidence_hydration_enabled)
         self.assertEqual(policy.evidence_per_step, 4)
         self.assertEqual(policy.first_followup_evidence_per_step, 6)
@@ -648,6 +648,17 @@ class RAGRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["sections_path"], Path("private/sections.jsonl"))
         self.assertEqual(kwargs["elements_path"], Path("private/elements.jsonl"))
         self.assertEqual(kwargs["local_retrieval_workers"], 3)
+
+        with (
+            patch.dict(
+                "os.environ",
+                {"PRA_PROJECT_ROOT": "project-root", "PRA_CORPUS_DIR": "corpus"},
+                clear=True,
+            ),
+            patch.object(RAGRuntime, "load", return_value=sentinel) as default_load,
+        ):
+            self.assertIs(RAGRuntime.from_environment(), sentinel)
+        self.assertEqual(default_load.call_args.kwargs["local_retrieval_workers"], 6)
 
     def test_agent_environment_flag_is_explicit_and_fail_closed(self) -> None:
         with patch.dict("os.environ", {}, clear=True):

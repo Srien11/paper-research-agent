@@ -53,7 +53,10 @@ from paper_research_agent.memory.service import turn_from_answer
 from paper_research_agent.memory.store import ShortTermMemoryStore, SQLiteShortTermMemory
 from paper_research_agent.models import FrozenPaper
 from paper_research_agent.rag import DEFAULT_RAG_SYSTEM_RULES, AsyncBilingualRetriever
-from paper_research_agent.retrieval.bilingual import BilingualRetrievalService
+from paper_research_agent.retrieval.bilingual import (
+    DEFAULT_LOCAL_RETRIEVAL_WORKERS,
+    BilingualRetrievalService,
+)
 from paper_research_agent.retrieval.bm25 import BM25Index
 from paper_research_agent.retrieval.config import (
     RetrievalConfig,
@@ -362,7 +365,7 @@ class RAGRuntime:
         token_budget: int = 8192,
         output_reserve_tokens: int = 1200,
         excerpt_chars: int = 360,
-        local_retrieval_workers: int = 2,
+        local_retrieval_workers: int = DEFAULT_LOCAL_RETRIEVAL_WORKERS,
     ) -> RAGRuntime:
         """Construct local runtime dependencies once from project-local artifacts.
 
@@ -540,7 +543,10 @@ class RAGRuntime:
             answer_audit_path=_optional_env_path("PRA_ANSWER_AUDIT_PATH"),
             sections_path=_optional_env_path("PRA_SECTIONS_PATH"),
             elements_path=_optional_env_path("PRA_ELEMENTS_PATH"),
-            local_retrieval_workers=_environment_int("PRA_LOCAL_RETRIEVAL_WORKERS", 2),
+            local_retrieval_workers=_environment_int(
+                "PRA_LOCAL_RETRIEVAL_WORKERS",
+                DEFAULT_LOCAL_RETRIEVAL_WORKERS,
+            ),
         )
 
     @classmethod
@@ -1359,7 +1365,10 @@ def _environment_float(name: str, default: float) -> float:
 
 
 def _research_policy_from_environment() -> object:
-    from paper_research_agent.agent.policy import ResearchRuntimePolicy
+    from paper_research_agent.agent.policy import (
+        DEFAULT_COMPARISON_SEARCH_CONCURRENCY,
+        ResearchRuntimePolicy,
+    )
 
     legacy_name = "PRA_RESEARCH_AGENT_EVIDENCE_PER_STEP"
     cutoff_names = (
@@ -1389,7 +1398,7 @@ def _research_policy_from_environment() -> object:
         ),
         comparison_search_concurrency=_environment_int(
             "PRA_COMPARISON_SEARCH_CONCURRENCY",
-            2,
+            DEFAULT_COMPARISON_SEARCH_CONCURRENCY,
         ),
         adaptive_evidence_hydration_enabled=_environment_flag(
             "PRA_RESEARCH_AGENT_ADAPTIVE_EVIDENCE_HYDRATION_ENABLED",
