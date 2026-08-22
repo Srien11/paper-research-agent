@@ -15,9 +15,7 @@ from statistics import median
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from paper_research_agent.agent.observability import safe_fingerprint
 from paper_research_agent.agent.orchestrator.artifacts import LocalRAGArtifact
-from paper_research_agent.agent.orchestrator.identifiers import child_session_id
 from paper_research_agent.agent.orchestrator.models import MainAgentRequest
 from paper_research_agent.web.bootstrap import (
     ApplicationEnvironment,
@@ -115,24 +113,21 @@ async def run_main_agent_smoke(
                 message=question,
                 rag_mode="preferred",
             )
-            run_started = time.perf_counter()
-            result = await runtime.run(request)
-            run_ms = round((time.perf_counter() - run_started) * 1000, 2)
             event_path = environment.main_checkpoint_path.with_name(
                 "agent-events-v1.sqlite3"
             )
+            after_event_id = _latest_agent_event_id(event_path)
+            run_started = time.perf_counter()
+            result = await runtime.run(request)
+            run_ms = round((time.perf_counter() - run_started) * 1000, 2)
             hydration = _hydration_trace(
                 event_path,
                 result.run_id,
             )
-            rag_summary, research_threads = _rag_child_summary(
-                result.child_results,
-                conversation_id=conversation_id,
-                run_id=result.run_id,
-            )
+            rag_summary = _rag_child_summary(result.child_results)
             comparison_stages = _comparison_stage_trace(
                 event_path,
-                research_threads,
+                after_event_id,
             )
             run_summaries.append(
                 {
@@ -192,56 +187,39 @@ async def run_main_agent_smoke(
 
 def _rag_child_summary(
     child_results: tuple[object, ...],
-    *,
-    conversation_id: str,
-    run_id: str,
-) -> tuple[dict[str, int | float], tuple[str, ...]]:
+) -> dict[str, int | float]:
     artifacts: list[LocalRAGArtifact] = []
-    thread_sha256s: list[str] = []
     for child in child_results:
         artifact = getattr(child, "artifact", None)
         if getattr(artifact, "kind", None) != "local_rag":
             continue
         artifacts.append(LocalRAGArtifact.model_validate(artifact))
-        task_id = getattr(child, "task_id", None)
-        if isinstance(task_id, str):
-            thread_sha256s.append(
-                safe_fingerprint(
-                    child_session_id("research", conversation_id, run_id, task_id)
-                )
-            )
-    return (
-        {
-            "research_agent_ms": sum(item.metrics.elapsed_ms for item in artifacts),
-            "answer_provider_ms": round(
-                sum(item.answer.latency_ms for item in artifacts), 2
-            ),
-            "answer_attempts": sum(item.answer.attempts for item in artifacts),
-        },
-        tuple(thread_sha256s),
-    )
+    return {
+        "research_agent_ms": sum(item.metrics.elapsed_ms for item in artifacts),
+        "answer_provider_ms": round(
+            sum(item.answer.latency_ms for item in artifacts), 2
+        ),
+        "answer_attempts": sum(item.answer.attempts for item in artifacts),
+    }
 
 
 def _comparison_stage_trace(
     path: Path,
-    thread_sha256s: tuple[str, ...],
+    after_event_id: int,
 ) -> dict[str, float | None]:
     empty: dict[str, float | None] = {
         "comparison_plan_ms": None,
         "comparison_search_batch_ms": None,
         "compiler_ms": None,
     }
-    if not thread_sha256s:
-        return empty
-    placeholders = ",".join("?" for _ in thread_sha256s)
     try:
         with sqlite3.connect(path) as connection:
             rows = connection.execute(
                 "SELECT name, duration_ms FROM agent_events "
-                f"WHERE thread_sha256 IN ({placeholders}) "
+                "WHERE event_id > ? "
                 "AND event_type = 'node_completed' AND status = 'succeeded' "
                 "AND name IN ('plan', 'execute_tools', 'assess_evidence')",
-                thread_sha256s,
+                (after_event_id,),
             ).fetchall()
     except (OSError, sqlite3.Error):
         return empty
@@ -260,6 +238,16 @@ def _comparison_stage_trace(
 
 def _optional_milliseconds(value: float | None) -> float | None:
     return None if value is None else round(value, 2)
+
+
+def _latest_agent_event_id(path: Path) -> int:
+    try:
+        with sqlite3.connect(path) as connection:
+            row = connection.execute("SELECT MAX(event_id) FROM agent_events").fetchone()
+    except (OSError, sqlite3.Error):
+        return 0
+    value = None if row is None else row[0]
+    return int(value) if isinstance(value, int) else 0
 
 
 def _hydration_trace(path: Path, run_id: str) -> dict[str, object]:
