@@ -24,6 +24,8 @@ from paper_research_agent.answering.config import load_answering_config
 from paper_research_agent.chunking.chunker import canonical_sha256
 from paper_research_agent.evaluation.candidate_gold import load_candidate_paper_gold
 from paper_research_agent.evaluation.comparison_end_to_end import (
+    COMPARISON_E2E_RUN_SCHEMA_VERSION,
+    COMPATIBLE_COMPARISON_E2E_RUN_SCHEMAS,
     CitationDiagnostic,
     ComparisonCaseDiagnostic,
     ComparisonEndToEndGold,
@@ -54,15 +56,28 @@ class _JudgeItem(BaseModel):
 
 def _git_revision() -> str:
     """Read the local Git revision without invoking a shell or exposing config."""
-    git_dir = PROJECT_ROOT / ".git"
+    git_entry = PROJECT_ROOT / ".git"
+    git_dir = git_entry
+    if git_entry.is_file():
+        pointer = git_entry.read_text(encoding="utf-8").strip()
+        if not pointer.startswith("gitdir: "):
+            return "unknown"
+        git_dir = (git_entry.parent / pointer.removeprefix("gitdir: ")).resolve()
+    common_dir = git_dir
+    common_dir_pointer = git_dir / "commondir"
+    if common_dir_pointer.is_file():
+        common_dir = (
+            git_dir / common_dir_pointer.read_text(encoding="utf-8").strip()
+        ).resolve()
     head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
     if not head.startswith("ref: "):
         return head
     reference = head.removeprefix("ref: ")
-    loose_ref = git_dir / reference
-    if loose_ref.is_file():
-        return loose_ref.read_text(encoding="utf-8").strip()
-    packed_refs = git_dir / "packed-refs"
+    for ref_root in (git_dir, common_dir):
+        loose_ref = ref_root / reference
+        if loose_ref.is_file():
+            return loose_ref.read_text(encoding="utf-8").strip()
+    packed_refs = common_dir / "packed-refs"
     if packed_refs.is_file():
         for line in packed_refs.read_text(encoding="utf-8").splitlines():
             if not line.startswith("#") and line.endswith(f" {reference}"):
@@ -803,7 +818,7 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(
                 json.dumps(
-                    {"schema_version": "comparison-e2e-run-v1", **experiment, "cases": [
+                    {"schema_version": COMPARISON_E2E_RUN_SCHEMA_VERSION, **experiment, "cases": [
                         item.model_dump(mode="json") for item in cases
                     ]},
                     ensure_ascii=False,
@@ -875,7 +890,7 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
         for split in split_counts
     }
     payload = {
-        "schema_version": "comparison-e2e-run-v1",
+        "schema_version": COMPARISON_E2E_RUN_SCHEMA_VERSION,
         **experiment,
         "question_count": len(cases),
         "split_counts": dict(split_counts),
@@ -922,6 +937,9 @@ def _load_resumed_cases(
     selected_ids: set[str],
 ) -> list[ComparisonCaseDiagnostic]:
     previous = json.loads(output.read_text(encoding="utf-8"))
+    schema_version = previous.get("schema_version", "comparison-e2e-run-v1")
+    if schema_version not in COMPATIBLE_COMPARISON_E2E_RUN_SCHEMAS:
+        raise ValueError("resume run schema is unsupported")
     if previous.get("experiment_fingerprint") != experiment_fingerprint:
         raise ValueError("resume experiment fingerprint does not match")
     return [

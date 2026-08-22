@@ -400,6 +400,69 @@ def test_resume_rejects_a_different_experiment_fingerprint() -> None:
             )
 
 
+@pytest.mark.parametrize(
+    "schema_version",
+    ["comparison-e2e-run-v1", "comparison-e2e-run-v2"],
+)
+def test_resume_reads_compatible_run_schemas(schema_version: str) -> None:
+    case = {
+        "schema_version": "comparison-e2e-diagnostic-v1",
+        "question_id": "CPG001",
+        "split": "dev",
+        "original_question_sha256": "a" * 64,
+        "raw_question_preserved": True,
+        "rewrite_status": "success",
+        "candidate_paper_ids_top8": [],
+        "final_paper_ids": [],
+        "planned_dimensions": [],
+        "retrievals": [],
+        "citations": [],
+        "total_latency_ms": 0,
+    }
+    with TemporaryDirectory() as directory:
+        output = Path(directory) / "run.json"
+        output.write_text(
+            json.dumps(
+                {
+                    "schema_version": schema_version,
+                    "experiment_fingerprint": "a" * 64,
+                    "cases": [case],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        resumed = _load_resumed_cases(
+            output,
+            experiment_fingerprint="a" * 64,
+            selected_ids={"CPG001"},
+        )
+
+    assert [item.question_id for item in resumed] == ["CPG001"]
+
+
+def test_resume_rejects_unknown_schema_before_fingerprint() -> None:
+    with TemporaryDirectory() as directory:
+        output = Path(directory) / "run.json"
+        output.write_text(
+            json.dumps(
+                {
+                    "schema_version": "comparison-e2e-run-v999",
+                    "experiment_fingerprint": "a" * 64,
+                    "cases": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="schema is unsupported"):
+            _load_resumed_cases(
+                output,
+                experiment_fingerprint="b" * 64,
+                selected_ids={"CPG001"},
+            )
+
+
 def test_experiment_metadata_identifies_cutoff_reranking_config_and_checkpoint() -> None:
     retriever = _Retriever(_run(6, stage_ranks=(9, 4, 5)))
     retriever.retrieval_config = _Config("retrieval")

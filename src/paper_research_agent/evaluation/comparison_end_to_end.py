@@ -11,6 +11,11 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+COMPARISON_E2E_RUN_SCHEMA_VERSION = "comparison-e2e-run-v2"
+COMPATIBLE_COMPARISON_E2E_RUN_SCHEMAS = frozenset(
+    {"comparison-e2e-run-v1", COMPARISON_E2E_RUN_SCHEMA_VERSION}
+)
+
 
 class FrozenEvaluationModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
