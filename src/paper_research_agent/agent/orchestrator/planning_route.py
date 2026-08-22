@@ -34,6 +34,12 @@ _LOCAL_RESEARCH_OBJECT = re.compile(
     r"\bpaper\b|\bstudy\b|\bresearch\b|\bmethod\b|\bmodel\b)",
     re.IGNORECASE,
 )
+_EXPLICIT_MULTI_OBJECT = re.compile(
+    r"(?:两篇|两个(?:论文|研究|方法|模型)|多篇|多个(?:论文|研究|方法|模型)|"
+    r"一篇.{0,160}另一篇|一种.{0,160}另一种|这些论文|上述论文|"
+    r"\btwo\s+(?:papers|studies|methods|models)\b|\bthese papers\b)",
+    re.IGNORECASE,
+)
 _FILE_OR_CONTROL = re.compile(
     r"(?:修改|编辑|写入|保存|删除|移动|重命名|上传|下载).{0,16}(?:文件|报告|目录)|"
     r"(?:继续|恢复|resume|取消|撤销|修改目标|成功标准|约束|批准|拒绝|审批)",
@@ -90,6 +96,9 @@ def classify_planning_route(
 
     has_corpus_id = _LOCAL_CORPUS_ID.search(message) is not None
     is_comparison = requires_research_planning(message)
+    has_explicit_multi_object = _EXPLICIT_MULTI_OBJECT.search(message) is not None
+    if is_comparison and not (has_corpus_id or has_explicit_multi_object):
+        return _full("complex_or_ambiguous")
     if envelope.rag_mode == "required" and (
         has_corpus_id
         or is_comparison
@@ -99,7 +108,9 @@ def classify_planning_route(
             route="fast_path",
             reason_code="clear_single_local_rag",
         )
-    if envelope.rag_mode == "preferred" and (has_corpus_id or is_comparison):
+    if envelope.rag_mode == "preferred" and (
+        has_corpus_id or (is_comparison and has_explicit_multi_object)
+    ):
         return PlanningRouteDecision(
             route="fast_path",
             reason_code="clear_single_local_rag",

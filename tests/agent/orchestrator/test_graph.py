@@ -603,6 +603,125 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["planning_route"], "full_planner")
         self.assertEqual(state["planning_route_reason"], "feature_disabled")
 
+    async def test_complex_request_matrix_keeps_full_planner_when_fast_enabled(self) -> None:
+        cases = (
+            (
+                "attachment",
+                MainAgentRequest(
+                    request_id="request-matrix-attachment",
+                    conversation_id="conversation-matrix-attachment",
+                    message="总结附件并对照论文",
+                    rag_mode="preferred",
+                    attachment_ids=("file-1",),
+                ),
+                _plan_decision(
+                    (_task(task_id="attachment", capability="attachment_qa"),)
+                ),
+                (
+                    _result(
+                        task_id="attachment",
+                        capability="attachment_qa",
+                        citation_kind="none",
+                    ),
+                ),
+            ),
+            (
+                "file",
+                MainAgentRequest(
+                    request_id="request-matrix-file",
+                    conversation_id="conversation-matrix-file",
+                    message="修改报告文件并保存",
+                    rag_mode="preferred",
+                    attachment_ids=("file-1",),
+                ),
+                _plan_decision((_task(task_id="file", capability="file_edit"),)),
+                (
+                    _result(
+                        task_id="file",
+                        capability="file_edit",
+                        citation_kind="none",
+                    ),
+                ),
+            ),
+            (
+                "dynamic",
+                MainAgentRequest(
+                    request_id="request-matrix-dynamic",
+                    conversation_id="conversation-matrix-dynamic",
+                    message="查询这个项目今天最新的网页状态",
+                    rag_mode="preferred",
+                ),
+                _plan_decision(
+                    (_task(task_id="dynamic", capability="dynamic_tools"),)
+                ),
+                (
+                    _result(
+                        task_id="dynamic",
+                        capability="dynamic_tools",
+                        citation_kind="external",
+                    ),
+                ),
+            ),
+            (
+                "cross-capability",
+                MainAgentRequest(
+                    request_id="request-matrix-cross",
+                    conversation_id="conversation-matrix-cross",
+                    message="比较 C001 与 T001，然后查询最新网页状态",
+                    rag_mode="preferred",
+                ),
+                _plan_decision(
+                    (
+                        _task(task_id="local", capability="local_rag"),
+                        _task(
+                            task_id="web",
+                            capability="dynamic_tools",
+                            depends_on=("local",),
+                        ),
+                    )
+                ),
+                (
+                    _result(task_id="local", source_id="chunk-cross"),
+                    _result(
+                        task_id="web",
+                        capability="dynamic_tools",
+                        citation_kind="external",
+                        source_id="external-cross",
+                    ),
+                ),
+            ),
+            (
+                "ambiguous",
+                MainAgentRequest(
+                    request_id="request-matrix-ambiguous",
+                    conversation_id="conversation-matrix-ambiguous",
+                    message="比较论文",
+                    rag_mode="required",
+                ),
+                _plan_decision((_task(task_id="clarify", capability="direct_chat"),)),
+                (
+                    _result(
+                        task_id="clarify",
+                        capability="local_rag",
+                        source_id="chunk-ambiguous",
+                    ),
+                ),
+            ),
+        )
+        for label, request, plan, results in cases:
+            with self.subTest(label=label):
+                graph, _store, dispatcher, planner = self._build(
+                    plan_decisions=(plan,),
+                    dispatch_results=results,
+                    fast_path_enabled=True,
+                )
+
+                state = await self._run(graph, request)
+
+                self.assertEqual(state["planning_route"], "full_planner")
+                self.assertEqual(planner.calls, 1)
+                self.assertEqual(len(dispatcher.calls), len(results))
+
     async def test_dynamic_tools_flow(self) -> None:
         plan = _plan_decision((_task(task_id="web", capability="dynamic_tools"),))
         graph, _store, dispatcher, _planner = self._build(

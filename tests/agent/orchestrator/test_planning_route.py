@@ -121,6 +121,7 @@ class PlanningRouteTests(unittest.TestCase):
             (_envelope("查询这个项目今天的最新网页状态"), "complex_or_ambiguous"),
             (_envelope("比较论文，然后生成文件并发送审批"), "complex_or_ambiguous"),
             (_envelope("帮我研究一下", rag_mode="required"), "complex_or_ambiguous"),
+            (_envelope("比较论文", rag_mode="required"), "complex_or_ambiguous"),
             (_envelope("继续修改之前的目标"), "complex_or_ambiguous"),
         )
         for envelope, reason in cases:
