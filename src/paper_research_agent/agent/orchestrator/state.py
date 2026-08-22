@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 from paper_research_agent.agent.orchestrator.evaluator import TaskEvaluation
 from paper_research_agent.agent.orchestrator.models import (
@@ -27,6 +27,8 @@ class MainAgentGraphState(TypedDict, total=False):
     request: MainAgentRequest
     base_workspace_version: int
     context: AgentContextEnvelope
+    planning_route: Literal["fast_path", "full_planner"]
+    planning_route_reason: str
     interpretation: TurnInterpretationV2
     goal_decision: GoalDecision
     plan_decision: TaskPlanDecision

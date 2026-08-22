@@ -52,6 +52,7 @@ def build_main_agent_runtime(
     clear: ConversationClearer | None = None,
     event_sink: AgentEventSink | None = None,
     run_event_publisher: RunEventPublisherLike | None = None,
+    fast_path_enabled: bool = False,
 ) -> MainAgentRuntime:
     """Assemble one closable main Agent runtime with a strict Pydantic graph."""
     resolved_synthesizer = synthesizer or AnswerSynthesizer()
@@ -67,6 +68,7 @@ def build_main_agent_runtime(
         max_replans=max_replans,
         checkpointer=checkpointer,
         run_event_publisher=run_event_publisher,
+        fast_path_enabled=fast_path_enabled,
     )
     resolved_resumer = approval_resumer or MainAgentApprovalResumer(
         repository=store,
@@ -99,6 +101,7 @@ def build_main_agent_runtime_from_model(
     event_sink: AgentEventSink | None = None,
     memory_provider: LongTermMemoryProvider | None = None,
     run_event_publisher: RunEventPublisherLike | None = None,
+    fast_path_enabled: bool = False,
 ) -> MainAgentRuntime:
     """Build production stages while sharing one lifecycle-managed model client."""
     return build_main_agent_runtime(
@@ -121,6 +124,7 @@ def build_main_agent_runtime_from_model(
         clear=clear,
         event_sink=event_sink,
         run_event_publisher=run_event_publisher,
+        fast_path_enabled=fast_path_enabled,
     )
 
 

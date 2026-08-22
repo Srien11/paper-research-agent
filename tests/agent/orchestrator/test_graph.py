@@ -153,20 +153,24 @@ class FakeHydrator:
 class FakeInterpreter:
     def __init__(self, interpretation: TurnInterpretationV2) -> None:
         self.interpretation = interpretation
+        self.calls = 0
 
     async def interpret(self, envelope: AgentContextEnvelope) -> TurnInterpretationV2:
         del envelope
+        self.calls += 1
         return self.interpretation
 
 
 class FakeReconciler:
     def __init__(self, decision: GoalDecision) -> None:
         self.decision = decision
+        self.calls = 0
 
     async def reconcile(
         self, envelope: AgentContextEnvelope, interpretation: TurnInterpretationV2
     ) -> GoalDecision:
         del envelope, interpretation
+        self.calls += 1
         return self.decision
 
 
@@ -224,6 +228,7 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
         dispatch_delay_seconds: float = 0,
         recalled_context: tuple[RecalledContext, ...] = (),
         run_event_publisher: object | None = None,
+        fast_path_enabled: bool = False,
     ) -> tuple[object, InMemoryConversationStore, FakeDispatcher, FakePlanner]:
         resolved_store = store or InMemoryConversationStore()
         planner = FakePlanner(*plan_decisions)
@@ -243,6 +248,7 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
             dispatcher=dispatcher,
             max_child_calls=max_child_calls,
             run_event_publisher=run_event_publisher,
+            fast_path_enabled=fast_path_enabled,
         )
         return graph, resolved_store, dispatcher, planner
 
@@ -505,6 +511,97 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[local_paper]", state["final_answer"])
         task = store.load_workspace("conversation-1").task_plan.tasks[0]
         self.assertEqual(task.status, "completed")
+
+    async def test_clear_local_comparison_skips_all_three_model_stages(self) -> None:
+        class EchoDispatcher:
+            def __init__(self) -> None:
+                self.calls: list[object] = []
+
+            async def dispatch(self, request: object) -> ChildTaskResult:
+                self.calls.append(request)
+                return ChildTaskResult(
+                    child_run_id="e" * 32,
+                    task_id=request.task_id,  # type: ignore[attr-defined]
+                    capability="local_rag",
+                    status="completed",
+                    summary="本地论文比较完成",
+                    citation_kind="local_paper",
+                    source_ids=("chunk-1",),
+                )
+
+        store = InMemoryConversationStore()
+        interpreter = FakeInterpreter(_interpretation())
+        reconciler = FakeReconciler(_goal_decision())
+        planner = FakePlanner()
+        dispatcher = EchoDispatcher()
+        graph = build_main_agent_graph(
+            repository=store,
+            hydrator=FakeHydrator(),
+            interpreter=interpreter,
+            goal_reconciler=reconciler,
+            task_planner=planner,
+            dispatcher=dispatcher,  # type: ignore[arg-type]
+            fast_path_enabled=True,
+        )
+        request = MainAgentRequest(
+            request_id="request-fast-comparison",
+            conversation_id="conversation-fast-comparison",
+            message=(
+                "在逻辑推理研究中，一篇认为没有外部反馈时无效，"
+                "另一篇区分找错与改错。请找出论文。"
+            ),
+            rag_mode="preferred",
+        )
+
+        state = await self._run(graph, request)
+
+        self.assertEqual(interpreter.calls, 0)
+        self.assertEqual(reconciler.calls, 0)
+        self.assertEqual(planner.calls, 0)
+        self.assertEqual(len(dispatcher.calls), 1)
+        child_request = dispatcher.calls[0]
+        self.assertEqual(child_request.capability, "local_rag")  # type: ignore[attr-defined]
+        self.assertEqual(child_request.request_id, request.request_id)  # type: ignore[attr-defined]
+        self.assertEqual(child_request.conversation_id, request.conversation_id)  # type: ignore[attr-defined]
+        self.assertEqual(child_request.current_message, request.message)  # type: ignore[attr-defined]
+        self.assertEqual(child_request.rag_mode, "preferred")  # type: ignore[attr-defined]
+        self.assertTrue(child_request.run_id)  # type: ignore[attr-defined]
+        self.assertTrue(child_request.turn_id)  # type: ignore[attr-defined]
+        self.assertTrue(child_request.goal_id)  # type: ignore[attr-defined]
+        self.assertTrue(child_request.task_id)  # type: ignore[attr-defined]
+        self.assertEqual(state["planning_route"], "fast_path")
+        self.assertEqual(
+            state["planning_route_reason"],
+            "clear_single_local_rag",
+        )
+        self.assertEqual(store.load_agent_run(request.request_id).status, "completed")
+
+        cached = await self._run(graph, request)
+        self.assertEqual(len(dispatcher.calls), 1)
+        self.assertEqual(cached["termination_reason"], "cached")
+
+    async def test_disabled_fast_path_uses_existing_full_planner_chain(self) -> None:
+        plan = _plan_decision((_task(task_id="local", capability="local_rag"),))
+        graph, _store, dispatcher, planner = self._build(
+            plan_decisions=(plan,),
+            dispatch_results=(_result(task_id="local", source_id="chunk-1"),),
+            fast_path_enabled=False,
+        )
+
+        state = await self._run(
+            graph,
+            MainAgentRequest(
+                request_id="request-fast-disabled",
+                conversation_id="conversation-fast-disabled",
+                message="比较 C001 与 T001 的方法",
+                rag_mode="preferred",
+            ),
+        )
+
+        self.assertEqual(planner.calls, 1)
+        self.assertEqual(len(dispatcher.calls), 1)
+        self.assertEqual(state["planning_route"], "full_planner")
+        self.assertEqual(state["planning_route_reason"], "feature_disabled")
 
     async def test_dynamic_tools_flow(self) -> None:
         plan = _plan_decision((_task(task_id="web", capability="dynamic_tools"),))

@@ -155,10 +155,35 @@ def _environment(root: Path, *, mode: str, api_key: str = "test-key") -> Applica
         base_url="https://dashscope.example/v1",
         main_model="qwen-test",
         corpus_configured=False,
+        main_agent_fast_path_enabled=True,
     )
 
 
 class ApplicationBootstrapTests(unittest.IsolatedAsyncioTestCase):
+    def test_fast_path_environment_flag_is_strict_and_defaults_true(self) -> None:
+        default = ApplicationEnvironment.from_environment(
+            {"PRA_PROJECT_ROOT": str(Path.cwd())}
+        )
+        disabled = ApplicationEnvironment.from_environment(
+            {
+                "PRA_PROJECT_ROOT": str(Path.cwd()),
+                "PRA_MAIN_AGENT_FAST_PATH_ENABLED": "FaLsE",
+            }
+        )
+
+        self.assertTrue(default.main_agent_fast_path_enabled)
+        self.assertFalse(disabled.main_agent_fast_path_enabled)
+        with self.assertRaisesRegex(
+            ValueError,
+            "PRA_MAIN_AGENT_FAST_PATH_ENABLED",
+        ):
+            ApplicationEnvironment.from_environment(
+                {
+                    "PRA_PROJECT_ROOT": str(Path.cwd()),
+                    "PRA_MAIN_AGENT_FAST_PATH_ENABLED": "1",
+                }
+            )
+
     async def test_dynamic_tool_events_arrive_before_child_completion(self) -> None:
         runtime = _StreamingDynamicRuntime()
         publisher = _CapturingPublisher()
@@ -238,6 +263,7 @@ class ApplicationBootstrapTests(unittest.IsolatedAsyncioTestCase):
                 build_main.call_args.kwargs["event_sink"], SQLiteAgentEventLogger
             )
             self.assertIsNone(build_main.call_args.kwargs["memory_provider"])
+            self.assertTrue(build_main.call_args.kwargs["fast_path_enabled"])
             started = services.conversation_store.begin_agent_run(
                 request_id="request-checkpoint",
                 conversation_id="conversation-a",

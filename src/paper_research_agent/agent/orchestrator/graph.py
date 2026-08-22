@@ -38,7 +38,14 @@ from paper_research_agent.agent.orchestrator.models import (
     RecalledContext,
     TurnInterpretationV2,
 )
-from paper_research_agent.agent.orchestrator.planner import GoalReconciler, TaskPlanner
+from paper_research_agent.agent.orchestrator.planner import (
+    GoalReconciler,
+    TaskPlanner,
+    build_single_local_rag_decisions,
+)
+from paper_research_agent.agent.orchestrator.planning_route import (
+    classify_planning_route as classify_planning_route_pure,
+)
 from paper_research_agent.agent.orchestrator.router import CAPABILITIES
 from paper_research_agent.agent.orchestrator.router import route_task as route_task_pure
 from paper_research_agent.agent.orchestrator.router import (
@@ -69,6 +76,7 @@ def build_main_agent_graph(
     max_replans: int = MAX_REPLANS_PER_RUN,
     checkpointer: Any | None = None,
     run_event_publisher: Any | None = None,
+    fast_path_enabled: bool = False,
 ) -> CompiledStateGraph[Any, Any, Any, Any]:
     """Assemble the graph; only commit_turn and abort_turn write storage."""
     if max_child_calls <= 0 or max_child_calls > 12:
@@ -229,6 +237,61 @@ def build_main_agent_graph(
             idempotency_key="reasoning:hydrate",
         )
         return {"context": envelope}
+
+    async def classify_planning_route(
+        state: MainAgentGraphState,
+    ) -> MainAgentGraphState:
+        envelope = AgentContextEnvelope.model_validate(state["context"])
+        decision = classify_planning_route_pure(
+            envelope,
+            enabled=fast_path_enabled,
+        )
+        return {
+            "planning_route": decision.route,
+            "planning_route_reason": decision.reason_code,
+        }
+
+    async def materialize_fast_path(
+        state: MainAgentGraphState,
+    ) -> MainAgentGraphState:
+        envelope = AgentContextEnvelope.model_validate(state["context"])
+        interpretation, goal_decision, plan_decision = (
+            build_single_local_rag_decisions(envelope)
+        )
+        workspace = reduce_workspace(
+            ConversationWorkspace.model_validate(state["workspace_draft"]),
+            goal_decision=goal_decision,
+        )
+        workspace = reduce_workspace(
+            workspace,
+            plan_decision=plan_decision,
+        )
+        await publish_product_event(
+            state,
+            "goal_updated",
+            node_id="goal:active",
+            status="completed",
+            title="目标已更新",
+            summary="目标动作：create",
+            detail=SafeRunEventDetail(goal_action="create"),
+            idempotency_key="goal:update",
+        )
+        await publish_product_event(
+            state,
+            "plan_updated",
+            node_id="plan:active",
+            status="completed",
+            title="研究计划已更新",
+            summary="计划动作：create，共 1 个任务",
+            detail=SafeRunEventDetail(plan_action="create"),
+            idempotency_key="plan:update:1",
+        )
+        return {
+            "interpretation": interpretation,
+            "goal_decision": goal_decision,
+            "plan_decision": plan_decision,
+            "workspace_draft": workspace,
+        }
 
     async def interpret_turn(state: MainAgentGraphState) -> MainAgentGraphState:
         envelope = AgentContextEnvelope.model_validate(state["context"])
@@ -621,7 +684,18 @@ def build_main_agent_graph(
         return "hydrate_context"
 
     def after_hydrate(state: MainAgentGraphState) -> str:
-        return "select_next_task" if state.get("resuming") else "interpret_turn"
+        return (
+            "select_next_task"
+            if state.get("resuming")
+            else "classify_planning_route"
+        )
+
+    def after_planning_route(state: MainAgentGraphState) -> str:
+        return (
+            "materialize_fast_path"
+            if state.get("planning_route") == "fast_path"
+            else "interpret_turn"
+        )
 
     def after_interpret(state: MainAgentGraphState) -> str:
         raw = state.get("interpretation")
@@ -663,6 +737,8 @@ def build_main_agent_graph(
     builder = StateGraph(MainAgentGraphState)
     builder.add_node("initialize_turn", initialize_turn)
     builder.add_node("hydrate_context", hydrate_context)
+    builder.add_node("classify_planning_route", classify_planning_route)
+    builder.add_node("materialize_fast_path", materialize_fast_path)
     builder.add_node("interpret_turn", interpret_turn)
     builder.add_node("reconcile_goal", reconcile_goal)
     builder.add_node("plan_tasks", plan_tasks)
@@ -682,8 +758,20 @@ def build_main_agent_graph(
     builder.add_conditional_edges(
         "hydrate_context",
         after_hydrate,
-        {"interpret_turn": "interpret_turn", "select_next_task": "select_next_task"},
+        {
+            "classify_planning_route": "classify_planning_route",
+            "select_next_task": "select_next_task",
+        },
     )
+    builder.add_conditional_edges(
+        "classify_planning_route",
+        after_planning_route,
+        {
+            "materialize_fast_path": "materialize_fast_path",
+            "interpret_turn": "interpret_turn",
+        },
+    )
+    builder.add_edge("materialize_fast_path", "select_next_task")
     builder.add_conditional_edges(
         "interpret_turn",
         after_interpret,

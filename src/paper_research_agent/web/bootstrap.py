@@ -71,6 +71,7 @@ class ApplicationEnvironment:
     main_model: str
     corpus_configured: bool
     timeout_seconds: float = 180
+    main_agent_fast_path_enabled: bool = True
 
     @classmethod
     def from_environment(
@@ -106,6 +107,11 @@ class ApplicationEnvironment:
             ).strip(),
             corpus_configured=bool(source.get("PRA_CORPUS_DIR", "").strip()),
             timeout_seconds=_timeout_from_environment(source),
+            main_agent_fast_path_enabled=_strict_boolean_from_environment(
+                source,
+                "PRA_MAIN_AGENT_FAST_PATH_ENABLED",
+                default=True,
+            ),
         )
 
 
@@ -450,6 +456,7 @@ async def create_application_services(
                 event_sink=event_sink,
                 memory_provider=memory_provider,
                 run_event_publisher=run_events.publisher,
+                fast_path_enabled=environment.main_agent_fast_path_enabled,
             )
             own(main)
         return ApplicationServices(
@@ -544,3 +551,20 @@ def _timeout_from_environment(source: Mapping[str, str]) -> float:
     if timeout <= 0 or timeout > 3600:
         raise ValueError("PRA_MAIN_AGENT_TIMEOUT_SECONDS must be between 0 and 3600")
     return timeout
+
+
+def _strict_boolean_from_environment(
+    source: Mapping[str, str],
+    name: str,
+    *,
+    default: bool,
+) -> bool:
+    raw = source.get(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().casefold()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    raise ValueError(f"{name} must be true or false")
