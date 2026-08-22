@@ -166,6 +166,84 @@ def _merge_constraints(
     return merged[:20]
 
 
+def _build_single_task_plan(
+    *,
+    goal_id: str,
+    request: str,
+    capability: Capability,
+    success_criteria: tuple[str, ...],
+    title: str,
+    execution_reason: str,
+    revision: int,
+) -> TaskPlan:
+    now = datetime.now(UTC)
+    task = AgentTask(
+        task_id=uuid.uuid4().hex,
+        goal_id=goal_id,
+        title=title,
+        objective=request,
+        success_criteria=success_criteria,
+        capability=capability,
+        status="pending",
+        depends_on=(),
+        execution_reason=execution_reason,
+    )
+    return TaskPlan(
+        plan_id=uuid.uuid4().hex,
+        goal_id=goal_id,
+        revision=revision,
+        tasks=(task,),
+        created_at=now,
+        updated_at=now,
+    )
+
+
+def build_single_local_rag_decisions(
+    envelope: AgentContextEnvelope,
+) -> tuple[TurnInterpretationV2, GoalDecision, TaskPlanDecision]:
+    """Materialize a strict new-goal local-RAG plan without model calls."""
+    request = " ".join(envelope.current_message.split())
+    if not request:
+        raise ValueError("single local RAG request must not be blank")
+    if len(request) > 1000:
+        raise ValueError("single local RAG request exceeds the 1000 character limit")
+    now = datetime.now(UTC)
+    interpretation = TurnInterpretationV2(
+        relation="new_goal",
+        resolved_request=request,
+        needs_clarification=False,
+        confidence=1.0,
+    )
+    goal = GoalState(
+        goal_id=uuid.uuid4().hex,
+        objective=request,
+        status="active",
+        origin_turn_id=envelope.turn_id,
+        created_at=now,
+        updated_at=now,
+    )
+    goal_decision = GoalDecision(
+        action="create",
+        goal=goal,
+        rationale="确定性单一私有论文请求",
+    )
+    plan = _build_single_task_plan(
+        goal_id=goal.goal_id,
+        request=request,
+        capability="local_rag",
+        success_criteria=("使用本地论文证据完成当前请求",),
+        title="完成当前本地论文请求",
+        execution_reason="使用本地论文证据完成单一研究请求",
+        revision=1,
+    )
+    plan_decision = TaskPlanDecision(
+        action="create",
+        plan=plan,
+        rationale="确定性构造单一 local_rag 任务",
+    )
+    return interpretation, goal_decision, plan_decision
+
+
 class _TaskDraft(FrozenModel):
     task_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")
     title: str = Field(min_length=1, max_length=200)
@@ -299,29 +377,19 @@ class TaskPlanner:
         capability: Capability = (
             "direct_chat" if envelope.rag_mode == "disabled" else "local_rag"
         )
-        task = AgentTask(
-            task_id="single-research-task",
-            goal_id=goal_id,
-            title="完成当前请求",
-            objective=interpretation.resolved_request,
-            success_criteria=("完成当前请求",),
-            capability=capability,
-            status="pending",
-            execution_reason="直接完成当前请求并据此判断目标是否达成",
-        )
-        now = datetime.now(UTC)
         revision = (
             1
             if goal_decision.action == "create" or current is None
             else current.revision + 1
         )
-        plan = TaskPlan(
-            plan_id=uuid.uuid4().hex,
+        plan = _build_single_task_plan(
             goal_id=goal_id,
+            request=interpretation.resolved_request,
+            capability=capability,
+            success_criteria=("完成当前请求",),
+            title="完成当前请求",
+            execution_reason="直接完成当前请求并据此判断目标是否达成",
             revision=revision,
-            tasks=(task,),
-            created_at=now,
-            updated_at=now,
         )
         action: Literal["create", "revise"] = (
             "create" if current is None else "revise"

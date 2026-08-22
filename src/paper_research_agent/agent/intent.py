@@ -23,6 +23,11 @@ _MULTI_OBJECT_SIGNAL = re.compile(
     r"\bthese papers\b|\bthe papers\b)",
     re.IGNORECASE,
 )
+_PARALLEL_SCHOLARLY_OBJECT_SIGNAL = re.compile(
+    r"(?:一篇.{0,160}另一篇|一种.{0,160}另一种|"
+    r"\bone\s+(?:paper|study|method).{0,240}\b(?:another|the other)\b)",
+    re.IGNORECASE,
+)
 
 
 def requires_research_planning(question: str) -> bool:
@@ -40,5 +45,6 @@ def requires_research_planning(question: str) -> bool:
         and (
             _COMPARISON_SIGNAL.search(normalized)
             or _MULTI_OBJECT_SIGNAL.search(normalized)
+            or _PARALLEL_SCHOLARLY_OBJECT_SIGNAL.search(normalized)
         )
     )

@@ -15,7 +15,11 @@ from paper_research_agent.agent.orchestrator.models import (
     TaskPlan,
     TurnInterpretationV2,
 )
-from paper_research_agent.agent.orchestrator.planner import GoalReconciler, TaskPlanner
+from paper_research_agent.agent.orchestrator.planner import (
+    GoalReconciler,
+    TaskPlanner,
+    build_single_local_rag_decisions,
+)
 
 
 def _utc() -> datetime:
@@ -503,6 +507,49 @@ class TaskPlannerTests(unittest.TestCase):
             TaskPlanner(model=_FakeModel([RuntimeError("down")])), envelope, _goal_decision()
         )
         self.assertEqual(decision.plan.tasks[0].capability, "direct_chat")
+
+    def test_single_local_rag_decisions_build_strict_new_goal_and_plan(self) -> None:
+        workspace = ConversationWorkspace(
+            conversation_id="conversation-1",
+            version=0,
+            updated_at=_utc(),
+        )
+        envelope = _envelope(
+            current_message="比较 C001 与 T001 的方法",
+            workspace=workspace,
+        )
+
+        interpretation, goal_decision, plan_decision = (
+            build_single_local_rag_decisions(envelope)
+        )
+
+        self.assertEqual(interpretation.relation, "new_goal")
+        self.assertFalse(interpretation.needs_clarification)
+        self.assertEqual(goal_decision.action, "create")
+        self.assertIsNotNone(goal_decision.goal)
+        self.assertEqual(goal_decision.goal.status, "active")
+        self.assertEqual(plan_decision.action, "create")
+        self.assertEqual(plan_decision.plan.revision, 1)
+        self.assertEqual(len(plan_decision.plan.tasks), 1)
+        task = plan_decision.plan.tasks[0]
+        self.assertEqual(task.capability, "local_rag")
+        self.assertEqual(task.status, "pending")
+        self.assertEqual(task.depends_on, ())
+        self.assertEqual(
+            task.success_criteria,
+            ("使用本地论文证据完成当前请求",),
+        )
+
+    def test_single_local_rag_decisions_never_truncate_contract_bounds(self) -> None:
+        workspace = ConversationWorkspace(
+            conversation_id="conversation-1",
+            version=0,
+            updated_at=_utc(),
+        )
+        envelope = _envelope(current_message="论" * 1001, workspace=workspace)
+
+        with self.assertRaisesRegex(ValueError, "1000"):
+            build_single_local_rag_decisions(envelope)
 
 
 if __name__ == "__main__":
