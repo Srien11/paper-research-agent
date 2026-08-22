@@ -407,6 +407,71 @@ def test_invalid_compilation_attempt_requires_failure_details(
         )
 
 
+def test_compilation_aggregation_scopes_requirement_ids_by_case() -> None:
+    def audit() -> CompilationAuditDiagnostic:
+        return CompilationAuditDiagnostic(
+            attempts=(
+                CompilationAttemptDiagnostic(
+                    attempt=1,
+                    outcome="validated",
+                    requested_requirement_ids=("requirement-01-01",),
+                    accepted_requirement_ids=("requirement-01-01",),
+                ),
+            ),
+            repair=CompilationRepairDiagnostic(
+                applied=False,
+                source_assessment_available=True,
+                input_fact_count=1,
+                retained_fact_count=1,
+                dropped_chunk_scope_count=0,
+                dropped_fact_mapping_count=0,
+                missing_ledger_cell_count=0,
+                fallback_empty_used=False,
+            ),
+        )
+
+    summary = aggregate_compilation_audits(
+        (
+            _case(question_id="CPG001", compilation_audit=audit()),
+            _case(question_id="CPG002", compilation_audit=audit()),
+        )
+    )
+
+    assert summary["case_count_with_audit"] == 2
+    assert summary["final"]["requested_unit_count"] == 2
+    assert summary["final"]["accepted_unit_count"] == 2
+
+
+@pytest.mark.parametrize("cases", [(), (_case(),)])
+def test_compilation_aggregation_has_stable_empty_shape(
+    cases: tuple[ComparisonCaseDiagnostic, ...],
+) -> None:
+    assert aggregate_compilation_audits(cases) == {
+        "case_count_with_audit": 0,
+        "retry_case_count": 0,
+        "attempts": {
+            "attempt_count": 0,
+            "requested_unit_count": 0,
+            "accepted_unit_count": 0,
+            "failed_unit_count": 0,
+            "schema_failed_unit_count": 0,
+            "contract_failed_unit_count": 0,
+            "accepted_fact_count": 0,
+            "rejected_fact_count": 0,
+            "unresolved_fact_requirement_count": 0,
+        },
+        "final": {
+            "requested_unit_count": 0,
+            "accepted_unit_count": 0,
+            "failed_unit_count": 0,
+            "schema_failed_unit_count": 0,
+            "contract_failed_unit_count": 0,
+            "unresolved_fact_requirement_count": 0,
+            "retained_fact_count": 0,
+        },
+    }
+
+
 def test_case_diagnostic_persists_and_aggregates_body_free_planner_attempts() -> None:
     attempts = (
         PlannerAttemptDiagnostic(

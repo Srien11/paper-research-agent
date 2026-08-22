@@ -436,38 +436,86 @@ def aggregate_fact_lineage(
 
 def aggregate_compilation_audits(
     cases: Iterable[ComparisonCaseDiagnostic],
-) -> dict[str, int]:
-    """Aggregate body-free transactional compiler unit counts."""
-    attempts = tuple(
-        attempt
+) -> dict[str, object]:
+    """Aggregate body-free Compiler attempts and final transactional state."""
+    audits = tuple(
+        case.compilation_audit
         for case in cases
         if case.compilation_audit is not None
-        for attempt in case.compilation_audit.attempts
     )
+    attempts = tuple(
+        attempt
+        for audit in audits
+        for attempt in audit.attempts
+    )
+    final_requested: set[tuple[int, str]] = set()
+    final_accepted: set[tuple[int, str]] = set()
+    final_failed: dict[
+        tuple[int, str], CompilationAttemptDiagnostic
+    ] = {}
+
+    for case_index, audit in enumerate(audits):
+        latest_by_requirement: dict[str, CompilationAttemptDiagnostic] = {}
+        for attempt in audit.attempts:
+            for requirement_id in attempt.requested_requirement_ids:
+                latest_by_requirement[requirement_id] = attempt
+        for requirement_id, latest in latest_by_requirement.items():
+            key = (case_index, requirement_id)
+            final_requested.add(key)
+            if requirement_id in latest.failed_requirement_ids:
+                final_failed[key] = latest
+            else:
+                final_accepted.add(key)
+
     return {
-        "attempt_count": len(attempts),
-        "requested_unit_count": sum(
-            len(item.requested_requirement_ids) for item in attempts
-        ),
-        "accepted_unit_count": sum(
-            len(item.accepted_requirement_ids) for item in attempts
-        ),
-        "failed_unit_count": sum(len(item.failed_requirement_ids) for item in attempts),
-        "schema_failed_unit_count": sum(
-            len(item.failed_requirement_ids)
-            for item in attempts
-            if item.outcome == "schema_invalid"
-        ),
-        "contract_failed_unit_count": sum(
-            len(item.failed_requirement_ids)
-            for item in attempts
-            if item.outcome == "contract_invalid"
-        ),
-        "accepted_fact_count": sum(item.accepted_fact_count for item in attempts),
-        "rejected_fact_count": sum(item.rejected_fact_count for item in attempts),
-        "unresolved_fact_requirement_count": sum(
-            item.unresolved_fact_requirement_count for item in attempts
-        ),
+        "case_count_with_audit": len(audits),
+        "retry_case_count": sum(len(audit.attempts) > 1 for audit in audits),
+        "attempts": {
+            "attempt_count": len(attempts),
+            "requested_unit_count": sum(
+                len(item.requested_requirement_ids) for item in attempts
+            ),
+            "accepted_unit_count": sum(
+                len(item.accepted_requirement_ids) for item in attempts
+            ),
+            "failed_unit_count": sum(
+                len(item.failed_requirement_ids) for item in attempts
+            ),
+            "schema_failed_unit_count": sum(
+                len(item.failed_requirement_ids)
+                for item in attempts
+                if item.outcome == "schema_invalid"
+            ),
+            "contract_failed_unit_count": sum(
+                len(item.failed_requirement_ids)
+                for item in attempts
+                if item.outcome == "contract_invalid"
+            ),
+            "accepted_fact_count": sum(item.accepted_fact_count for item in attempts),
+            "rejected_fact_count": sum(item.rejected_fact_count for item in attempts),
+            "unresolved_fact_requirement_count": sum(
+                item.unresolved_fact_requirement_count for item in attempts
+            ),
+        },
+        "final": {
+            "requested_unit_count": len(final_requested),
+            "accepted_unit_count": len(final_accepted),
+            "failed_unit_count": len(final_failed),
+            "schema_failed_unit_count": sum(
+                item.outcome == "schema_invalid" for item in final_failed.values()
+            ),
+            "contract_failed_unit_count": sum(
+                item.outcome == "contract_invalid" for item in final_failed.values()
+            ),
+            "unresolved_fact_requirement_count": sum(
+                audit.attempts[-1].unresolved_fact_requirement_count
+                for audit in audits
+                if audit.attempts
+            ),
+            "retained_fact_count": sum(
+                audit.repair.retained_fact_count for audit in audits
+            ),
+        },
     }
 
 
