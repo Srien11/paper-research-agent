@@ -228,22 +228,32 @@ def build_comparison_research_plan(
     proposal: ComparisonPlanProposal,
     *,
     resolved_catalog: Mapping[str, str],
+    dimension_labels: tuple[str, ...],
     max_steps: int,
-    expected_dimension_count: int | None = None,
 ) -> ResearchPlan:
     """Build all comparison control-plane IDs and scopes deterministically."""
     if len(proposal.selected_corpus_ids) < 2:
         raise ValueError("comparison research plan requires at least two targets")
     if not set(proposal.selected_corpus_ids) <= set(resolved_catalog):
         raise ValueError("comparison plan left the resolved candidate set")
-    if not proposal.dimension_labels:
-        raise ValueError("comparison research plan requires at least one dimension")
+    normalized_dimension_labels = tuple(
+        " ".join(label.split()) for label in dimension_labels
+    )
     if (
-        expected_dimension_count is not None
-        and len(proposal.dimension_labels) != expected_dimension_count
+        not normalized_dimension_labels
+        or len(normalized_dimension_labels) > 5
+        or any(
+            not label or len(label) > 200
+            for label in normalized_dimension_labels
+        )
     ):
-        raise ValueError("comparison research plan requires valid dimensions")
-    cell_count = len(proposal.selected_corpus_ids) * len(proposal.dimension_labels)
+        raise ValueError("comparison research plan requires at least one dimension")
+    dimension_keys = tuple(label.casefold() for label in normalized_dimension_labels)
+    if len(dimension_keys) != len(set(dimension_keys)):
+        raise ValueError("comparison research plan requires unique dimensions")
+    cell_count = len(proposal.selected_corpus_ids) * len(
+        normalized_dimension_labels
+    )
     if cell_count > max_steps:
         raise ValueError("research plan exceeds the requested step budget")
     materialized_fact_count = len(proposal.facts) * len(proposal.selected_corpus_ids)
@@ -254,12 +264,12 @@ def build_comparison_research_plan(
 
     grouped: dict[int, list[ComparisonFactProposal]] = {}
     for fact in proposal.facts:
-        if fact.dimension_index >= len(proposal.dimension_labels):
+        if fact.dimension_index >= len(normalized_dimension_labels):
             raise ValueError(
                 "comparison requirement references an unknown target or dimension"
             )
         grouped.setdefault(fact.dimension_index, []).append(fact)
-    if set(grouped) != set(range(len(proposal.dimension_labels))):
+    if set(grouped) != set(range(len(normalized_dimension_labels))):
         raise ValueError(
             "comparison requirements must form a complete target-dimension grid"
         )
@@ -277,7 +287,7 @@ def build_comparison_research_plan(
             dimension_id=f"dimension-{dimension_index:02d}",
             label=label,
         )
-        for dimension_index, label in enumerate(proposal.dimension_labels, 1)
+        for dimension_index, label in enumerate(normalized_dimension_labels, 1)
     )
     requirements: list[EvidenceRequirement] = []
     steps: list[ResearchStep] = []
@@ -497,10 +507,10 @@ class LangChainResearchPlanner:
                 content=(
                     "You propose only semantic content for a private-paper comparison plan. "
                     f"Select two to four corpus IDs only from LOCAL_CORPUS_CATALOG_JSON and "
-                    f"use no more than {max_steps} total fact proposals. Return a distinct "
-                    "dimension label for every explicit comparison topic, clue cluster, method, "
-                    "result, limitation, condition, or manipulation requested by the user; do "
-                    "not merge separate requested topics. Return at least one atomic fact for "
+                    f"use no more than {max_steps} total fact proposals. Local code has already "
+                    "fixed every comparison dimension, its count, order, label, and control-plane "
+                    "identifier. Do not return dimension labels or attempt to add, remove, merge, "
+                    "or reorder dimensions. Return at least one atomic fact for "
                     f"exactly {len(dimension_hints)} dimensions, preserving the one-to-one order "
                     "of EXPLICIT_DIMENSION_HINTS_JSON. Do not merge, drop, or add hint entries. "
                     "Return one or more atomic fact intents for every zero-based dimension_index. "
@@ -537,8 +547,8 @@ class LangChainResearchPlanner:
                     plan = build_comparison_research_plan(
                         proposal,
                         resolved_catalog=resolved_catalog,
+                        dimension_labels=dimension_hints,
                         max_steps=max_steps,
-                        expected_dimension_count=len(dimension_hints),
                     )
                 else:
                     plan = ResearchPlan.model_validate(raw)

@@ -55,6 +55,8 @@ class ResearchToolModelTests(unittest.TestCase):
         self.assertIn("selected_corpus_ids", schema)
         self.assertIn("dimension_index", schema)
         for excluded in (
+            "dimension_labels",
+            "legacy_dimension_labels",
             "target_id",
             "dimension_id",
             "requirement_id",
@@ -64,6 +66,25 @@ class ResearchToolModelTests(unittest.TestCase):
             "objective",
         ):
             self.assertNotIn(excluded, schema)
+
+    def test_comparison_proposal_accepts_but_never_serializes_legacy_labels(self) -> None:
+        proposal = ComparisonPlanProposal.model_validate(
+            {
+                "selected_corpus_ids": ["C001", "T001"],
+                "dimension_labels": ["ignored", "ignored"],
+                "facts": [
+                    {
+                        "dimension_index": 0,
+                        "description": "Method",
+                        "protected_anchor_ids": [0],
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(proposal.legacy_dimension_labels, ("ignored", "ignored"))
+        self.assertNotIn("dimension_labels", proposal.model_dump(mode="json"))
+        self.assertNotIn("legacy_dimension_labels", proposal.model_dump(mode="json"))
 
     def test_planner_attempt_audit_is_local_only_and_consecutive(self) -> None:
         attempts = (

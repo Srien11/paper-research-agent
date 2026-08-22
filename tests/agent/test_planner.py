@@ -23,6 +23,12 @@ from paper_research_agent.retrieval.contracts import QueryRewriteTrace
 from paper_research_agent.retrieval.papers import PaperCandidateHit, PaperCandidateQuery
 
 
+CPG020_LIKE_QUESTION = (
+    "在逻辑推理自我修正研究中，一篇认为没有外部反馈时经常无效，"
+    "另一篇区分找错与改错，指出给出错误位置后能够纠正。请找出论文。"
+)
+
+
 class LangChainComparisonTargetResolverTests(unittest.IsolatedAsyncioTestCase):
     def test_explicit_parser_rejects_partial_or_overlong_identifiers(self) -> None:
         self.assertEqual(parse_explicit_corpus_ids("C001/T002 and c003"), ("C001", "T002", "C003"))
@@ -255,6 +261,7 @@ class LangChainResearchPlannerTests(unittest.IsolatedAsyncioTestCase):
         plan = build_comparison_research_plan(
             proposal,
             resolved_catalog={"C001": "Paper A", "T001": "Paper B"},
+            dimension_labels=("Method", "Result"),
             max_steps=4,
         )
 
@@ -279,6 +286,194 @@ class LangChainResearchPlannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             all(step.corpus_id == target.corpus_id for target in plan.targets for step in plan.steps if step.target_ids == (target.target_id,))
         )
+
+    def test_local_dimension_skeleton_owns_count_order_and_ids(self) -> None:
+        hints = comparison_dimension_hints(CPG020_LIKE_QUESTION)
+        proposal = ComparisonPlanProposal.model_validate(
+            {
+                "selected_corpus_ids": ["C001", "T001"],
+                "facts": [
+                    {
+                        "dimension_index": index,
+                        "description": hint,
+                        "protected_anchor_ids": [index + 2],
+                    }
+                    for index, hint in enumerate(hints)
+                ],
+            }
+        )
+
+        plan = build_comparison_research_plan(
+            proposal,
+            resolved_catalog={"C001": "Paper A", "T001": "Paper B"},
+            dimension_labels=hints,
+            max_steps=6,
+        )
+
+        self.assertEqual(tuple(item.label for item in plan.dimensions), hints)
+        self.assertEqual(
+            tuple(item.dimension_id for item in plan.dimensions),
+            ("dimension-01", "dimension-02", "dimension-03"),
+        )
+        self.assertEqual(len(plan.requirements), 6)
+        self.assertEqual(len(plan.steps), 6)
+
+    def test_comparison_builder_rejects_invalid_local_skeletons(self) -> None:
+        proposal = ComparisonPlanProposal.model_validate(
+            {
+                "selected_corpus_ids": ["C001", "T001"],
+                "facts": [
+                    {
+                        "dimension_index": 0,
+                        "description": "Method",
+                        "protected_anchor_ids": [0],
+                    }
+                ],
+            }
+        )
+        for labels in ((), ("Method", "method"), (" ",)):
+            with self.subTest(labels=labels), self.assertRaises(ValueError) as raised:
+                build_comparison_research_plan(
+                    proposal,
+                    resolved_catalog={"C001": "Paper A", "T001": "Paper B"},
+                    dimension_labels=labels,
+                    max_steps=6,
+                )
+            self.assertEqual(
+                _planner_failure_code(raised.exception),
+                "local_dimension_skeleton_invalid",
+            )
+
+    def test_fact_indices_and_grid_budget_have_stable_failure_codes(self) -> None:
+        hints = ("Method", "Result", "Limitation")
+        base_facts = [
+            {
+                "dimension_index": index,
+                "description": hint,
+                "protected_anchor_ids": [index],
+            }
+            for index, hint in enumerate(hints)
+        ]
+        cases = (
+            (
+                "planner_fact_proposal_invalid",
+                base_facts[:2],
+                ("C001", "T001"),
+                6,
+            ),
+            (
+                "planner_fact_dimension_reference_invalid",
+                [*base_facts, {**base_facts[-1], "dimension_index": 3}],
+                ("C001", "T001"),
+                8,
+            ),
+            (
+                "planner_step_budget_invalid",
+                base_facts,
+                ("C001", "T001", "C002"),
+                6,
+            ),
+        )
+        catalog = {
+            "C001": "Paper A",
+            "T001": "Paper B",
+            "C002": "Paper C",
+        }
+        for expected, facts, corpus_ids, max_steps in cases:
+            with self.subTest(expected=expected), self.assertRaises(ValueError) as raised:
+                build_comparison_research_plan(
+                    ComparisonPlanProposal.model_validate(
+                        {
+                            "selected_corpus_ids": corpus_ids,
+                            "facts": facts,
+                        }
+                    ),
+                    resolved_catalog=catalog,
+                    dimension_labels=hints,
+                    max_steps=max_steps,
+                )
+            self.assertEqual(_planner_failure_code(raised.exception), expected)
+
+    def test_multiple_atomic_facts_do_not_change_fixed_dimension_grid(self) -> None:
+        proposal = ComparisonPlanProposal.model_validate(
+            {
+                "selected_corpus_ids": ["C001", "T001"],
+                "facts": [
+                    {
+                        "dimension_index": 0,
+                        "description": "Method architecture",
+                        "protected_anchor_ids": [0],
+                    },
+                    {
+                        "dimension_index": 0,
+                        "description": "Method input",
+                        "protected_anchor_ids": [1],
+                    },
+                    {
+                        "dimension_index": 1,
+                        "description": "Result",
+                        "protected_anchor_ids": [2],
+                    },
+                    {
+                        "dimension_index": 2,
+                        "description": "Limitation",
+                        "protected_anchor_ids": [3],
+                    },
+                ],
+            }
+        )
+
+        plan = build_comparison_research_plan(
+            proposal,
+            resolved_catalog={"C001": "Paper A", "T001": "Paper B"},
+            dimension_labels=("Method", "Result", "Limitation"),
+            max_steps=8,
+        )
+
+        self.assertEqual(len(plan.dimensions), 3)
+        self.assertEqual(len(plan.requirements), 6)
+        self.assertEqual(len(plan.steps), 6)
+
+    async def test_provider_dimension_labels_cannot_change_local_skeleton(self) -> None:
+        hints = comparison_dimension_hints(CPG020_LIKE_QUESTION)
+        for ignored_labels in (
+            ["A", "B"],
+            ["A", "B", "C", "D"],
+            ["A", "A", "C"],
+            ["", "B", "C"],
+        ):
+            with self.subTest(ignored_labels=ignored_labels):
+                model = Mock()
+                structured = AsyncMock()
+                structured.ainvoke.return_value = {
+                    "selected_corpus_ids": ["C001", "T001"],
+                    "dimension_labels": ignored_labels,
+                    "facts": [
+                        {
+                            "dimension_index": index,
+                            "description": hint,
+                            "protected_anchor_ids": [index + 2],
+                        }
+                        for index, hint in enumerate(hints)
+                    ],
+                }
+                model.with_structured_output.return_value = structured
+                planner = LangChainResearchPlanner(
+                    model,
+                    corpus_catalog={"C001": "Paper A", "T001": "Paper B"},
+                )
+
+                plan = await planner.plan(
+                    CPG020_LIKE_QUESTION,
+                    max_steps=6,
+                    planning_required=True,
+                )
+
+                self.assertEqual(
+                    [item.label for item in plan.dimensions],
+                    list(hints),
+                )
+                self.assertEqual(len(plan.steps), 6)
 
     def test_planner_failures_have_stable_body_free_codes(self) -> None:
         base = {

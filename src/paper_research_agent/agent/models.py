@@ -746,8 +746,12 @@ class ComparisonPlanProposal(FrozenContract):
     """Provider schema limited to semantic choices for a comparison plan."""
 
     selected_corpus_ids: tuple[str, ...] = Field(min_length=2, max_length=4)
-    dimension_labels: tuple[str, ...] = Field(min_length=1, max_length=5)
     facts: tuple[ComparisonFactProposal, ...] = Field(min_length=1, max_length=24)
+    legacy_dimension_labels: SkipJsonSchema[tuple[str, ...]] = Field(
+        default=(),
+        validation_alias="dimension_labels",
+        exclude=True,
+    )
 
     @field_validator("selected_corpus_ids")
     @classmethod
@@ -757,18 +761,6 @@ class ComparisonPlanProposal(FrozenContract):
         if len(values) != len(set(values)):
             raise ValueError("comparison targets must use distinct corpus IDs")
         return values
-
-    @field_validator("dimension_labels")
-    @classmethod
-    def normalize_dimension_labels(cls, values: tuple[str, ...]) -> tuple[str, ...]:
-        normalized = tuple(" ".join(value.split()) for value in values)
-        if any(not value for value in normalized):
-            raise ValueError("comparison research plan requires valid dimensions")
-        keys = tuple(value.casefold() for value in normalized)
-        if len(keys) != len(set(keys)):
-            raise ValueError("comparison research plan requires unique dimensions")
-        return normalized
-
 
 class ResearchPlan(FrozenContract):
     """Ordered, auditable subquestions that stay within the read-only workflow."""
