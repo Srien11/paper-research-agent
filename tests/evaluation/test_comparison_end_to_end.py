@@ -222,20 +222,35 @@ def test_case_diagnostic_persists_body_free_compilation_audit() -> None:
         attempts=(
             CompilationAttemptDiagnostic(
                 attempt=1,
-                outcome="schema_invalid",
-                failure_code="schema_ledger_too_long",
-                raw_ledger_cell_count=4,
-                raw_fact_count=8,
+                outcome="contract_invalid",
+                failure_code="fact_chunk_scope_invalid",
+                raw_ledger_cell_count=2,
+                raw_fact_count=2,
+                accepted_fact_count=1,
+                rejected_fact_count=1,
+                unresolved_fact_requirement_count=1,
                 requested_requirement_ids=("a-method", "b-method"),
                 accepted_requirement_ids=("a-method",),
                 failed_requirement_ids=("b-method",),
             ),
+            CompilationAttemptDiagnostic(
+                attempt=2,
+                outcome="validated",
+                raw_ledger_cell_count=1,
+                raw_fact_count=1,
+                accepted_fact_count=1,
+                rejected_fact_count=0,
+                unresolved_fact_requirement_count=0,
+                requested_requirement_ids=("b-method",),
+                accepted_requirement_ids=("b-method",),
+                failed_requirement_ids=(),
+            ),
         ),
         repair=CompilationRepairDiagnostic(
-            applied=True,
+            applied=False,
             source_assessment_available=True,
-            input_fact_count=8,
-            retained_fact_count=8,
+            input_fact_count=2,
+            retained_fact_count=2,
             dropped_chunk_scope_count=0,
             dropped_fact_mapping_count=0,
             missing_ledger_cell_count=0,
@@ -248,11 +263,68 @@ def test_case_diagnostic_persists_body_free_compilation_audit() -> None:
     assert case.compilation_audit == audit
     assert "secret" not in str(case.compilation_audit.model_dump())
     summary = aggregate_compilation_audits((case,))
-    assert summary["attempt_count"] == 1
-    assert summary["requested_unit_count"] == 2
-    assert summary["accepted_unit_count"] == 1
-    assert summary["failed_unit_count"] == 1
-    assert summary["schema_failed_unit_count"] == 1
+    assert summary["retry_case_count"] == 1
+    assert summary["attempts"] == {
+        "attempt_count": 2,
+        "requested_unit_count": 3,
+        "accepted_unit_count": 2,
+        "failed_unit_count": 1,
+        "schema_failed_unit_count": 0,
+        "contract_failed_unit_count": 1,
+        "accepted_fact_count": 2,
+        "rejected_fact_count": 1,
+        "unresolved_fact_requirement_count": 1,
+    }
+    assert summary["final"] == {
+        "requested_unit_count": 2,
+        "accepted_unit_count": 2,
+        "failed_unit_count": 0,
+        "schema_failed_unit_count": 0,
+        "contract_failed_unit_count": 0,
+        "unresolved_fact_requirement_count": 0,
+        "retained_fact_count": 2,
+    }
+
+
+def test_compilation_audit_keeps_failure_when_retry_still_fails() -> None:
+    audit = CompilationAuditDiagnostic(
+        attempts=(
+            CompilationAttemptDiagnostic(
+                attempt=1,
+                outcome="contract_invalid",
+                failure_code="fact_chunk_scope_invalid",
+                requested_requirement_ids=("a-method", "b-method"),
+                accepted_requirement_ids=("a-method",),
+                failed_requirement_ids=("b-method",),
+                unresolved_fact_requirement_count=1,
+            ),
+            CompilationAttemptDiagnostic(
+                attempt=2,
+                outcome="contract_invalid",
+                failure_code="fact_chunk_scope_invalid",
+                requested_requirement_ids=("b-method",),
+                accepted_requirement_ids=(),
+                failed_requirement_ids=("b-method",),
+                unresolved_fact_requirement_count=1,
+            ),
+        ),
+        repair=CompilationRepairDiagnostic(
+            applied=False,
+            source_assessment_available=True,
+            input_fact_count=2,
+            retained_fact_count=1,
+            dropped_chunk_scope_count=0,
+            dropped_fact_mapping_count=0,
+            missing_ledger_cell_count=0,
+            fallback_empty_used=False,
+        ),
+    )
+
+    summary = aggregate_compilation_audits((_case(compilation_audit=audit),))
+
+    assert summary["final"]["failed_unit_count"] == 1
+    assert summary["final"]["contract_failed_unit_count"] == 1
+    assert summary["final"]["unresolved_fact_requirement_count"] == 1
 
 
 def test_case_diagnostic_persists_and_aggregates_body_free_planner_attempts() -> None:
