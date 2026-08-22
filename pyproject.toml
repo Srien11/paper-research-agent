@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "paper-research-agent"
 version = "0.1.0"
-description = "面向小型论文语料的可复现、证据可追溯 RAG 检索基线"
+description = "面向私有论文库的可复现、证据可追溯研究 Agent"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
