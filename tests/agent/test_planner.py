@@ -10,6 +10,7 @@ from paper_research_agent.agent.models import (
     ResearchStep,
 )
 from paper_research_agent.agent.planner import (
+    ComparisonPlanningError,
     ComparisonTargetResolutionError,
     LangChainComparisonTargetResolver,
     LangChainResearchPlanner,
@@ -169,6 +170,50 @@ class LangChainComparisonTargetResolverTests(unittest.IsolatedAsyncioTestCase):
         candidate_retriever.search.assert_not_awaited()
         query_resolver.resolve_query.assert_not_awaited()
 
+    async def test_too_many_explicit_ids_remain_target_resolution_failure(self) -> None:
+        resolver = LangChainComparisonTargetResolver(
+            candidate_retriever=AsyncMock(),
+            query_resolver=AsyncMock(),
+            corpus_catalog={
+                "C001": "Paper A",
+                "C002": "Paper B",
+                "C003": "Paper C",
+                "C004": "Paper D",
+                "C005": "Paper E",
+            },
+        )
+
+        with self.assertRaises(ComparisonTargetResolutionError) as raised:
+            await resolver.resolve("Compare C001 C002 C003 C004 C005")
+
+        self.assertEqual(raised.exception.reason_code, "too_many_explicit_corpus_ids")
+
+    async def test_insufficient_candidates_remain_target_resolution_failure(self) -> None:
+        candidate_retriever = AsyncMock()
+        candidate_retriever.search.return_value = ()
+        query_resolver = AsyncMock()
+        query_resolver.resolve_query.return_value = QueryRewriteTrace(
+            status="error",
+            requested_model="qwen-test",
+            prompt_version="query-rewrite-v3",
+            latency_ms=1,
+            error_class="QueryRewriteError",
+            fallback_reason="error",
+        )
+        resolver = LangChainComparisonTargetResolver(
+            candidate_retriever=candidate_retriever,
+            query_resolver=query_resolver,
+            corpus_catalog={"C001": "Paper A", "T001": "Paper B"},
+        )
+
+        with self.assertRaises(ComparisonTargetResolutionError) as raised:
+            await resolver.resolve("Compare the described methods")
+
+        self.assertEqual(
+            raised.exception.reason_code,
+            "insufficient_retrieval_candidates",
+        )
+
 
 class LangChainResearchPlannerTests(unittest.IsolatedAsyncioTestCase):
     def test_derives_explicit_dimension_hints_without_answer_data(self) -> None:
@@ -277,20 +322,20 @@ class LangChainResearchPlannerTests(unittest.IsolatedAsyncioTestCase):
         one_target["targets"] = one_target["targets"][:1]
         one_target["requirements"] = one_target["requirements"][:1]
         one_target["steps"] = one_target["steps"][:1]
-        invalid_payloads.append(("planner_target_count_invalid", one_target))
+        invalid_payloads.append(("planner_target_selection_invalid", one_target))
         duplicate_target = copy.deepcopy(base)
         duplicate_target["targets"][1]["corpus_id"] = "C001"
-        invalid_payloads.append(("planner_target_duplicate", duplicate_target))
+        invalid_payloads.append(("planner_target_selection_invalid", duplicate_target))
         no_dimensions = copy.deepcopy(base)
         no_dimensions["dimensions"] = []
-        invalid_payloads.append(("planner_dimension_invalid", no_dimensions))
+        invalid_payloads.append(("local_dimension_skeleton_invalid", no_dimensions))
         incomplete_grid = copy.deepcopy(base)
         incomplete_grid["requirements"] = incomplete_grid["requirements"][:1]
-        invalid_payloads.append(("planner_grid_incomplete", incomplete_grid))
+        invalid_payloads.append(("planner_fact_proposal_invalid", incomplete_grid))
         bad_requirement_reference = copy.deepcopy(base)
         bad_requirement_reference["requirements"][0]["target_id"] = "outside"
         invalid_payloads.append(
-            ("planner_requirement_reference_invalid", bad_requirement_reference)
+            ("planner_fact_dimension_reference_invalid", bad_requirement_reference)
         )
         bad_step_scope = copy.deepcopy(base)
         bad_step_scope["steps"][0]["target_ids"] = ["a", "b"]
@@ -304,7 +349,7 @@ class LangChainResearchPlannerTests(unittest.IsolatedAsyncioTestCase):
 
         errors: list[tuple[str, ValueError]] = [
             ("planner_task_type_invalid", ValueError("planned research requires a comparison plan")),
-            ("planner_target_outside_candidate_set", ValueError("comparison plan left the resolved candidate set")),
+            ("planner_target_selection_invalid", ValueError("comparison plan left the resolved candidate set")),
             ("planner_step_budget_invalid", ValueError("research plan exceeds the requested step budget")),
             ("planner_fact_budget_invalid", ValueError("comparison fact requirements exceed the requested step budget")),
             ("planner_anchor_selection_invalid", ValueError("protected anchor selection is invalid")),
@@ -434,7 +479,7 @@ class LangChainResearchPlannerTests(unittest.IsolatedAsyncioTestCase):
             ["contract_invalid", "validated"],
         )
         retry_message = structured.ainvoke.await_args_list[1].args[0][-1].content
-        self.assertIn("FAILURE_CODE=planner_target_count_invalid", retry_message)
+        self.assertIn("FAILURE_CODE=planner_target_selection_invalid", retry_message)
         self.assertTrue(
             all(
                 intent.origin == "planned"
@@ -527,13 +572,59 @@ class LangChainResearchPlannerTests(unittest.IsolatedAsyncioTestCase):
             corpus_catalog={"C001": "Paper A", "T001": "Paper B"},
         )
 
-        with self.assertRaises(ComparisonTargetResolutionError) as raised:
+        with self.assertRaises(ComparisonPlanningError) as raised:
             await planner.plan("Compare C001 and T001", max_steps=2, planning_required=True)
 
-        self.assertEqual(raised.exception.reason_code, "planner_target_count_invalid")
+        self.assertEqual(
+            raised.exception.reason_code,
+            "planner_target_selection_invalid",
+        )
         self.assertEqual(
             [item.failure_code for item in raised.exception.attempts],
-            ["planner_target_count_invalid", "planner_target_count_invalid"],
+            [
+                "planner_target_selection_invalid",
+                "planner_target_selection_invalid",
+            ],
+        )
+
+    async def test_proposal_failure_is_not_reported_as_target_resolution(self) -> None:
+        model = Mock()
+        structured = AsyncMock()
+        structured.ainvoke.return_value = {
+            "selected_corpus_ids": ["C001", "T001"],
+            "dimension_labels": ["Method", "Result"],
+            "facts": [
+                {
+                    "dimension_index": 0,
+                    "description": "model-authored fact",
+                    "protected_anchor_ids": [0],
+                }
+            ],
+        }
+        model.with_structured_output.return_value = structured
+        planner = LangChainResearchPlanner(
+            model,
+            corpus_catalog={"C001": "Paper A", "T001": "Paper B"},
+        )
+
+        with self.assertRaises(ComparisonPlanningError) as raised:
+            await planner.plan(
+                "Compare C001 and T001: method; result.",
+                max_steps=4,
+                planning_required=True,
+            )
+
+        self.assertEqual(
+            raised.exception.reason_code,
+            "planner_fact_proposal_invalid",
+        )
+        self.assertNotIsInstance(
+            raised.exception,
+            ComparisonTargetResolutionError,
+        )
+        self.assertEqual(
+            [item.attempt for item in raised.exception.attempts],
+            [1, 2],
         )
 
     async def test_required_comparison_rejects_targets_outside_resolved_candidates(self) -> None:
@@ -555,17 +646,17 @@ class LangChainResearchPlannerTests(unittest.IsolatedAsyncioTestCase):
         resolver.resolve.return_value = {"C001": "Paper A", "T001": "Paper B"}
         planner = LangChainResearchPlanner(model, target_resolver=resolver)
 
-        with self.assertRaises(ComparisonTargetResolutionError) as raised:
+        with self.assertRaises(ComparisonPlanningError) as raised:
             await planner.plan("Compare the methods", max_steps=2, planning_required=True)
 
         self.assertEqual(
             raised.exception.reason_code,
-            "planner_target_outside_candidate_set",
+            "planner_target_selection_invalid",
         )
         self.assertEqual(structured.ainvoke.await_count, 2)
         retry_message = structured.ainvoke.await_args_list[1].args[0][-1].content
         self.assertIn(
-            "FAILURE_CODE=planner_target_outside_candidate_set",
+            "FAILURE_CODE=planner_target_selection_invalid",
             retry_message,
         )
         self.assertIn("LOCAL_CORPUS_CATALOG_JSON", retry_message)

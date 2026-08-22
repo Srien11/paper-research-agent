@@ -95,6 +95,26 @@ class ResearchToolModelTests(unittest.TestCase):
                 planner_attempts=(PlannerAttemptAudit(attempt=2, outcome="validated"),),
             )
 
+    def test_planner_attempt_audit_serialization_is_body_free(self) -> None:
+        audit = PlannerAttemptAudit(
+            attempt=2,
+            outcome="contract_invalid",
+            failure_code="planner_fact_proposal_invalid",
+        )
+
+        serialized = audit.model_dump(mode="json")
+
+        self.assertEqual(
+            serialized["failure_code"],
+            "planner_fact_proposal_invalid",
+        )
+        for forbidden in (
+            "private question body",
+            "model-authored fact",
+            "raw query",
+        ):
+            self.assertNotIn(forbidden, str(serialized))
+
     def test_fact_requirement_normalizes_structured_query_terms(self) -> None:
         item = EvidenceFactRequirement(
             fact_requirement_id="a-method-input",

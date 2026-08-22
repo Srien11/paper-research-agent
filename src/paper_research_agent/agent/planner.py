@@ -49,6 +49,20 @@ class ComparisonTargetResolutionError(RuntimeError):
         super().__init__(f"comparison target resolution failed: {reason_code}")
 
 
+class ComparisonPlanningError(RuntimeError):
+    """Resolved comparison candidates could not be materialized into a safe plan."""
+
+    def __init__(
+        self,
+        reason_code: str,
+        *,
+        attempts: tuple[PlannerAttemptAudit, ...] = (),
+    ) -> None:
+        self.reason_code = reason_code
+        self.attempts = attempts
+        super().__init__(f"comparison planning failed: {reason_code}")
+
+
 class ComparisonTargetResolver(Protocol):
     async def resolve(self, question: str) -> Mapping[str, str]: ...
 
@@ -60,15 +74,15 @@ class ComparisonQueryResolver(Protocol):
 _PLANNER_FAILURE_FRAGMENTS: tuple[tuple[str, str], ...] = (
     ("planned research requires a comparison plan", "planner_task_type_invalid"),
     ("task_type", "planner_task_type_invalid"),
-    ("requires at least two targets", "planner_target_count_invalid"),
-    ("targets must use distinct corpus ids", "planner_target_duplicate"),
-    ("target ids must be unique", "planner_target_duplicate"),
-    ("left the resolved candidate set", "planner_target_outside_candidate_set"),
-    ("requires at least one dimension", "planner_dimension_invalid"),
-    ("requires valid dimensions", "planner_dimension_invalid"),
-    ("requires unique dimensions", "planner_dimension_invalid"),
-    ("requirements must form a complete target-dimension grid", "planner_grid_incomplete"),
-    ("requirement references an unknown target or dimension", "planner_requirement_reference_invalid"),
+    ("requires at least two targets", "planner_target_selection_invalid"),
+    ("targets must use distinct corpus ids", "planner_target_selection_invalid"),
+    ("target ids must be unique", "planner_target_selection_invalid"),
+    ("left the resolved candidate set", "planner_target_selection_invalid"),
+    ("requires at least one dimension", "local_dimension_skeleton_invalid"),
+    ("requires valid dimensions", "local_dimension_skeleton_invalid"),
+    ("requires unique dimensions", "local_dimension_skeleton_invalid"),
+    ("requirements must form a complete target-dimension grid", "planner_fact_proposal_invalid"),
+    ("requirement references an unknown target or dimension", "planner_fact_dimension_reference_invalid"),
     ("step fact does not belong to its cell", "planner_requirement_reference_invalid"),
     ("steps require one target and one dimension", "planner_step_scope_invalid"),
     ("step corpus scope does not match its target", "planner_step_scope_invalid"),
@@ -95,6 +109,18 @@ _PLANNER_REPAIR_INSTRUCTIONS: dict[str, str] = {
     ),
     "planner_target_outside_candidate_set": (
         "Use corpus IDs only from LOCAL_CORPUS_CATALOG_JSON."
+    ),
+    "planner_target_selection_invalid": (
+        "Return two to four unique corpus IDs only from LOCAL_CORPUS_CATALOG_JSON."
+    ),
+    "local_dimension_skeleton_invalid": (
+        "Return facts for every fixed dimension index supplied by local code."
+    ),
+    "planner_fact_dimension_reference_invalid": (
+        "Use only zero-based dimension indexes from EXPLICIT_DIMENSION_HINTS_JSON."
+    ),
+    "planner_fact_proposal_invalid": (
+        "Return at least one valid atomic fact intent for every fixed dimension index."
     ),
     "planner_dimension_invalid": (
         "Return one or more unique dimensions explicitly requested by the question."
@@ -135,12 +161,20 @@ def _planner_failure_code(error: ValueError) -> str:
                 "too_short",
                 "too_long",
             }:
-                return "planner_target_count_invalid"
+                return "planner_target_selection_invalid"
             if location in {("dimensions",), ("dimension_labels",)} and error_type in {
                 "too_short",
                 "too_long",
             }:
-                return "planner_dimension_invalid"
+                return "local_dimension_skeleton_invalid"
+            if location and location[0] == "selected_corpus_ids":
+                return "planner_target_selection_invalid"
+            if location and location[0] == "dimension_labels":
+                return "local_dimension_skeleton_invalid"
+            if location and location[0] == "facts":
+                if "dimension_index" in location:
+                    return "planner_fact_dimension_reference_invalid"
+                return "planner_fact_proposal_invalid"
     else:
         diagnostics.append(str(error))
     normalized = " ".join(diagnostics).casefold()
@@ -570,7 +604,7 @@ class LangChainResearchPlanner:
                     ]
 
         if planning_required:
-            raise ComparisonTargetResolutionError(
+            raise ComparisonPlanningError(
                 failure_reason,
                 attempts=tuple(attempt_audits),
             )

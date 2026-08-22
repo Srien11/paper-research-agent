@@ -22,7 +22,10 @@ from paper_research_agent.agent.models import (
     ResearchTarget,
     SearchCorpusResult,
 )
-from paper_research_agent.agent.planner import ComparisonTargetResolutionError
+from paper_research_agent.agent.planner import (
+    ComparisonPlanningError,
+    ComparisonTargetResolutionError,
+)
 from paper_research_agent.retrieval.contracts import (
     BilingualRetrievalRun,
     QueryRewriteTrace,
@@ -177,18 +180,18 @@ def test_diagnostic_copies_planner_attempts_from_success_and_failure() -> None:
         elapsed_ms=1.0,
         error=None,
     )
-    failure_error = ComparisonTargetResolutionError(
-        "planner_grid_incomplete",
+    failure_error = ComparisonPlanningError(
+        "planner_fact_proposal_invalid",
         attempts=(
             PlannerAttemptAudit(
                 attempt=1,
                 outcome="contract_invalid",
-                failure_code="planner_grid_incomplete",
+                failure_code="planner_fact_proposal_invalid",
             ),
             PlannerAttemptAudit(
                 attempt=2,
                 outcome="contract_invalid",
-                failure_code="planner_grid_incomplete",
+                failure_code="planner_fact_proposal_invalid",
             ),
         ),
     )
@@ -208,10 +211,25 @@ def test_diagnostic_copies_planner_attempts_from_success_and_failure() -> None:
         "validated",
     ]
     assert [item.failure_code for item in failure.planner_attempts] == [
-        "planner_grid_incomplete",
-        "planner_grid_incomplete",
+        "planner_fact_proposal_invalid",
+        "planner_fact_proposal_invalid",
     ]
-    assert "private question body" not in str(failure.planner_attempts)
+    serialized = failure.model_dump(mode="json")
+    assert serialized["error_reason_code"] == "planner_fact_proposal_invalid"
+    for forbidden in ("private question body", "model-authored fact", "raw query"):
+        assert forbidden not in str(serialized)
+
+    target_failure = _diagnostic(
+        question,
+        query_call=None,
+        candidate_call=None,
+        research=None,
+        answer=None,
+        generation=None,
+        elapsed_ms=1.0,
+        error=ComparisonTargetResolutionError("unknown_explicit_corpus_id"),
+    )
+    assert target_failure.error_reason_code == "unknown_explicit_corpus_id"
 
 
 def _hit(
