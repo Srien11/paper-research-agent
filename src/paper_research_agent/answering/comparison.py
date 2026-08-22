@@ -2,32 +2,23 @@
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from collections.abc import Mapping
 from typing import Protocol
 
-from pydantic import ValidationError
-
 from paper_research_agent.agent.models import EvidenceAssessment, ResearchPlan
-from paper_research_agent.answering.dashscope import (
-    AnswerGenerationError,
-    AsyncAnswerGenerator,
-)
+from paper_research_agent.answering.dashscope import AsyncAnswerGenerator
 from paper_research_agent.answering.models import (
     AnswerCitation,
     AnswerClaim,
-    AnswerRequest,
     ComparisonAnswerRequest,
     ComparisonDimension,
     ComparisonFact,
     ComparisonTarget,
-    GenerationResult,
-    ProviderAnswer,
     RAGAnswer,
 )
 from paper_research_agent.answering.validation import AnswerValidationError
-from paper_research_agent.context.models import AssembledContext, CitationRef, PromptMessage
+from paper_research_agent.context.models import AssembledContext, CitationRef
 
 
 class ComparisonAnswerAudit(Protocol):
@@ -121,55 +112,19 @@ async def answer_comparison(
     audit: ComparisonAnswerAudit | None = None,
     max_dimension_attempts: int = 2,
 ) -> RAGAnswer:
-    """Generate one structured draft per dimension, then deterministically render facts."""
+    """Render the trusted comparison ledger without making a Provider call."""
     if max_dimension_attempts <= 0 or max_dimension_attempts > 2:
         raise ValueError("max_dimension_attempts must be between 1 and 2")
-    facts_by_dimension = {
+    ordered_fact_ids = {
         dimension.dimension_id: tuple(
-            item for item in request.facts if item.dimension_id == dimension.dimension_id
+            fact.fact_id
+            for target in request.targets
+            for fact in request.facts
+            if fact.dimension_id == dimension.dimension_id
+            and fact.target_id == target.target_id
         )
         for dimension in request.dimensions
     }
-    ordered_fact_ids: dict[str, tuple[str, ...]] = {}
-    totals = {"input_tokens": 0, "output_tokens": 0, "latency_ms": 0.0, "attempts": 0}
-    actual_model: str | None = None
-    for dimension in request.dimensions:
-        facts = facts_by_dimension[dimension.dimension_id]
-        if not facts:
-            ordered_fact_ids[dimension.dimension_id] = ()
-            continue
-        last_error = "invalid dimension draft"
-        for attempt in range(max_dimension_attempts):
-            generation_request = _dimension_request(
-                request,
-                dimension,
-                facts,
-                repair_error=last_error if attempt else None,
-            )
-            try:
-                generation = await generator.generate(generation_request)
-            except AnswerGenerationError as exc:
-                _accumulate_generation_error(totals, exc)
-                ordered_fact_ids[dimension.dimension_id] = tuple(
-                    item.fact_id for item in facts
-                )
-                break
-            _accumulate_generation(totals, generation)
-            actual_model = generation.actual_model
-            try:
-                draft = ProviderAnswer.model_validate_json(generation.content)
-                ordered_fact_ids[dimension.dimension_id] = _validate_dimension_draft(
-                    draft,
-                    dimension=dimension,
-                    facts=facts,
-                )
-                break
-            except (ValidationError, AnswerValidationError) as exc:
-                last_error = str(exc)
-        else:
-            ordered_fact_ids[dimension.dimension_id] = tuple(
-                item.fact_id for item in facts
-            )
 
     claims = _render_claims(request, ordered_fact_ids)
     citations_by_id = {item.citation_id: item for item in request.context.citations}
@@ -186,91 +141,16 @@ async def answer_comparison(
         claims=claims,
         citations=citations,
         requested_model=generator.model_id,
-        actual_model=actual_model or generator.model_id,
-        prompt_version=generator.prompt_version,
-        input_tokens=int(totals["input_tokens"]),
-        output_tokens=int(totals["output_tokens"]),
-        latency_ms=float(totals["latency_ms"]),
-        attempts=int(totals["attempts"]),
+        actual_model=None,
+        prompt_version="comparison-ledger-render-v2",
+        input_tokens=0,
+        output_tokens=0,
+        latency_ms=0,
+        attempts=0,
     )
     if set(used_citations) - set(citations_by_id):
         raise AnswerValidationError("comparison renderer produced an unknown citation")
     return _best_effort_audit(result, audit)
-
-
-def _dimension_request(
-    request: ComparisonAnswerRequest,
-    dimension: ComparisonDimension,
-    facts: tuple[ComparisonFact, ...],
-    *,
-    repair_error: str | None,
-) -> AnswerRequest:
-    target_by_id = {item.target_id: item for item in request.targets}
-    payload = {
-        "kind": "trusted_compiled_dimension_ledger",
-        "question": request.question,
-        "dimension": dimension.model_dump(mode="json"),
-        "facts": [
-            {
-                **item.model_dump(mode="json"),
-                "target_label": target_by_id[item.target_id].label,
-            }
-            for item in facts
-        ],
-        "repair_error": repair_error,
-    }
-    system = PromptMessage(
-        role="system",
-        content=(
-            "Return one JSON ProviderAnswer for this comparison dimension. Use status answered. "
-            "Every claim must include one or more supplied fact_ids and only citation_ids attached "
-            "to those facts. Use every supplied fact_id exactly once. Do not add facts. Claim text "
-            "is only an organizational draft; the trusted renderer will use ledger statements."
-        ),
-    )
-    user = PromptMessage(
-        role="user",
-        content=json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-    )
-    context = AssembledContext(
-        messages=(system, user),
-        citations=request.context.citations,
-        estimated_tokens=request.context.estimated_tokens,
-        token_budget=request.context.token_budget,
-        output_reserve_tokens=request.context.output_reserve_tokens,
-        omitted_evidence_count=request.context.omitted_evidence_count,
-        evidence_insufficient=False,
-    )
-    return AnswerRequest(context=context)
-
-
-def _validate_dimension_draft(
-    draft: ProviderAnswer,
-    *,
-    dimension: ComparisonDimension,
-    facts: tuple[ComparisonFact, ...],
-) -> tuple[str, ...]:
-    if draft.status != "answered":
-        raise AnswerValidationError("comparison dimension draft cannot be insufficient")
-    fact_by_id = {item.fact_id: item for item in facts}
-    ordered = tuple(fact_id for claim in draft.claims for fact_id in claim.fact_ids)
-    if set(ordered) != set(fact_by_id) or len(ordered) != len(fact_by_id):
-        raise AnswerValidationError(
-            f"comparison dimension {dimension.dimension_id} must use every fact exactly once"
-        )
-    for claim in draft.claims:
-        if not claim.fact_ids:
-            raise AnswerValidationError("comparison claim requires fact IDs")
-        allowed = {
-            citation_id
-            for fact_id in claim.fact_ids
-            for citation_id in fact_by_id[fact_id].citation_ids
-        }
-        if not set(claim.citation_ids) <= allowed:
-            raise AnswerValidationError("comparison claim citation is outside its facts")
-        if any(not set(fact_by_id[fact_id].citation_ids) <= set(claim.citation_ids) for fact_id in claim.fact_ids):
-            raise AnswerValidationError("comparison claim omitted a fact citation")
-    return ordered
 
 
 def _render_claims(
@@ -333,22 +213,6 @@ def _answer_citation(value: CitationRef) -> AnswerCitation:
         evidence_type=value.evidence_type,
         storage_class=value.storage_class,
     )
-
-
-def _accumulate_generation(totals: dict[str, float | int], value: GenerationResult) -> None:
-    totals["input_tokens"] += value.input_tokens
-    totals["output_tokens"] += value.output_tokens
-    totals["latency_ms"] += value.latency_ms
-    totals["attempts"] += value.attempts
-
-
-def _accumulate_generation_error(
-    totals: dict[str, float | int],
-    error: AnswerGenerationError,
-) -> None:
-    totals["input_tokens"] += error.input_tokens
-    totals["output_tokens"] += error.output_tokens
-    totals["attempts"] += error.attempts
 
 
 def _best_effort_audit(

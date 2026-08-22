@@ -880,6 +880,10 @@ class RAGRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn(first.text, prompt)
         self.assertNotIn(second.text, prompt)
+        self.assertEqual(generator.calls, 0)
+        self.assertIsNone(result.answer.actual_model)
+        self.assertEqual(result.answer.attempts, 0)
+        self.assertEqual(result.answer.latency_ms, 0)
         self.assertIn("Paper A uses a verified method", result.answer.answer_markdown)
         self.assertEqual(
             result.comparison.expressed_fact_ids,

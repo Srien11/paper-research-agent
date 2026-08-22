@@ -1,20 +1,17 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import unittest
 
 from paper_research_agent.answering.comparison import (
     answer_comparison,
     compiler_failed_comparison_answer,
 )
-from paper_research_agent.answering.dashscope import AnswerGenerationError
 from paper_research_agent.answering.models import (
     ComparisonAnswerRequest,
     ComparisonDimension,
     ComparisonFact,
     ComparisonTarget,
-    GenerationResult,
 )
 from paper_research_agent.context.models import AssembledContext, CitationRef, PromptMessage
 
@@ -77,51 +74,76 @@ def _request() -> ComparisonAnswerRequest:
     )
 
 
-class FakeGenerator:
-    model_id = "qwen-test"
-    prompt_version = "comparison-v1"
-
-    def __init__(self, payloads: tuple[dict[str, object], ...]):
-        self.payloads = payloads
-        self.calls = 0
-
-    async def generate(self, request) -> GenerationResult:
-        del request
-        payload = self.payloads[min(self.calls, len(self.payloads) - 1)]
-        self.calls += 1
-        return GenerationResult(
-            content=json.dumps(payload, ensure_ascii=False),
-            requested_model=self.model_id,
-            actual_model=self.model_id,
-            prompt_version=self.prompt_version,
-            input_tokens=10,
-            output_tokens=5,
-            latency_ms=1,
-            attempts=1,
-        )
-
-
-class FailingGenerator:
+class ForbiddenGenerator:
     model_id = "qwen-test"
     prompt_version = "comparison-v1"
 
     def __init__(self):
         self.calls = 0
 
-    async def generate(self, request) -> GenerationResult:
+    async def generate(self, request):
         del request
         self.calls += 1
-        raise AnswerGenerationError(
-            "answer generation returned an invalid response",
-            attempts=2,
-            input_tokens=20,
-            output_tokens=10,
-        )
+        raise AssertionError("comparison renderer must not call Provider")
+
+
+def _multi_dimension_request() -> ComparisonAnswerRequest:
+    return ComparisonAnswerRequest(
+        question="比较 A 与 B",
+        context=_context(),
+        targets=_request().targets,
+        dimensions=(
+            ComparisonDimension(dimension_id="method", label="方法"),
+            ComparisonDimension(dimension_id="dataset", label="数据集"),
+        ),
+        facts=(
+            ComparisonFact(
+                fact_id="b-dataset-f1",
+                requirement_id="b-dataset",
+                target_id="b",
+                dimension_id="dataset",
+                statement="B 数据集事实。",
+                citation_ids=("E2",),
+            ),
+            ComparisonFact(
+                fact_id="a-method-f2",
+                requirement_id="a-method",
+                target_id="a",
+                dimension_id="method",
+                statement="A 方法事实二。",
+                citation_ids=("E1",),
+            ),
+            ComparisonFact(
+                fact_id="a-method-f1",
+                requirement_id="a-method",
+                target_id="a",
+                dimension_id="method",
+                statement="A 方法事实一。",
+                citation_ids=("E1",),
+            ),
+            ComparisonFact(
+                fact_id="b-method-f1",
+                requirement_id="b-method",
+                target_id="b",
+                dimension_id="method",
+                statement="B 方法事实。",
+                citation_ids=("E2",),
+            ),
+            ComparisonFact(
+                fact_id="a-dataset-f1",
+                requirement_id="a-dataset",
+                target_id="a",
+                dimension_id="dataset",
+                statement="A 数据集事实。",
+                citation_ids=("E1",),
+            ),
+        ),
+    )
 
 
 class ComparisonAnswerTests(unittest.IsolatedAsyncioTestCase):
     def test_compiler_failure_is_not_reported_as_insufficient_evidence(self) -> None:
-        generator = FakeGenerator(({},))
+        generator = ForbiddenGenerator()
 
         result = compiler_failed_comparison_answer(generator)
 
@@ -132,33 +154,13 @@ class ComparisonAnswerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(generator.calls, 0)
 
     async def test_renders_every_ledger_fact_and_trusted_citation(self) -> None:
-        generator = FakeGenerator(
-            (
-                {
-                    "status": "answered",
-                    "claims": [
-                        {
-                            "text": "draft A",
-                            "citation_ids": ["E1"],
-                            "fact_ids": ["a-method-f1"],
-                        },
-                        {
-                            "text": "draft B",
-                            "citation_ids": ["E2"],
-                            "fact_ids": ["b-method-f1"],
-                        },
-                    ],
-                    "insufficient_reason": None,
-                },
-            )
-        )
+        generator = ForbiddenGenerator()
 
         result = await answer_comparison(_request(), generator)
 
-        self.assertEqual(generator.calls, 1)
+        self.assertEqual(generator.calls, 0)
         self.assertIn("使用方法 A。[E1]", result.answer_markdown)
         self.assertIn("使用方法 B。[E2]", result.answer_markdown)
-        self.assertNotIn("draft A", result.answer_markdown)
         self.assertEqual(
             [claim.text for claim in result.claims],
             ["使用方法 A。", "使用方法 B。"],
@@ -167,51 +169,55 @@ class ComparisonAnswerTests(unittest.IsolatedAsyncioTestCase):
             {fact_id for claim in result.claims for fact_id in claim.fact_ids},
             {"a-method-f1", "b-method-f1"},
         )
+        self.assertIsNone(result.actual_model)
+        self.assertEqual(result.prompt_version, "comparison-ledger-render-v2")
+        self.assertEqual(result.input_tokens, 0)
+        self.assertEqual(result.output_tokens, 0)
+        self.assertEqual(result.latency_ms, 0)
+        self.assertEqual(result.attempts, 0)
 
-    async def test_repairs_only_the_invalid_dimension_draft_once(self) -> None:
-        invalid = {
-            "status": "answered",
-            "claims": [
-                {
-                    "text": "incomplete",
-                    "citation_ids": ["E1"],
-                    "fact_ids": ["a-method-f1"],
-                }
-            ],
-            "insufficient_reason": None,
+    async def test_rendering_is_stable_and_orders_dimensions_targets_then_facts(self) -> None:
+        generator = ForbiddenGenerator()
+        results = [
+            await answer_comparison(_multi_dimension_request(), generator)
+            for _ in range(20)
+        ]
+
+        hashes = {
+            hashlib.sha256(item.answer_markdown.encode("utf-8")).hexdigest()
+            for item in results
         }
-        valid = {
-            "status": "answered",
-            "claims": [
-                {
-                    "text": "complete",
-                    "citation_ids": ["E1", "E2"],
-                    "fact_ids": ["a-method-f1", "b-method-f1"],
-                }
-            ],
-            "insufficient_reason": None,
-        }
-        generator = FakeGenerator((invalid, valid))
-
-        result = await answer_comparison(_request(), generator)
-
-        self.assertEqual(generator.calls, 2)
-        self.assertEqual(len(result.claims), 2)
-        self.assertEqual(result.attempts, 2)
-
-    async def test_provider_failure_repairs_dimension_from_trusted_ledger(self) -> None:
-        generator = FailingGenerator()
-
-        result = await answer_comparison(_request(), generator)
-
-        self.assertEqual(generator.calls, 1)
-        self.assertEqual(len(result.claims), 2)
-        self.assertEqual(result.attempts, 2)
-        self.assertEqual(result.input_tokens, 20)
+        self.assertEqual(len(hashes), 1)
+        self.assertEqual(generator.calls, 0)
         self.assertEqual(
-            {fact_id for claim in result.claims for fact_id in claim.fact_ids},
-            {"a-method-f1", "b-method-f1"},
+            [claim.fact_ids[0] for claim in results[0].claims],
+            [
+                "a-method-f2",
+                "a-method-f1",
+                "b-method-f1",
+                "a-dataset-f1",
+                "b-dataset-f1",
+            ],
         )
+        self.assertTrue(all(len(claim.fact_ids) == 1 for claim in results[0].claims))
+        self.assertEqual(
+            [claim.citation_ids for claim in results[0].claims],
+            [("E1",), ("E1",), ("E2",), ("E1",), ("E2",)],
+        )
+
+    async def test_empty_dimension_cells_are_explicit_without_fabricated_claims(self) -> None:
+        request = _request().model_copy(
+            update={
+                "dimensions": (
+                    *_request().dimensions,
+                    ComparisonDimension(dimension_id="dataset", label="数据集"),
+                )
+            }
+        )
+        result = await answer_comparison(request, ForbiddenGenerator())
+
+        self.assertEqual(result.answer_markdown.count("暂无可靠事实。"), 2)
+        self.assertEqual(len(result.claims), 2)
 
 
 if __name__ == "__main__":

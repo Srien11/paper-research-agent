@@ -230,8 +230,10 @@ class RAGAnswer(FrozenContract):
     @model_validator(mode="after")
     def validate_state(self) -> RAGAnswer:
         if self.status == "answered":
-            if not self.claims or not self.citations or self.actual_model is None:
-                raise ValueError("answered result requires claims, citations, and actual_model")
+            if not self.claims or not self.citations:
+                raise ValueError("answered result requires claims and citations")
+            if self.attempts > 0 and self.actual_model is None:
+                raise ValueError("provider-backed answer requires actual_model")
         elif self.claims or self.citations:
             raise ValueError("non-answer result cannot contain claims or citations")
         used = {identifier for claim in self.claims for identifier in claim.citation_ids}
