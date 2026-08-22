@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any, Literal, Protocol
@@ -96,6 +97,7 @@ class RAGRuntimeChildExecutor:
                 )
             except ValidationError:
                 continue
+        child_started = time.perf_counter()
         result = await self._runtime.ask(
             request.objective,
             session_id=_child_session_id("research", request),
@@ -104,6 +106,7 @@ class RAGRuntimeChildExecutor:
             ),
             long_term_memory=tuple(long_term_memory),
         )
+        child_elapsed_ms = (time.perf_counter() - child_started) * 1_000
         answer = RAGAnswer.model_validate(_value(result, "answer"))
         retrieval = _value(result, "retrieval")
         resolved_question = str(
@@ -122,7 +125,7 @@ class RAGRuntimeChildExecutor:
                 hit_count=len(tuple(_value(retrieval, "hits", ()))),
             ),
             metrics=ChildExecutionMetrics(
-                elapsed_ms=max(0, round(answer.latency_ms)),
+                elapsed_ms=max(0, round(child_elapsed_ms)),
                 input_tokens=answer.input_tokens,
                 output_tokens=answer.output_tokens,
                 total_tokens=answer.input_tokens + answer.output_tokens,

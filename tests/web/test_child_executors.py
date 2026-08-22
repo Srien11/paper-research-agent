@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -148,7 +149,38 @@ class _FakeRAGRuntime:
         )
 
 
+class _DelayedDeterministicRAGRuntime(_FakeRAGRuntime):
+    async def ask(self, question: str, **kwargs: object) -> object:
+        await asyncio.sleep(0.02)
+        result = await super().ask(question, **kwargs)
+        result.answer = result.answer.model_copy(
+            update={
+                "actual_model": None,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "latency_ms": 0,
+                "attempts": 0,
+            }
+        )
+        return result
+
+
 class ConversationChildExecutorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rag_child_elapsed_is_wall_time_not_answer_provider_time(self) -> None:
+        artifact = await RAGRuntimeChildExecutor(
+            _DelayedDeterministicRAGRuntime()
+        ).answer(
+            _request(
+                capability="local_rag",
+                rag_mode="required",
+                objective="测试确定性比较答案",
+            )
+        )
+
+        self.assertGreater(artifact.metrics.elapsed_ms, 0)
+        self.assertEqual(artifact.answer.latency_ms, 0)
+        self.assertEqual(artifact.answer.attempts, 0)
+
     async def test_local_rag_answer_completion_persists_safe_citations(self) -> None:
         store = InMemoryConversationStore()
         started = store.begin_agent_run(
