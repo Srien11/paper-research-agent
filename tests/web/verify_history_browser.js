@@ -106,10 +106,11 @@ async function main() {
       }));
     }, { requestId, conversationId });
     await page.goto(`${baseURL}/paper-research/`, { waitUntil: "networkidle" });
-    await page.locator(".run-node-turn-tail").waitFor();
+    await page.locator(".message-assistant .answer-copy").last().waitFor({ state: "visible" });
 
-    const answer = await page.locator(".run-answer-copy").innerText();
+    const answer = await page.locator(".message-assistant .answer-copy").last().innerText();
     if (answer !== "前半段与后半段 [E1]") throw new Error(`reconnected answer is incomplete: ${answer}`);
+    if (await page.locator("#messages details, #messages .run-node").count()) throw new Error("historical run cards were restored");
     await page.getByRole("button", { name: "查看引用 E1" }).click();
     if (!(await page.locator("#evidence-content").innerText()).includes("历史引用论文")) {
       throw new Error("historical citation metadata was not restored");

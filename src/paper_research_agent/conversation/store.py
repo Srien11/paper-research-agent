@@ -113,6 +113,10 @@ class ConversationStore(Protocol):
         self, turn_id: str, *, after_event_id: int = 0, limit: int = 2_000
     ) -> tuple[PersistedRunEvent, ...]: ...
 
+    def conversation_run_events(
+        self, conversation_id: str, *, limit: int = 10_000
+    ) -> tuple[PersistedRunEvent, ...]: ...
+
     def load_workspace(self, conversation_id: str) -> ConversationWorkspace: ...
 
     def load_agent_run(self, request_id: str) -> MainAgentResult | None: ...
@@ -472,6 +476,21 @@ class SQLiteConversationStore:
                    WHERE turn_id = ? AND event_id > ?
                    ORDER BY event_id LIMIT ?""",
                 (normalized, after, bounded),
+            ).fetchall()
+        return tuple(_persisted_run_event(row) for row in rows)
+
+    def conversation_run_events(
+        self, conversation_id: str, *, limit: int = 10_000
+    ) -> tuple[PersistedRunEvent, ...]:
+        normalized = _conversation_id(conversation_id)
+        _, bounded = _event_page(0, limit)
+        with self._lock, closing(self._connect()) as connection:
+            rows = connection.execute(
+                """SELECT run_id, event_id, request_id, conversation_id, turn_id,
+                          event_json, event_type, node_id, occurred_at, idempotency_key
+                   FROM main_agent_run_events WHERE conversation_id = ?
+                   ORDER BY occurred_at, run_id, event_id LIMIT ?""",
+                (normalized, bounded),
             ).fetchall()
         return tuple(_persisted_run_event(row) for row in rows)
 
@@ -938,7 +957,8 @@ class SQLiteConversationStore:
                 str(row[0])
                 for row in connection.execute(
                     "SELECT conversation_id FROM conversation_turns "
-                    "GROUP BY conversation_id ORDER BY MAX(created_at) DESC LIMIT ?",
+                    "GROUP BY conversation_id "
+                    "ORDER BY MAX(COALESCE(completed_at, created_at)) DESC LIMIT ?",
                     (limit,),
                 ).fetchall()
             )
@@ -971,6 +991,9 @@ class SQLiteConversationStore:
                 "(SELECT MAX(COALESCE(latest.completed_at, latest.created_at)) "
                 " FROM conversation_turns AS latest "
                 " WHERE latest.conversation_id = t.conversation_id) "
+                ", (SELECT latest.status FROM conversation_turns AS latest "
+                " WHERE latest.conversation_id = t.conversation_id "
+                " ORDER BY latest.sequence DESC LIMIT 1) "
                 "FROM conversation_turns AS t WHERE t.conversation_id = ? "
                 "ORDER BY t.sequence LIMIT 1",
                 (conversation_id,),
@@ -981,6 +1004,7 @@ class SQLiteConversationStore:
             return PersistedConversation(
                 conversation_id=conversation_id,
                 title=title,
+                status=str(summary[3]),
                 created_at=datetime.fromisoformat(str(summary[1])),
                 updated_at=datetime.fromisoformat(str(summary[2])),
                 messages=(),
@@ -1483,6 +1507,22 @@ class InMemoryConversationStore:
             )
             return tuple(sorted(values, key=lambda item: item.event_id))[:bounded]
 
+    def conversation_run_events(
+        self, conversation_id: str, *, limit: int = 10_000
+    ) -> tuple[PersistedRunEvent, ...]:
+        normalized = _conversation_id(conversation_id)
+        _, bounded = _event_page(0, limit)
+        with self._lock:
+            values = (
+                item
+                for events in self._run_events.values()
+                for item in events
+                if item.conversation_id == normalized
+            )
+            return tuple(
+                sorted(values, key=lambda item: (item.occurred_at, item.run_id, item.event_id))
+            )[:bounded]
+
     def load_workspace(self, conversation_id: str) -> ConversationWorkspace:
         normalized = _conversation_id(conversation_id)
         with self._lock:
@@ -1977,6 +2017,7 @@ def _persisted_dialogue(
     return PersistedConversation(
         conversation_id=conversation_id,
         title=title or "未命名对话",
+        status=str(rows[-1][1]) if rows else "completed",
         created_at=created_at,
         updated_at=updated_at,
         messages=tuple(messages),

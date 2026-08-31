@@ -40,7 +40,10 @@
           <span><strong>论文研究台</strong><small>Evidence-grounded RAG</small></span>
         </a>
         <div class="topbar-actions">
-          <button id="navigation-toggle" class="button button-quiet" type="button" aria-controls="library-panel" aria-expanded="true">会话</button>
+          <button id="chat-toggle" class="button button-quiet workspace-toggle" type="button">对话</button>
+          <button id="navigation-toggle" class="icon-button navigation-toggle" type="button" aria-label="打开会话导航" title="打开会话导航" aria-controls="library-panel" aria-expanded="true">☰</button>
+          <button id="knowledge-toggle" class="button button-quiet workspace-toggle" type="button">知识库</button>
+          <button id="trace-toggle" class="button button-quiet workspace-toggle" type="button">轨迹</button>
           <span class="stage-badge"><span class="status-dot" aria-hidden="true"></span>可视化测试</span>
           <button id="inspector-toggle" class="button button-quiet" type="button" aria-controls="inspector" aria-expanded="false">详情</button>
           <button id="new-conversation" class="button button-secondary" type="button">新对话</button>
@@ -110,25 +113,27 @@
                 <button id="tool-approval-accept" class="button button-primary" type="button">允许</button>
               </div>
             </section>
-            <label class="sr-only" for="question">研究问题</label>
-            <textarea id="question" name="question" rows="1" maxlength="2000" placeholder="输入研究问题…" required></textarea>
-            <div class="file-row">
+            <div class="input-row">
               <input id="file-input" type="file" accept=".txt,.md,.json,.csv,.pdf" hidden>
               <button id="file-button" class="file-button" type="button" aria-label="添加文件">＋</button>
-              <div id="file-list" class="file-list" aria-live="polite"></div>
+              <label class="sr-only" for="question">研究问题</label>
+              <textarea id="question" name="question" rows="1" maxlength="2000" placeholder="输入研究问题…" required></textarea>
+              <button id="ask-button" class="button button-primary send-button" type="submit" aria-label="发送消息">
+                <span class="button-label">↑</span>
+                <span class="spinner" aria-hidden="true"></span>
+              </button>
+            </div>
+            <div class="tool-row">
               <label class="tool-mode-toggle" aria-label="使用本地论文知识库">
                 <input id="tool-mode" type="checkbox">
-                <span>本地论文</span>
+                <span>使用本地论文知识库</span>
               </label>
               <label id="rag-required-option" class="tool-mode-toggle rag-required-option" aria-label="仅依据本地论文回答" hidden>
                 <input id="rag-required" type="checkbox">
-                <span>仅本地</span>
+                <span>仅依据本地论文回答</span>
               </label>
+              <div id="file-list" class="file-list" aria-live="polite"></div>
             </div>
-            <button id="ask-button" class="button button-primary" type="submit" aria-label="发送消息">
-              <span class="button-label">↑</span>
-              <span class="spinner" aria-hidden="true"></span>
-            </button>
           </form>
         </section>
 
@@ -182,6 +187,21 @@
           </div>
         </aside>
       </main>
+      <section id="knowledge-workspace" class="full-workspace" aria-labelledby="knowledge-title" hidden>
+        <header class="full-workspace-header">
+          <div><p class="eyebrow">IMMUTABLE KNOWLEDGE BASE</p><h1 id="knowledge-title">知识库</h1></div>
+          <div class="workspace-summary"><button class="workspace-chat-action" type="button" data-return-to-chat>返回对话</button><span>待入库资料需人工确认后才会发布</span><button id="knowledge-upload-button" class="button button-primary" type="button">添加 PDF</button><input id="knowledge-upload-input" type="file" accept="application/pdf,.pdf" hidden></div>
+        </header>
+        <div class="knowledge-grid">
+          <section class="knowledge-list-pane" aria-label="待入库与构建历史"><div class="section-heading"><h2>资料队列</h2><span id="knowledge-count">0</span></div><div id="knowledge-items" class="knowledge-items"></div></section>
+          <section class="knowledge-main-pane"><div id="knowledge-empty" class="workspace-empty"><h2>从 PDF 开始</h2><p>上传后它只会进入待入库区。补齐来源信息并确认后，才创建不可变增量构建。</p></div><form id="knowledge-detail-form" class="knowledge-detail" hidden><div class="knowledge-file-heading"><p class="eyebrow">SOURCE REVIEW</p><h2 id="knowledge-file-name"></h2><p id="knowledge-file-status" class="status-text"></p></div><label>论文标题<input id="knowledge-title-input" required maxlength="500"></label><label>作者（用逗号分隔）<input id="knowledge-authors-input" required maxlength="1000"></label><div class="knowledge-detail-row"><label>年份<input id="knowledge-year-input" type="number" min="1900" max="2100" required></label><label>公开页面或 DOI URL<input id="knowledge-url-input" type="url" required></label></div><label>存储边界<select id="knowledge-storage-input"><option value="internal_research_only">仅限本地研究</option><option value="redistributable">可再分发</option></select></label><dl id="knowledge-provenance" class="provenance-list"></dl><div class="knowledge-detail-actions"><button class="button button-secondary" type="submit">保存资料</button><button id="knowledge-publish-button" class="button button-primary" type="button">确认并入库</button></div></form></section>
+        </div>
+      </section>
+      <section id="trace-workspace" class="full-workspace" aria-labelledby="trace-title" hidden>
+        <header class="full-workspace-header"><div><p class="eyebrow">EXECUTION TRAJECTORY</p><h1 id="trace-title">执行轨迹</h1></div><div class="workspace-summary"><button class="workspace-chat-action" type="button" data-return-to-chat>返回对话</button><span id="trace-summary">当前会话</span><button id="trace-refresh" class="button button-quiet" type="button">刷新</button></div></header>
+        <div class="trace-toolbar" role="tablist" aria-label="轨迹视图"><button id="trace-list-tab" class="trace-tab is-active" type="button" role="tab" aria-selected="true">轨迹</button><button id="trace-waterfall-tab" class="trace-tab" type="button" role="tab" aria-selected="false">瀑布</button></div>
+        <div class="trace-layout"><section id="trace-list" class="trace-list" aria-label="执行节点"></section><section id="trace-waterfall" class="trace-waterfall" aria-label="执行时间瀑布" hidden></section><aside id="trace-detail" class="trace-detail"><p>选择一个节点以查看安全的执行详情。</p></aside></div>
+      </section>
       <div id="inspector-scrim" class="scrim" hidden></div>
       <div id="navigation-scrim" class="scrim navigation-scrim" hidden></div>
     </div>
@@ -209,6 +229,11 @@
         <p class="privacy-note">这里只显示当前有效记忆。修改或删除请在动态工具模式中明确提出，系统会再次请求审批。</p>
         <div id="memories-list" class="memories-list" aria-live="polite"></div>
       </div>
+    </dialog>
+
+    <dialog id="knowledge-intent-dialog" class="evidence-dialog" aria-labelledby="knowledge-intent-title">
+      <div class="dialog-header"><div><p class="eyebrow">KNOWLEDGE BASE</p><h2 id="knowledge-intent-title">将附件加入知识库？</h2></div><button id="knowledge-intent-close" class="icon-button" type="button" aria-label="关闭">×</button></div>
+      <div class="evidence-content"><p>该操作会先把 PDF 放入待入库区，不会立即写入知识库。你可在资料审核页补齐来源信息后再确认发布。</p><div class="approval-actions"><button id="knowledge-intent-cancel" class="button button-secondary" type="button">继续对话</button><button id="knowledge-intent-confirm" class="button button-primary" type="button">转入待入库区</button></div></div>
     </dialog>
 
     <div id="toast-region" class="toast-region" role="status" aria-live="polite" aria-atomic="true"></div>

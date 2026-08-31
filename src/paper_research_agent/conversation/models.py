@@ -93,6 +93,7 @@ class PersistedRunEvent(FrozenConversationModel):
 class PersistedConversation(FrozenConversationModel):
     conversation_id: str = Field(min_length=1, max_length=256)
     title: str = Field(min_length=1, max_length=200)
+    status: str = Field(default="completed", min_length=1, max_length=64)
     created_at: datetime
     updated_at: datetime
     messages: tuple[PersistedConversationMessage, ...] = Field(

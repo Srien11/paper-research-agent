@@ -52,6 +52,12 @@ async function installRoutes(page, diagnostics) {
     if (pathname.endsWith("/api/conversations") && request.method() === "GET") {
       return route.fulfill({ contentType: "application/json", body: JSON.stringify({ current_conversation_id: "conversation-browser", conversations: [] }) });
     }
+    if (pathname.endsWith("/api/knowledge-base/items") && request.method() === "GET") {
+      return route.fulfill({ contentType: "application/json", body: JSON.stringify({ items: [] }) });
+    }
+    if (pathname.endsWith("/api/conversations/conversation-browser/trace")) {
+      return route.fulfill({ contentType: "application/json", body: JSON.stringify({ conversation_id: "conversation-browser", events: [] }) });
+    }
     if (/\/api\/agent\/runs\/[^/]+\/plan$/.test(pathname)) {
       return route.fulfill({ contentType: "application/json", body: JSON.stringify({ objective: "浏览器验证", control: { status: "completed", revision: 0 }, tasks: [] }) });
     }
@@ -82,16 +88,28 @@ async function desktopChecks(browser, diagnostics) {
     throw new Error("inspector must be closed initially");
   }
   const composerHeight = (await page.locator("#ask-form").boundingBox()).height;
-  if (composerHeight > 76) throw new Error(`idle composer is too tall: ${composerHeight}`);
+  if (composerHeight > 104) throw new Error(`idle composer is too tall: ${composerHeight}`);
+  const layout = await page.evaluate(() => {
+    const form = document.querySelector("#ask-form").getBoundingClientRect();
+    const textarea = document.querySelector("#question").getBoundingClientRect();
+    const attach = document.querySelector("#file-button").getBoundingClientRect();
+    const send = document.querySelector("#ask-button").getBoundingClientRect();
+    return {
+      textareaCenter: textarea.left + textarea.width / 2,
+      composerCenter: form.left + form.width / 2,
+      attachCenterY: attach.top + attach.height / 2,
+      sendCenterY: send.top + send.height / 2,
+    };
+  });
+  if (Math.abs(layout.textareaCenter - layout.composerCenter) > 18) throw new Error(`textarea is not centered: ${JSON.stringify(layout)}`);
+  if (Math.abs(layout.attachCenterY - layout.sendCenterY) > 2) throw new Error(`composer controls are not aligned: ${JSON.stringify(layout)}`);
 
   await page.getByLabel("研究问题").fill("浏览器验证问题");
   await page.getByRole("button", { name: "发送消息" }).click();
-  await page.locator(".run-node-turn-tail").waitFor();
-  const toolNodes = page.locator('[data-node-id="tool:one:search:1"]');
-  if (await toolNodes.count() !== 1) throw new Error("tool node was not updated in place");
-  if (!(await toolNodes.first().getAttribute("class")).includes("is-completed")) {
-    throw new Error("tool node did not reach completed state");
-  }
+  await page.locator(".message-assistant .answer-copy").last().waitFor({ state: "visible" });
+  await page.waitForTimeout(240);
+  if (await page.locator("#messages details, #messages .run-node").count()) throw new Error("run cards leaked into compact transcript");
+  if (await page.locator(".progress-row").count()) throw new Error("completed progress strip was not removed");
   if (await page.evaluate(() => localStorage.getItem("paper-research.pending-request.v1")) !== null) {
     throw new Error("completed cursor was not cleared");
   }
@@ -104,6 +122,17 @@ async function desktopChecks(browser, diagnostics) {
     throw new Error("citation evidence metadata was not rendered");
   }
   await page.locator("#evidence-close").click();
+
+  const answerBeforeWorkspace = await page.locator("#messages").innerText();
+  await page.getByRole("button", { name: "知识库", exact: true }).click();
+  await page.locator("#knowledge-workspace").waitFor({ state: "visible" });
+  await page.getByRole("button", { name: "对话", exact: true }).click();
+  await page.locator("#main-content").waitFor({ state: "visible" });
+  if (!(await page.locator("#messages").innerText()).includes(answerBeforeWorkspace)) throw new Error("returning from knowledge cleared the chat");
+  await page.getByRole("button", { name: "轨迹", exact: true }).click();
+  await page.locator("#trace-workspace").waitFor({ state: "visible" });
+  await page.getByRole("button", { name: "返回对话", exact: true }).click();
+  await page.locator("#main-content").waitFor({ state: "visible" });
 
   const perf = await page.evaluate(() => {
     const transcript = document.createElement("div");
@@ -183,7 +212,7 @@ async function mobileChecks(browser, diagnostics) {
   if (!(await page.locator("#messages").isVisible()) || !(await page.locator("#ask-form").isVisible())) {
     throw new Error("mobile transcript or composer is not visible on first screen");
   }
-  const navigationToggle = page.getByRole("button", { name: "会话", exact: true });
+  const navigationToggle = page.getByRole("button", { name: "打开会话导航", exact: true });
   await navigationToggle.click();
   await page.locator("#library-panel.is-open").waitFor();
   await page.keyboard.press("Escape");

@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from paper_research_agent.agent.orchestrator.models import MainAgentResult
 from paper_research_agent.answering.models import RAGAnswer
+from paper_research_agent.conversation.store import InMemoryConversationStore
 from paper_research_agent.web.app import create_app
 from paper_research_agent.web.config import OwnerCredentials, WebConfig
 from paper_research_agent.web.models import RecommendedQuestion
@@ -149,6 +150,61 @@ class FakeRuntime:
 
     async def aclose(self) -> None:
         return None
+
+
+class ConversationListTests(unittest.TestCase):
+    def setUp(self) -> None:
+        config = WebConfig(
+            credentials=OwnerCredentials(username="owner", password="correct-password"),
+            session_secret=b"l" * 32,
+            allowed_origins=frozenset({ORIGIN}),
+            max_question_chars=100,
+        )
+        self.store = InMemoryConversationStore()
+        self.context = TestClient(
+            create_app(
+                config=config,
+                runtime=FakeRuntime(),
+                serve_static=False,
+                conversation_store=self.store,
+            ),
+            base_url=ORIGIN,
+        )
+        self.client = self.context.__enter__()
+
+    def tearDown(self) -> None:
+        self.context.__exit__(None, None, None)
+
+    def login(self) -> dict[str, object]:
+        response = self.client.post(
+            "/paper-research/api/login",
+            headers={"Origin": ORIGIN},
+            json={"username": "owner", "password": "correct-password"},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()
+
+    def test_pending_conversation_is_listed_and_details_are_owner_scoped(self) -> None:
+        session = self.login()
+        conversation_id = str(session["conversation_id"])
+        turn = self.store.begin_turn(conversation_id, "运行中的第一个问题")
+
+        listing = self.client.get("/paper-research/api/conversations")
+        self.assertEqual(listing.status_code, 200, listing.text)
+        item = next(
+            item for item in listing.json()["conversations"]
+            if item["conversation_id"] == conversation_id
+        )
+        self.assertEqual(item["title"], "运行中的第一个问题")
+        self.assertEqual(item["status"], "pending")
+
+        detail = self.client.get(f"/paper-research/api/conversations/{conversation_id}")
+        self.assertEqual(detail.status_code, 200, detail.text)
+        self.assertEqual(detail.json()["messages"][0]["turn_id"], turn.turn_id)
+
+        self.login()
+        other_session = self.client.get(f"/paper-research/api/conversations/{conversation_id}")
+        self.assertEqual(other_session.status_code, 409, other_session.text)
 
 
 class AppTests(unittest.TestCase):

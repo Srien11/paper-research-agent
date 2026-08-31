@@ -9,6 +9,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from paper_research_agent.agent.orchestrator.control import TaskEdit
 from paper_research_agent.agent.orchestrator.models import AcceptanceCriterion
 from paper_research_agent.answering.models import RAGAnswer, StorageClass
+from paper_research_agent.web.interventions import RunIntervention
+from paper_research_agent.web.knowledge import KnowledgeItem, KnowledgeItemPatch
 
 RAGMode = Literal["disabled", "preferred", "required"]
 
@@ -78,6 +80,54 @@ class AgentRunControlResponse(WebModel):
     ]
     revision: int = Field(ge=0)
     updated_at: str = Field(min_length=1, max_length=64)
+
+
+class KnowledgeIntentRequest(WebModel):
+    message: str = Field(min_length=1, max_length=10_000)
+    attachment_ids: tuple[str, ...] = Field(default=(), max_length=5)
+
+
+class KnowledgeIntentResponse(WebModel):
+    candidate: bool
+    reason: str | None = Field(default=None, max_length=300)
+
+
+class KnowledgeItemListResponse(WebModel):
+    items: tuple[KnowledgeItem, ...]
+
+
+class KnowledgeItemUpdateRequest(KnowledgeItemPatch):
+    pass
+
+
+class TraceEventResponse(WebModel):
+    event_id: int = Field(ge=1)
+    run_id: str = Field(min_length=1, max_length=256)
+    request_id: str = Field(min_length=16, max_length=128)
+    turn_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    type: str = Field(min_length=1, max_length=64)
+    occurred_at: str = Field(min_length=1, max_length=64)
+    node_id: str = Field(min_length=1, max_length=256)
+    parent_node_id: str | None = Field(default=None, max_length=256)
+    task_id: str | None = Field(default=None, max_length=64)
+    status: str | None = Field(default=None, max_length=64)
+    title: str | None = Field(default=None, max_length=200)
+    summary: str | None = Field(default=None, max_length=1_000)
+    duration_ms: int | None = Field(default=None, ge=0)
+    detail: dict[str, object] = Field(default_factory=dict)
+
+
+class ConversationTraceResponse(WebModel):
+    conversation_id: str = Field(min_length=1, max_length=256)
+    events: tuple[TraceEventResponse, ...] = Field(max_length=10_000)
+
+
+class RunInterventionRequest(WebModel):
+    message: str = Field(min_length=1, max_length=2_000)
+
+
+class RunInterventionListResponse(WebModel):
+    items: tuple[RunIntervention, ...]
 
 
 class AgentPlanEditRequest(WebModel):
@@ -159,6 +209,7 @@ class ConversationMessageResponse(WebModel):
 class ConversationArchiveItemResponse(WebModel):
     conversation_id: str = Field(min_length=1, max_length=256)
     title: str = Field(min_length=1, max_length=200)
+    status: str = Field(default="completed", min_length=1, max_length=64)
     created_at: str = Field(min_length=1, max_length=64)
     updated_at: str = Field(min_length=1, max_length=64)
     messages: tuple[ConversationMessageResponse, ...] = Field(max_length=1_000)

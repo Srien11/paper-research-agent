@@ -16,6 +16,12 @@ const API = Object.freeze({
   agentExplanation: (requestId, taskId) => `api/agent/runs/${encodeURIComponent(requestId)}/tasks/${encodeURIComponent(taskId)}/explanation`,
   files: "api/files",
   fileDownload: (attachmentId) => `api/files/${encodeURIComponent(attachmentId)}/download`,
+  knowledgeItems: "api/knowledge-base/items",
+  knowledgeItem: (itemId) => `api/knowledge-base/items/${encodeURIComponent(itemId)}`,
+  knowledgePublish: (itemId) => `api/knowledge-base/items/${encodeURIComponent(itemId)}/publish`,
+  knowledgeIntent: "api/knowledge-base/intent",
+  conversationTrace: (conversationId) => `api/conversations/${encodeURIComponent(conversationId)}/trace`,
+  interventions: (requestId) => `api/agent/runs/${encodeURIComponent(requestId)}/interventions`,
   memories: "api/memories",
 });
 
@@ -44,6 +50,13 @@ const state = {
   runViews: new Map(),
   inspectorReturnFocus: null,
   navigationReturnFocus: null,
+  workspace: "chat",
+  knowledgeItems: [],
+  selectedKnowledgeId: null,
+  pendingKnowledgeIntent: null,
+  ignoreKnowledgeIntentOnce: false,
+  traceEvents: [],
+  selectedTraceNode: null,
 };
 
 const elements = {
@@ -58,9 +71,41 @@ const elements = {
   memoriesButton: document.querySelector("#memories-button"),
   conversationHistory: document.querySelector("#conversation-history"),
   navigation: document.querySelector("#library-panel"),
+  chatToggle: document.querySelector("#chat-toggle"),
   navigationToggle: document.querySelector("#navigation-toggle"),
   navigationClose: document.querySelector("#navigation-close"),
   navigationScrim: document.querySelector("#navigation-scrim"),
+  workspace: document.querySelector("#main-content"),
+  knowledgeToggle: document.querySelector("#knowledge-toggle"),
+  traceToggle: document.querySelector("#trace-toggle"),
+  knowledgeWorkspace: document.querySelector("#knowledge-workspace"),
+  traceWorkspace: document.querySelector("#trace-workspace"),
+  knowledgeUploadButton: document.querySelector("#knowledge-upload-button"),
+  knowledgeUploadInput: document.querySelector("#knowledge-upload-input"),
+  knowledgeItems: document.querySelector("#knowledge-items"),
+  knowledgeCount: document.querySelector("#knowledge-count"),
+  knowledgeEmpty: document.querySelector("#knowledge-empty"),
+  knowledgeDetailForm: document.querySelector("#knowledge-detail-form"),
+  knowledgeFileName: document.querySelector("#knowledge-file-name"),
+  knowledgeFileStatus: document.querySelector("#knowledge-file-status"),
+  knowledgeTitleInput: document.querySelector("#knowledge-title-input"),
+  knowledgeAuthorsInput: document.querySelector("#knowledge-authors-input"),
+  knowledgeYearInput: document.querySelector("#knowledge-year-input"),
+  knowledgeUrlInput: document.querySelector("#knowledge-url-input"),
+  knowledgeStorageInput: document.querySelector("#knowledge-storage-input"),
+  knowledgeProvenance: document.querySelector("#knowledge-provenance"),
+  knowledgePublishButton: document.querySelector("#knowledge-publish-button"),
+  traceRefresh: document.querySelector("#trace-refresh"),
+  traceListTab: document.querySelector("#trace-list-tab"),
+  traceWaterfallTab: document.querySelector("#trace-waterfall-tab"),
+  traceList: document.querySelector("#trace-list"),
+  traceWaterfall: document.querySelector("#trace-waterfall"),
+  traceDetail: document.querySelector("#trace-detail"),
+  traceSummary: document.querySelector("#trace-summary"),
+  knowledgeIntentDialog: document.querySelector("#knowledge-intent-dialog"),
+  knowledgeIntentClose: document.querySelector("#knowledge-intent-close"),
+  knowledgeIntentCancel: document.querySelector("#knowledge-intent-cancel"),
+  knowledgeIntentConfirm: document.querySelector("#knowledge-intent-confirm"),
   askForm: document.querySelector("#ask-form"),
   question: document.querySelector("#question"),
   askButton: document.querySelector("#ask-button"),
@@ -294,7 +339,8 @@ function setBusy(busy) {
   state.busy = busy;
   elements.askButton.disabled = busy;
   elements.newConversation.disabled = busy;
-  elements.question.disabled = busy;
+  elements.question.disabled = false;
+  elements.question.placeholder = busy ? "向当前运行插入补充指令…" : "输入一个关于大模型评测、RAG 或检索研究的问题…";
   elements.toolMode.disabled = busy;
   elements.ragRequired.disabled = busy;
   elements.fileButton.disabled = busy;
@@ -306,10 +352,153 @@ function setBusy(busy) {
   }
 }
 
+function setWorkspace(name) {
+  const previous = state.workspace;
+  state.workspace = name;
+  elements.workspace.hidden = name !== "chat";
+  elements.knowledgeWorkspace.hidden = name !== "knowledge";
+  elements.traceWorkspace.hidden = name !== "trace";
+  elements.knowledgeToggle.classList.toggle("is-active", name === "knowledge");
+  elements.traceToggle.classList.toggle("is-active", name === "trace");
+  elements.chatToggle.classList.toggle("is-active", name === "chat");
+  if (name === "knowledge") refreshKnowledgeItems();
+  if (name === "trace") refreshTrace();
+  if (name === "chat" && previous !== "chat") {
+    closeNavigation();
+    elements.question.focus();
+  }
+}
+
+async function refreshKnowledgeItems() {
+  try {
+    const payload = await request(API.knowledgeItems, { method: "GET" });
+    state.knowledgeItems = Array.isArray(payload.items) ? payload.items : [];
+    renderKnowledgeItems();
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+function renderKnowledgeItems() {
+  elements.knowledgeItems.replaceChildren();
+  elements.knowledgeCount.textContent = String(state.knowledgeItems.length);
+  state.knowledgeItems.forEach((item) => {
+    const node = createElement("button", `knowledge-item${item.item_id === state.selectedKnowledgeId ? " is-selected" : ""}`);
+    node.type = "button";
+    node.append(
+      createElement("strong", "", item.title || item.filename),
+      createElement("small", "", `${knowledgeStatusLabel(item.status)} · ${item.corpus_id || "待分配 ID"}`),
+    );
+    node.addEventListener("click", () => { state.selectedKnowledgeId = item.item_id; renderKnowledgeItems(); renderKnowledgeDetail(item); });
+    elements.knowledgeItems.append(node);
+  });
+  const selected = state.knowledgeItems.find((item) => item.item_id === state.selectedKnowledgeId);
+  if (selected) renderKnowledgeDetail(selected);
+  else {
+    elements.knowledgeEmpty.hidden = false;
+    elements.knowledgeDetailForm.hidden = true;
+  }
+}
+
+function knowledgeStatusLabel(status) {
+  return ({ staged: "待补充", ready: "待确认", queued: "排队中", running: "处理中", published: "已发布", failed: "失败" })[status] || status;
+}
+
+function renderKnowledgeDetail(item) {
+  elements.knowledgeEmpty.hidden = true;
+  elements.knowledgeDetailForm.hidden = false;
+  elements.knowledgeFileName.textContent = item.filename;
+  elements.knowledgeFileStatus.textContent = item.error || knowledgeStatusLabel(item.status);
+  elements.knowledgeTitleInput.value = item.title || "";
+  elements.knowledgeAuthorsInput.value = Array.isArray(item.authors) ? item.authors.join(", ") : "";
+  elements.knowledgeYearInput.value = item.year || "";
+  elements.knowledgeUrlInput.value = item.official_url || "";
+  elements.knowledgeStorageInput.value = item.storage_class || "internal_research_only";
+  elements.knowledgePublishButton.disabled = item.status !== "ready" && item.status !== "failed";
+  elements.knowledgeProvenance.replaceChildren();
+  [["稳定 ID", item.corpus_id || "保存资料后生成"], ["SHA-256", item.sha256], ["构建", item.build_id || "尚未发布"], ["置信度", "OCR 内容将标为低置信度"]].forEach(([key, value]) => {
+    const row = document.createElement("div"); row.append(createElement("dt", "", key), createElement("dd", "", value)); elements.knowledgeProvenance.append(row);
+  });
+}
+
+async function uploadKnowledgePdf(file) {
+  if (!file) return;
+  try {
+    const response = await fetch(`${API.knowledgeItems}?filename=${encodeURIComponent(file.name)}`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": file.type || "application/pdf" }, body: file });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.detail || "知识库 PDF 上传失败。");
+    state.selectedKnowledgeId = payload.item_id;
+    await refreshKnowledgeItems();
+  } catch (error) { showToast(error.message); }
+  finally { elements.knowledgeUploadInput.value = ""; }
+}
+
+async function saveKnowledgeDetail(event) {
+  event.preventDefault();
+  const item = state.knowledgeItems.find((value) => value.item_id === state.selectedKnowledgeId);
+  if (!item) return;
+  const authors = elements.knowledgeAuthorsInput.value.split(/[,，]/).map((value) => value.trim()).filter(Boolean);
+  try {
+    const payload = await request(API.knowledgeItem(item.item_id), { method: "PATCH", body: JSON.stringify({ title: elements.knowledgeTitleInput.value.trim(), authors, year: Number(elements.knowledgeYearInput.value), official_url: elements.knowledgeUrlInput.value.trim(), storage_class: elements.knowledgeStorageInput.value }) });
+    state.knowledgeItems = state.knowledgeItems.map((value) => value.item_id === payload.item_id ? payload : value);
+    renderKnowledgeItems(); showToast("资料已保存，确认后才会进入知识库。");
+  } catch (error) { showToast(error.message); }
+}
+
+async function publishSelectedKnowledge() {
+  const item = state.knowledgeItems.find((value) => value.item_id === state.selectedKnowledgeId);
+  if (!item || !window.confirm("确认创建不可变增量构建并在成功后发布知识库？")) return;
+  try {
+    const payload = await request(API.knowledgePublish(item.item_id), { method: "POST", body: "{}" });
+    state.knowledgeItems = state.knowledgeItems.map((value) => value.item_id === payload.item_id ? payload : value);
+    renderKnowledgeItems(); showToast("已排队。索引完成前不会切换当前知识库。");
+  } catch (error) { showToast(error.message); }
+}
+
+async function refreshTrace() {
+  if (!state.currentConversationId) return;
+  try {
+    const payload = await request(API.conversationTrace(state.currentConversationId), { method: "GET" });
+    state.traceEvents = Array.isArray(payload.events) ? payload.events : [];
+    elements.traceSummary.textContent = `${state.traceEvents.length} 个安全事件`;
+    renderTrace();
+  } catch (error) { showToast(error.message); }
+}
+
+function renderTrace() {
+  elements.traceList.replaceChildren(); elements.traceWaterfall.replaceChildren();
+  const starts = new Map();
+  state.traceEvents.forEach((event) => { if (!starts.has(event.node_id)) starts.set(event.node_id, new Date(event.occurred_at).getTime()); });
+  state.traceEvents.forEach((event) => {
+    const indent = event.parent_node_id ? " trace-node-child" : "";
+    const row = createElement("button", `trace-node${indent}${event.node_id === state.selectedTraceNode ? " is-selected" : ""}`);
+    row.type = "button";
+    const own = Number.isFinite(event.duration_ms) ? `${(event.duration_ms / 1000).toFixed(2)}s` : "—";
+    row.append(createElement("span", `trace-status trace-status-${event.status || "pending"}`), createElement("strong", "", event.title || event.type), createElement("small", "", event.summary || event.type), createElement("time", "", own));
+    row.addEventListener("click", () => { state.selectedTraceNode = event.node_id; renderTrace(); renderTraceDetail(event); });
+    elements.traceList.append(row);
+    const base = Math.min(...[...starts.values()]); const point = new Date(event.occurred_at).getTime(); const offset = Math.max(0, point - base);
+    const bar = createElement("button", "waterfall-row"); bar.type = "button";
+    const span = createElement("span", "waterfall-span", event.title || event.type); span.style.marginLeft = `${Math.min(70, offset / 120)}%`; span.style.width = `${Math.max(6, Math.min(80, (event.duration_ms || 500) / 120))}%`;
+    bar.append(createElement("small", "", event.task_id || event.node_id), span); bar.addEventListener("click", () => { state.selectedTraceNode = event.node_id; renderTrace(); renderTraceDetail(event); }); elements.traceWaterfall.append(bar);
+  });
+  if (!state.traceEvents.length) elements.traceList.append(createElement("p", "workspace-empty", "此会话尚无可回放的运行事件。"));
+}
+
+function renderTraceDetail(event) {
+  elements.traceDetail.replaceChildren(createElement("h2", "", event.title || event.type));
+  const details = [["节点", event.node_id], ["状态", event.status || "—"], ["时间", new Date(event.occurred_at).toLocaleString()], ["摘要", event.summary || "—"]];
+  Object.entries(event.detail || {}).forEach(([key, value]) => details.push([key, Array.isArray(value) ? `${value.length} 项` : String(value)]));
+  const list = document.createElement("dl"); details.forEach(([key, value]) => { const row = document.createElement("div"); row.append(createElement("dt", "", key), createElement("dd", "", value)); list.append(row); }); elements.traceDetail.append(list);
+}
+
 async function handleAsk(event) {
   event.preventDefault();
-  if (state.busy) return;
   const question = elements.question.value.trim();
+  if (state.busy) {
+    await queueRunIntervention(question);
+    return;
+  }
   if (!question) {
     showNotice("请输入一个研究问题。", "error");
     elements.question.focus();
@@ -325,6 +514,19 @@ async function handleAsk(event) {
     showNotice("上一条请求仍在运行或等待处理，请先继续接收该运行。", "warning");
     return;
   }
+  if (!state.ignoreKnowledgeIntentOnce && state.attachments.length) {
+    try {
+      const intent = await request(API.knowledgeIntent, { method: "POST", body: JSON.stringify({ message: question, attachment_ids: state.attachments.map((item) => item.attachment_id) }) });
+      if (intent.candidate) {
+        state.pendingKnowledgeIntent = { question };
+        elements.knowledgeIntentDialog.showModal();
+        return;
+      }
+    } catch (_error) {
+      // Intent detection is advisory; a temporary error must not block conversation.
+    }
+  }
+  state.ignoreKnowledgeIntentOnce = false;
   hideNotice();
   if (state.viewingArchive) {
     resetWorkspace();
@@ -379,17 +581,62 @@ async function streamConversation(pendingRequest, sourceNote = "") {
   return consumeAgentStream(response, pendingRequest, sourceNote);
 }
 
+async function queueRunIntervention(message) {
+  const pending = loadPendingRequest();
+  if (!message || !pending?.requestId) {
+    showNotice("当前没有可插入指令的运行。", "warning");
+    return;
+  }
+  try {
+    await request(API.interventions(pending.requestId), { method: "POST", body: JSON.stringify({ message }) });
+    elements.question.value = "";
+    showNotice("补充指令已排队；当前节点结束后会安全暂停并允许修订计划。", "warning");
+  } catch (error) { showNotice(error.message, "error"); }
+}
+
+async function promotePendingAttachment() {
+  const attachment = state.attachments[0];
+  if (!attachment) return;
+  try {
+    const source = await fetch(API.fileDownload(attachment.attachment_id), { credentials: "same-origin" });
+    if (!source.ok) throw new Error("无法读取当前附件。");
+    const response = await fetch(`${API.knowledgeItems}?filename=${encodeURIComponent(attachment.filename)}`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": attachment.content_type || "application/pdf" }, body: await source.blob() });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.detail || "转入待入库区失败。");
+    await request(`${API.files}/${attachment.attachment_id}`, { method: "DELETE", body: "{}" });
+    state.attachments = [];
+    renderFiles();
+    state.selectedKnowledgeId = payload.item_id;
+    elements.knowledgeIntentDialog.close();
+    setWorkspace("knowledge");
+    showToast("已转入待入库区；补齐来源信息后才能发布。");
+  } catch (error) { showToast(error.message); }
+}
+
+function cancelKnowledgeIntent() {
+  elements.knowledgeIntentDialog.close();
+  state.ignoreKnowledgeIntentOnce = true;
+  state.pendingKnowledgeIntent = null;
+  elements.askForm.requestSubmit();
+}
+
 function runNodeKind(type) {
-  if (type.startsWith("reasoning_")) return "reasoning";
+  if (type.startsWith("reasoning_")) return "execution";
   if (type === "plan_updated" || type === "goal_updated") return "plan";
   if (type.startsWith("tool_")) return "tool";
-  if (type === "retrieval_completed") return "retrieval";
+  if (type === "retrieval_completed") return "execution";
   if (type === "file_created") return "tool";
-  if (type.startsWith("task_")) return "task";
+  if (type.startsWith("task_")) return "execution";
   if (type.startsWith("answer_")) return "answer";
-  if (type.startsWith("interaction_")) return "interaction";
-  if (["run_completed", "run_failed", "run_cancelled", "run_conflict"].includes(type)) return "turn-tail";
-  return "lifecycle";
+  if (type.startsWith("interaction_")) return "execution";
+  if (["run_completed", "run_failed", "run_cancelled", "run_conflict", "run_paused", "run_waiting_approval", "run_waiting_user"].includes(type)) return "terminal";
+  return "execution";
+}
+
+function runNodeId(event, kind) {
+  if (kind === "plan") return "progress:plan";
+  if (kind === "execution" && event.task_id) return `progress:execution:${event.task_id}`;
+  return event.node_id || `${kind}:${event.type}:${event.event_id}`;
 }
 
 function reduceRunEvent(runState, event) {
@@ -397,10 +644,11 @@ function reduceRunEvent(runState, event) {
   if (eventId > 0 && eventId <= (runState.lastEventId || 0)) return runState;
   const nodes = { ...runState.nodes };
   const order = [...runState.order];
-  const nodeId = event.node_id || `${event.type}:${event.event_id}`;
+  const kind = runNodeKind(event.type || "");
+  const nodeId = runNodeId(event, kind);
   const previous = nodes[nodeId] || {
     nodeId,
-    kind: runNodeKind(event.type || ""),
+    kind,
     title: "运行状态",
     summary: "",
     status: "running",
@@ -410,7 +658,7 @@ function reduceRunEvent(runState, event) {
   if (!nodes[nodeId]) order.push(nodeId);
   nodes[nodeId] = {
     ...previous,
-    kind: runNodeKind(event.type || ""),
+    kind,
     eventType: event.type,
     title: event.title || previous.title,
     summary: event.summary || previous.summary,
@@ -443,7 +691,7 @@ function citationMap(values) {
 
 function renderRunNode(node) {
   if (node.kind === "answer") {
-    const answer = createElement("section", "run-node run-node-answer");
+    const answer = createElement("section", "run-answer-block");
     answer.dataset.nodeId = node.nodeId;
     answer.dataset.kind = node.kind;
     const copy = createElement("div", "run-answer-copy natural-answer");
@@ -456,58 +704,34 @@ function renderRunNode(node) {
     answer.append(copy);
     return answer;
   }
-  if (node.kind === "lifecycle") {
-    const lifecycle = createElement("div", `run-node run-node-lifecycle is-${node.status}`);
-    lifecycle.dataset.nodeId = node.nodeId;
-    lifecycle.dataset.kind = node.kind;
-    lifecycle.append(
+  if (node.kind === "terminal") {
+    const terminal = createElement("div", `terminal-status is-${node.status}`);
+    terminal.dataset.nodeId = node.nodeId;
+    terminal.dataset.kind = node.kind;
+    terminal.append(
       createElement("strong", "run-node-title", node.title || "运行状态"),
       createElement("span", "run-node-summary", node.summary || ""),
     );
-    return lifecycle;
+    return terminal;
   }
-  if (node.kind === "turn-tail") {
-    const tail = createElement("footer", `run-node run-node-turn-tail is-${node.status}`);
-    tail.dataset.nodeId = node.nodeId;
-    tail.dataset.kind = node.kind;
-    tail.append(
-      createElement("strong", "run-node-title", node.title || "本轮结束"),
-      createElement("span", "run-node-summary", node.summary || ""),
-    );
-    const detailsButton = createElement("button", "run-detail-button", "运行详情");
-    detailsButton.type = "button";
-    detailsButton.addEventListener("click", openInspector);
-    tail.append(detailsButton);
-    return tail;
-  }
-  const details = createElement("details", `run-node run-node-${node.kind} is-${node.status}`);
-  details.dataset.nodeId = node.nodeId;
-  details.dataset.kind = node.kind;
-  const shouldOpen = ["failed", "waiting_approval", "waiting_user"].includes(node.status);
-  details.open = shouldOpen;
-  details.setAttribute("aria-expanded", String(shouldOpen));
-  details.addEventListener("toggle", () => {
-    details.setAttribute("aria-expanded", String(details.open));
-  });
-  const summary = createElement("summary", "run-node-heading");
-  summary.append(
-    createElement("strong", "run-node-title", node.title || "运行步骤"),
-    createElement("span", "run-node-status", node.status || "running"),
+  const labels = { plan: "计划", execution: "执行", tool: "工具" };
+  const row = createElement("div", `progress-row progress-${node.kind} is-${node.status}`);
+  row.dataset.nodeId = node.nodeId;
+  row.dataset.kind = node.kind;
+  row.append(
+    createElement("span", "progress-label", labels[node.kind] || "执行"),
+    createElement("strong", "progress-title", node.title || "运行步骤"),
+    createElement("span", "progress-summary", node.summary || ""),
+    createElement("span", "progress-status", node.status || "running"),
   );
-  const body = createElement("div", "run-node-body");
-  body.append(createElement("p", "run-node-summary", node.summary || "暂无公开摘要"));
-  if (Number.isFinite(node.durationMs)) {
-    body.append(createElement("small", "run-node-duration", `${node.durationMs} ms`));
-  }
-  details.append(summary, body);
-  return details;
+  return row;
 }
 
 function renderRunEvent(runView, event) {
   const previousState = runView.state;
   runView.state = reduceRunEvent(runView.state, event);
   if (runView.state === previousState) return null;
-  const node = runView.state.nodes[event.node_id || `${event.type}:${event.event_id}`];
+  const node = runView.state.nodes[runNodeId(event, runNodeKind(event.type || ""))];
   const existing = runView.registry.get(node.nodeId);
   if (!existing) {
     const element = renderRunNode(node);
@@ -521,10 +745,14 @@ function renderRunEvent(runView, event) {
     runView.registry.set(node.nodeId, replacement);
     return replacement;
   }
-  existing.className = `run-node run-node-${node.kind} is-${node.status}`;
+  existing.className = node.kind === "terminal"
+    ? `terminal-status is-${node.status}`
+    : node.kind === "answer"
+      ? "run-answer-block"
+      : `progress-row progress-${node.kind} is-${node.status}`;
   const title = existing.querySelector(".run-node-title");
   const summary = existing.querySelector(".run-node-summary");
-  const status = existing.querySelector(".run-node-status");
+  const status = existing.querySelector(".progress-status");
   const answer = existing.querySelector(".run-answer-copy");
   if (title) title.textContent = node.title || "运行步骤";
   if (summary) summary.textContent = node.summary || "";
@@ -541,18 +769,50 @@ function renderRunEvent(runView, event) {
 }
 
 function finalizeRunAnswers(runView) {
+  let finalAnswer = "";
   runView.state.order.forEach((nodeId) => {
     const node = runView.state.nodes[nodeId];
     if (node?.kind !== "answer") return;
-    const answer = runView.registry.get(nodeId)?.querySelector(".run-answer-copy");
-    if (!answer) return;
-    answer.replaceChildren(
-      renderTextWithCitations(
-        naturalText(node.text || ""),
-        citationMap(node.detail?.citations),
-      ),
-    );
+    finalAnswer += node.text || "";
   });
+  const citationSources = runView.state.order
+    .map((nodeId) => runView.state.nodes[nodeId])
+    .filter((node) => node?.kind === "answer")
+    .flatMap((node) => Array.isArray(node.detail?.citations) ? node.detail.citations : []);
+  runView.copy.hidden = false;
+  runView.copy.replaceChildren(
+    renderTextWithCitations(naturalText(finalAnswer), citationMap(citationSources)),
+  );
+  runView.transcript.querySelectorAll(".run-answer-block").forEach((node) => node.remove());
+  return finalAnswer;
+}
+
+function terminalStatusLabel(status) {
+  return ({
+    failed: ["运行失败", "请检查问题后重试。"],
+    cancelled: ["运行已取消", "可以修改问题后重新发送。"],
+    conflict: ["运行状态发生变化", "请刷新当前对话后继续。"],
+    paused: ["运行已暂停", "可在右侧计划控制中编辑后继续。"],
+    waiting_approval: ["等待审批", "请批准或拒绝敏感工具操作。"],
+    waiting_user: ["等待补充信息", "请在输入框中补充必要信息。"],
+  })[status] || ["运行未完成", "可在右侧查看运行详情。"];
+}
+
+function finalizeProgress(runView, status) {
+  if (status === "completed") {
+    runView.transcript.classList.add("is-completing");
+    window.setTimeout(() => {
+      if (runView.transcript.isConnected) runView.transcript.replaceChildren();
+    }, 180);
+    return;
+  }
+  const [title, summary] = terminalStatusLabel(status);
+  const terminal = createElement("div", `terminal-status is-${status}`);
+  terminal.append(
+    createElement("strong", "run-node-title", title),
+    createElement("span", "run-node-summary", summary),
+  );
+  runView.transcript.replaceChildren(terminal);
 }
 
 function getOrCreateRunView(pendingRequest, sourceNote = "") {
@@ -751,20 +1011,19 @@ async function consumeAgentStream(response, pendingRequest, sourceNote = "") {
   if (["completed", "failed", "cancelled", "conflict"].includes(finalStatus)) {
     clearPendingRequest();
   }
-  if (finalStatus === "failed" || finalStatus === "cancelled" || finalStatus === "conflict") {
-    article.remove();
-    throw new Error("主 Agent 未能完成这次请求，请检查输入后重试。");
-  }
   if (waitingApproval || finalStatus === "waiting_approval") {
+    finalizeProgress(runView, "waiting_approval");
     showNotice("敏感工具等待审批；批准或拒绝后将使用同一请求继续。", "warning");
     return;
   }
   if (finalStatus === "paused") {
+    finalizeProgress(runView, "paused");
     showNotice("运行已暂停，已完成步骤不会重跑。你可以编辑计划后继续。", "warning");
     await refreshPlanControl();
     return;
   }
   if (finalStatus === "waiting_user") {
+    finalizeProgress(runView, "waiting_user");
     showNotice("需要补充信息后才能继续运行。", "warning");
     return;
   }
@@ -772,9 +1031,16 @@ async function consumeAgentStream(response, pendingRequest, sourceNote = "") {
   rawText = answerTextFromRunView(runView) || rawText;
   const finalText = (editMode ? rawText : naturalText(rawText)).trim();
   if (editMode) {
+    copy.hidden = false;
     copy.textContent = "文件修改完成，可以下载新文件。";
   } else if (!copy.hidden) copy.replaceChildren(renderTextWithCitations(finalText));
   else finalizeRunAnswers(runView);
+  if (["failed", "cancelled", "conflict"].includes(finalStatus)) {
+    finalizeProgress(runView, finalStatus);
+    showNotice(terminalStatusLabel(finalStatus)[1], "error");
+    return;
+  }
+  finalizeProgress(runView, "completed");
   outputAttachmentIds.forEach((attachmentId) => {
     article.append(createServerDownloadButton(attachmentId));
   });
@@ -817,6 +1083,7 @@ async function refreshPlanControl() {
     state.activePlan = plan;
     state.controlRevision = plan.control.revision;
     renderPlanControl(plan);
+    if (plan.control.status === "paused") await renderQueuedInterventions();
     if (["running", "pause_requested", "resuming", "cancel_requested"].includes(plan.control.status)) {
       schedulePlanRefresh(700);
     } else {
@@ -833,6 +1100,27 @@ async function refreshPlanControl() {
       return;
     }
     showToast(error.message);
+  }
+}
+
+async function renderQueuedInterventions() {
+  try {
+    const payload = await request(API.interventions(state.activeRunId), { method: "GET" });
+    const items = Array.isArray(payload.items) ? payload.items : [];
+    items.filter((item) => item.status === "awaiting_confirmation").forEach((item) => {
+      const node = createElement("article", "plan-task plan-intervention");
+      node.append(
+        createElement("strong", "", "待确认的插入指令"),
+        createElement("p", "", item.message),
+        createElement("small", "", "请将需要保留的内容写入目标或任务后，再点击继续。"),
+      );
+      elements.planTaskList.prepend(node);
+      if (!elements.planObjective.value.includes(item.message)) {
+        elements.planObjective.value = `${elements.planObjective.value}\n\n补充指令：${item.message}`.trim();
+      }
+    });
+  } catch (_error) {
+    // A missing intervention endpoint must not hide the editable plan.
   }
 }
 
@@ -1669,7 +1957,20 @@ async function restoreServerHistory(renderCurrent = true) {
   try {
     const payload = await request(API.conversations);
     state.currentConversationId = payload.current_conversation_id || state.currentConversationId;
-    state.serverConversations = Array.isArray(payload.conversations) ? payload.conversations : [];
+    const incoming = Array.isArray(payload.conversations) ? payload.conversations : [];
+    const active = state.serverConversations.find(
+      (item) => item.conversation_id === state.currentConversationId,
+    );
+    state.serverConversations = incoming.slice();
+    if (active && state.history.length) {
+      const activeIndex = state.serverConversations.findIndex(
+        (item) => item.conversation_id === active.conversation_id,
+      );
+      if (activeIndex < 0) state.serverConversations.unshift(active);
+      else if (String(active.updated_at) >= String(state.serverConversations[activeIndex].updated_at)) {
+        state.serverConversations[activeIndex] = active;
+      }
+    }
     const current = state.serverConversations.find(
       (item) => item.conversation_id === state.currentConversationId,
     );
@@ -1690,6 +1991,7 @@ async function restoreServerHistory(renderCurrent = true) {
       if (renderCurrent) await retryPendingRequest();
     }
   } catch (_error) {
+    renderHistoryList();
     restoreHistory();
   }
 }
@@ -1813,6 +2115,7 @@ function saveHistoryItem(item) {
     const persisted = {
       conversation_id: state.currentConversationId,
       title,
+      status: item.status === "sent" ? "pending" : item.status || "completed",
       created_at: now,
       updated_at: now,
       messages: state.history.map((entry) => ({ ...entry, created_at: now })),
@@ -1894,7 +2197,9 @@ function renderHistoryList() {
     button.type = "button";
     button.append(
       createElement("strong", "", archive.title || "未命名对话"),
-      createElement("small", "", isCurrent ? "当前对话" : new Date(archive.updated_at).toLocaleString()),
+      createElement("small", "", isCurrent
+        ? (archive.status === "pending" || archive.status === "processing" ? "当前对话 · 运行中" : "当前对话")
+        : new Date(archive.updated_at).toLocaleString()),
     );
     button.addEventListener("click", () => {
       if (isCurrent) showCurrentDialogue();
@@ -1948,45 +2253,52 @@ function appendRestoredAssistant(text, status, events = [], requestId = null) {
   const meta = createElement("div", "message-meta");
   meta.append(createElement("span", "assistant-mark", "研"), createElement("strong", "", "论文研究 Agent"));
   article.append(meta);
-  if (Array.isArray(events) && events.length) {
-    const transcript = createElement("div", "run-transcript");
-    const copy = createElement("div", "answer-copy natural-answer");
-    copy.hidden = true;
-    const runView = {
-      article,
-      meta,
-      copy,
-      transcript,
-      registry: new Map(),
-      state: { nodes: {}, order: [], lastEventId: 0, lastEventType: "" },
-    };
-    events.forEach((event) => {
-      if (event?.schema_version === "main-agent-stream-v2") renderRunEvent(runView, event);
-    });
-    article.append(transcript, copy);
-    if (requestId) state.runViews.set(requestId, runView);
-    const outputAttachmentIds = events
-      .filter((event) => event?.type === "file_created")
-      .map((event) => event.detail?.output_attachment_id)
-      .filter((attachmentId) => /^[0-9a-f]{32}$/.test(attachmentId || ""));
-    [...new Set(outputAttachmentIds)].forEach((attachmentId) => {
-      article.append(createServerDownloadButton(attachmentId));
-    });
-    const approval = [...events].reverse().find(
-      (event) => event?.type === "interaction_required" && event.status === "waiting_approval",
-    );
-    const pendingRequest = loadPendingRequest();
-    if (
-      approval?.detail?.arguments_sha256
-      && requestId
-      && pendingRequest?.requestId === requestId
-      && runView.state.lastEventType === "run_waiting_approval"
-    ) {
-      openToolApproval(approval.detail, requestId);
-    }
+  const answerEvents = Array.isArray(events) ? events.filter((event) => event?.type === "answer_completed") : [];
+  const citations = answerEvents.flatMap((event) => Array.isArray(event.detail?.citations) ? event.detail.citations : []);
+  const terminalStatuses = new Set(["failed", "cancelled", "conflict", "paused", "waiting_approval", "waiting_user", "error"]);
+  if (terminalStatuses.has(status)) {
+    const [title, summary] = terminalStatusLabel(status === "error" ? "failed" : status);
+    const line = createElement("div", `terminal-status is-${status}`);
+    line.append(createElement("strong", "run-node-title", title), createElement("span", "run-node-summary", summary));
+    article.append(line);
   } else {
-    article.append(status === "error" ? createElement("p", "insufficient", text) : renderCompactText(text));
+    const copy = createElement("div", "answer-copy natural-answer");
+    copy.append(renderTextWithCitations(naturalText(text), citationMap(citations)));
+    article.append(copy);
+    if (requestId && ["pending", "processing", "running"].includes(status)) {
+      const transcript = createElement("div", "run-transcript");
+      const runView = {
+        article,
+        meta,
+        copy,
+        transcript,
+        registry: new Map(),
+        state: {
+          nodes: {
+            "answer:restored": {
+              nodeId: "answer:restored",
+              kind: "answer",
+              title: "生成回答",
+              summary: "",
+              status: "running",
+              text,
+              detail: { citations },
+            },
+          },
+          order: ["answer:restored"],
+          lastEventId: Number(loadPendingRequest()?.lastEventId) || 0,
+          lastEventType: "answer_delta",
+        },
+      };
+      article.insertBefore(transcript, copy);
+      state.runViews.set(requestId, runView);
+    }
   }
+  const outputAttachmentIds = (Array.isArray(events) ? events : [])
+    .filter((event) => event?.type === "file_created")
+    .map((event) => event.detail?.output_attachment_id)
+    .filter((attachmentId) => /^[0-9a-f]{32}$/.test(attachmentId || ""));
+  [...new Set(outputAttachmentIds)].forEach((attachmentId) => article.append(createServerDownloadButton(attachmentId)));
   elements.messages.append(article);
 }
 
@@ -2076,7 +2388,7 @@ elements.askForm.addEventListener("drop", (event) => {
   uploadSelectedFile(event.dataTransfer.files[0]);
 });
 elements.question.addEventListener("keydown", (event) => {
-  if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+  if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
     event.preventDefault();
     elements.askForm.requestSubmit();
   }
@@ -2085,7 +2397,23 @@ elements.inspectorToggle.addEventListener("click", toggleInspector);
 elements.inspectorClose.addEventListener("click", closeInspector);
 elements.inspectorScrim.addEventListener("click", closeInspector);
 document.addEventListener("keydown", handleInspectorKeyboard);
+elements.chatToggle.addEventListener("click", () => setWorkspace("chat"));
 elements.navigationToggle.addEventListener("click", toggleNavigation);
+elements.knowledgeToggle.addEventListener("click", () => setWorkspace(state.workspace === "knowledge" ? "chat" : "knowledge"));
+elements.traceToggle.addEventListener("click", () => setWorkspace(state.workspace === "trace" ? "chat" : "trace"));
+elements.knowledgeUploadButton.addEventListener("click", () => elements.knowledgeUploadInput.click());
+elements.knowledgeUploadInput.addEventListener("change", () => uploadKnowledgePdf(elements.knowledgeUploadInput.files[0]));
+elements.knowledgeDetailForm.addEventListener("submit", saveKnowledgeDetail);
+elements.knowledgePublishButton.addEventListener("click", publishSelectedKnowledge);
+elements.traceRefresh.addEventListener("click", refreshTrace);
+elements.traceListTab.addEventListener("click", () => { elements.traceList.hidden = false; elements.traceWaterfall.hidden = true; elements.traceListTab.classList.add("is-active"); elements.traceWaterfallTab.classList.remove("is-active"); elements.traceListTab.setAttribute("aria-selected", "true"); elements.traceWaterfallTab.setAttribute("aria-selected", "false"); });
+elements.traceWaterfallTab.addEventListener("click", () => { elements.traceList.hidden = true; elements.traceWaterfall.hidden = false; elements.traceWaterfallTab.classList.add("is-active"); elements.traceListTab.classList.remove("is-active"); elements.traceWaterfallTab.setAttribute("aria-selected", "true"); elements.traceListTab.setAttribute("aria-selected", "false"); });
+elements.knowledgeIntentClose.addEventListener("click", cancelKnowledgeIntent);
+elements.knowledgeIntentCancel.addEventListener("click", cancelKnowledgeIntent);
+elements.knowledgeIntentConfirm.addEventListener("click", promotePendingAttachment);
+document.querySelectorAll("[data-return-to-chat]").forEach((control) => {
+  control.addEventListener("click", () => setWorkspace("chat"));
+});
 elements.navigationClose.addEventListener("click", closeNavigation);
 elements.navigationScrim.addEventListener("click", closeNavigation);
 document.addEventListener("keydown", handleNavigationKeyboard);

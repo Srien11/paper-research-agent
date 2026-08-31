@@ -60,6 +60,12 @@ from paper_research_agent.web.compat import (
 from paper_research_agent.web.config import WebConfig
 from paper_research_agent.web.events import AgentEventProjector
 from paper_research_agent.web.files import AttachmentStore
+from paper_research_agent.web.interventions import InterventionStore, RunIntervention
+from paper_research_agent.web.knowledge import (
+    KnowledgeBaseStore,
+    KnowledgeItem,
+    publish_item,
+)
 from paper_research_agent.web.models import (
     AgentApprovalRequest,
     AgentPlanEditRequest,
@@ -76,18 +82,26 @@ from paper_research_agent.web.models import (
     ConversationArchiveItemResponse,
     ConversationArchiveResponse,
     ConversationMessageResponse,
+    ConversationTraceResponse,
     HealthResponse,
+    KnowledgeIntentRequest,
+    KnowledgeIntentResponse,
+    KnowledgeItemListResponse,
+    KnowledgeItemUpdateRequest,
     LoginRequest,
     LongTermMemoryListResponse,
     OperationResponse,
     QuestionRequest,
     RecommendedQuestion,
+    RunInterventionListResponse,
+    RunInterventionRequest,
     SafeLongTermMemory,
     SafePendingToolApproval,
     SafeToolObservation,
     SessionResponse,
     ToolApprovalRequest,
     ToolResearchResponse,
+    TraceEventResponse,
 )
 from paper_research_agent.web.routing import (
     ROUTE_LABELS,
@@ -101,6 +115,10 @@ from paper_research_agent.web.run_event_bus import RunEventBus
 APP_PREFIX = "/paper-research"
 API_PREFIX = f"{APP_PREFIX}/api"
 _REQUEST_ID = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+_KNOWLEDGE_INTENT = re.compile(
+    r"(?:加入|添加|收录|导入|入).{0,12}(?:知识库|语料|论文库)|(?:知识库|语料|论文库).{0,12}(?:加入|添加|收录|导入|入)",
+    re.IGNORECASE,
+)
 
 
 def _set_session_cookie(response: Response, settings: WebConfig, token: str) -> None:
@@ -113,6 +131,11 @@ def _set_session_cookie(response: Response, settings: WebConfig, token: str) -> 
         samesite="strict",
         path=settings.cookie_path,
     )
+
+
+def _is_knowledge_base_intent(message: str) -> bool:
+    """A deliberately conservative candidate gate; the user still confirms every publish."""
+    return bool(_KNOWLEDGE_INTENT.search(message.strip()))
 
 
 class WebRuntime(Protocol):
@@ -623,6 +646,13 @@ def create_app(
     shared_attachments = AttachmentStore(
         Path(__file__).resolve().parents[3] / "data/runtime/uploads"
     )
+    project_root = Path(__file__).resolve().parents[3]
+    knowledge_store = KnowledgeBaseStore(
+        Path(os.environ.get("PRA_KNOWLEDGE_STAGING_PATH", project_root / "data/runtime/knowledge-base"))
+    )
+    intervention_store = InterventionStore(project_root / "data/runtime/run-interventions-v1.sqlite3")
+    knowledge_corpus_dir = Path(os.environ.get("PRA_CORPUS_DIR", project_root / "data/corpus"))
+    knowledge_output_root = project_root / "data/processed"
     conversation = ConversationCoordinator(shared_store)
     use_services = services_factory is not None or (
         runtime is None
@@ -719,6 +749,10 @@ def create_app(
     app.state.config = settings
     app.state.sessions = sessions
     app.state.attachments = shared_attachments
+    app.state.knowledge_store = knowledge_store
+    app.state.intervention_store = intervention_store
+    app.state.knowledge_corpus_dir = knowledge_corpus_dir
+    app.state.knowledge_output_root = knowledge_output_root
     app.state.conversation = conversation
     app.state.run_event_bus = local_run_event_bus
 
@@ -1107,6 +1141,66 @@ def create_app(
             ) from None
         return _safe_agent_control(control)
 
+    @app.get(
+        f"{API_PREFIX}/agent/runs/{{request_id}}/interventions",
+        response_model=RunInterventionListResponse,
+    )
+    async def list_run_interventions(
+        request_id: str,
+        session: OwnerSession = Depends(current_session),  # noqa: B008
+        main_runtime: MainAgentRuntime = Depends(active_main_agent),  # noqa: B008
+    ) -> RunInterventionListResponse:
+        control, _workspace = await owned_run_workspace(request_id, session, main_runtime)
+        items = cast(tuple[RunIntervention, ...], await asyncio.to_thread(
+            app.state.intervention_store.list,
+            request_id=request_id,
+            conversation_id=control.conversation_id,
+        ))
+        if control.status == "paused":
+            transitioned: list[RunIntervention] = []
+            for item in items:
+                if item.status == "queued":
+                    item = cast(
+                        RunIntervention,
+                        await asyncio.to_thread(
+                            app.state.intervention_store.transition,
+                            item.intervention_id,
+                            "awaiting_confirmation",
+                        ),
+                    )
+                transitioned.append(item)
+            items = tuple(transitioned)
+        return RunInterventionListResponse(items=items)
+
+    @app.post(
+        f"{API_PREFIX}/agent/runs/{{request_id}}/interventions",
+        response_model=RunIntervention,
+    )
+    async def queue_run_intervention(
+        request_id: str,
+        payload: RunInterventionRequest,
+        _origin: None = Depends(require_origin),
+        session: OwnerSession = Depends(current_session),  # noqa: B008
+        main_runtime: MainAgentRuntime = Depends(active_main_agent),  # noqa: B008
+    ) -> RunIntervention:
+        control, _workspace = await owned_run_workspace(request_id, session, main_runtime)
+        item = cast(RunIntervention, await asyncio.to_thread(
+            app.state.intervention_store.queue,
+            request_id=request_id,
+            conversation_id=control.conversation_id,
+            message=payload.message,
+        ))
+        if control.status in {"running", "resuming"}:
+            try:
+                await main_runtime.command_run(
+                    request_id=request_id,
+                    command=RunControlCommand(action="pause", expected_revision=control.revision),
+                )
+            except RunControlConflict:
+                # The run may have reached its safe pause boundary between reads.
+                pass
+        return item
+
     @app.patch(
         f"{API_PREFIX}/agent/runs/{{request_id}}/plan",
         response_model=AgentPlanResponse,
@@ -1251,6 +1345,7 @@ def create_app(
                 ConversationArchiveItemResponse(
                     conversation_id=item.conversation_id,
                     title=item.title,
+                    status=item.status,
                     created_at=item.created_at.isoformat(),
                     updated_at=item.updated_at.isoformat(),
                     messages=(),
@@ -1267,8 +1362,10 @@ def create_app(
     async def get_conversation(
         conversation_id: str,
         message_limit: int = Query(default=24, ge=2, le=1_000),
-        _session: OwnerSession = Depends(current_session),  # noqa: B008
+        session: OwnerSession = Depends(current_session),  # noqa: B008
     ) -> ConversationArchiveItemResponse:
+        if conversation_id != session.conversation_id:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="请先切换到目标会话")
         dialogue = await asyncio.to_thread(
             conversation.store.conversation,
             conversation_id,
@@ -1282,6 +1379,7 @@ def create_app(
         return ConversationArchiveItemResponse(
             conversation_id=dialogue.conversation_id,
             title=dialogue.title,
+            status=dialogue.status,
             created_at=dialogue.created_at.isoformat(),
             updated_at=dialogue.updated_at.isoformat(),
             messages=tuple(
@@ -1301,6 +1399,42 @@ def create_app(
             has_more_messages=len(dialogue.messages) > len(selected),
             message_count=len(dialogue.messages),
         )
+
+    @app.get(
+        f"{API_PREFIX}/conversations/{{conversation_id}}/trace",
+        response_model=ConversationTraceResponse,
+    )
+    async def get_conversation_trace(
+        conversation_id: str,
+        session: OwnerSession = Depends(current_session),  # noqa: B008
+    ) -> ConversationTraceResponse:
+        if conversation_id != session.conversation_id:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="请先切换到目标会话")
+        persisted = await asyncio.to_thread(
+            conversation.store.conversation_run_events, conversation_id, limit=10_000
+        )
+        events: list[TraceEventResponse] = []
+        for record in persisted:
+            event = record.to_stream_event()
+            events.append(
+                TraceEventResponse(
+                    event_id=event.event_id,
+                    run_id=event.run_id,
+                    request_id=event.request_id,
+                    turn_id=event.turn_id,
+                    type=event.type,
+                    occurred_at=event.occurred_at.isoformat(),
+                    node_id=event.node_id,
+                    parent_node_id=event.parent_node_id,
+                    task_id=event.task_id,
+                    status=event.status,
+                    title=event.title,
+                    summary=event.summary,
+                    duration_ms=event.duration_ms,
+                    detail=event.detail.model_dump(mode="json", exclude_none=True),
+                )
+            )
+        return ConversationTraceResponse(conversation_id=conversation_id, events=tuple(events))
 
     @app.post(
         f"{API_PREFIX}/conversations/{{conversation_id}}/activate",
@@ -1836,6 +1970,106 @@ def create_app(
             return AttachmentResponse.model_validate(attachment, from_attributes=True)
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from None
+
+    @app.get(
+        f"{API_PREFIX}/knowledge-base/items",
+        response_model=KnowledgeItemListResponse,
+    )
+    async def list_knowledge_items(
+        _session: OwnerSession = Depends(current_session),  # noqa: B008
+    ) -> KnowledgeItemListResponse:
+        items = await asyncio.to_thread(app.state.knowledge_store.list)
+        return KnowledgeItemListResponse(items=items)
+
+    @app.post(f"{API_PREFIX}/knowledge-base/items", response_model=KnowledgeItem)
+    async def stage_knowledge_item(
+        request: Request,
+        filename: str,
+        _origin: None = Depends(require_origin),
+        _session: OwnerSession = Depends(current_session),  # noqa: B008
+    ) -> KnowledgeItem:
+        try:
+            chunks = [chunk async for chunk in request.stream()]
+            return await asyncio.to_thread(
+                app.state.knowledge_store.stage,
+                filename=filename,
+                chunks=chunks,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
+
+    @app.patch(f"{API_PREFIX}/knowledge-base/items/{{item_id}}", response_model=KnowledgeItem)
+    async def update_knowledge_item(
+        item_id: str,
+        payload: KnowledgeItemUpdateRequest,
+        _origin: None = Depends(require_origin),
+        _session: OwnerSession = Depends(current_session),  # noqa: B008
+    ) -> KnowledgeItem:
+        try:
+            corpus_id = await asyncio.to_thread(
+                app.state.knowledge_store.next_corpus_id,
+                app.state.knowledge_corpus_dir,
+            )
+            return await asyncio.to_thread(
+                app.state.knowledge_store.update,
+                item_id,
+                payload,
+                corpus_id=corpus_id,
+            )
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from None
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
+
+    @app.post(f"{API_PREFIX}/knowledge-base/items/{{item_id}}/publish", response_model=KnowledgeItem)
+    async def publish_knowledge_item(
+        item_id: str,
+        _origin: None = Depends(require_origin),
+        _session: OwnerSession = Depends(current_session),  # noqa: B008
+    ) -> KnowledgeItem:
+        try:
+            queued = cast(
+                KnowledgeItem,
+                await asyncio.to_thread(
+                    app.state.knowledge_store.set_status, item_id, "queued"
+                ),
+            )
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from None
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
+
+        async def run_publish() -> None:
+            await asyncio.to_thread(
+                publish_item,
+                app.state.knowledge_store,
+                item_id,
+                corpus_dir=app.state.knowledge_corpus_dir,
+                output_root=app.state.knowledge_output_root,
+                chunking_config=project_root / "configs/chunking/baseline-v1.json",
+                retrieval_config=project_root / "configs/retrieval/hybrid-rerank-v1.json",
+            )
+
+        tasks: set[asyncio.Task[None]] = cast(
+            set[asyncio.Task[None]], getattr(app.state, "knowledge_tasks", set())
+        )
+        task = asyncio.create_task(run_publish(), name=f"knowledge-publish::{item_id}")
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+        app.state.knowledge_tasks = tasks
+        return queued
+
+    @app.post(f"{API_PREFIX}/knowledge-base/intent", response_model=KnowledgeIntentResponse)
+    async def identify_knowledge_intent(
+        payload: KnowledgeIntentRequest,
+        _origin: None = Depends(require_origin),
+        _session: OwnerSession = Depends(current_session),  # noqa: B008
+    ) -> KnowledgeIntentResponse:
+        candidate = bool(payload.attachment_ids) and _is_knowledge_base_intent(payload.message)
+        return KnowledgeIntentResponse(
+            candidate=candidate,
+            reason="检测到将当前附件加入长期知识库的意图" if candidate else None,
+        )
 
     @app.delete(f"{API_PREFIX}/files/{{attachment_id}}", response_model=OperationResponse)
     async def delete_file(

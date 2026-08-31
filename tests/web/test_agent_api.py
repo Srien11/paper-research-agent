@@ -535,6 +535,14 @@ class MainAgentApiTests(unittest.TestCase):
         self.assertEqual(saved["messages"], [])
         self.assertFalse(saved["messages_loaded"])
 
+        activated = self.client.post(
+            f"/paper-research/api/conversations/{previous}/activate",
+            headers={"Origin": ORIGIN},
+            json={},
+        )
+        self.assertEqual(activated.status_code, 200, activated.text)
+        self.assertEqual(self._conversation_id(), previous)
+
         detail = self.client.get(
             f"/paper-research/api/conversations/{previous}?message_limit=2"
         )
@@ -544,14 +552,6 @@ class MainAgentApiTests(unittest.TestCase):
         self.assertEqual(detail.json()["message_count"], 2)
         self.assertEqual(detail.json()["messages"][0]["text"], "持久化问题")
         self.assertEqual(detail.json()["messages"][1]["text"], "持久化回答")
-
-        activated = self.client.post(
-            f"/paper-research/api/conversations/{previous}/activate",
-            headers={"Origin": ORIGIN},
-            json={},
-        )
-        self.assertEqual(activated.status_code, 200, activated.text)
-        self.assertEqual(self._conversation_id(), previous)
 
     def test_conversation_messages_are_hydrated_in_bounded_pages(self) -> None:
         conversation_id = self._conversation_id()

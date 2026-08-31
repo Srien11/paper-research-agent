@@ -46,6 +46,7 @@ class StaticWebContractTests(unittest.TestCase):
             "memories-dialog",
             "memories-list",
             "new-conversation",
+            "chat-toggle",
         }
         all_ids = re.findall(r'id="([^"]+)"', self.html)
         found_ids = set(all_ids)
@@ -59,6 +60,32 @@ class StaticWebContractTests(unittest.TestCase):
         self.assertIn('href="#main-content"', self.html)
         self.assertIn("clip-path: inset(50%)", self.css)
         self.assertIn(".skip-link:focus", self.css)
+
+    def test_full_screen_knowledge_and_trace_workspaces_are_wired(self) -> None:
+        for required_id in (
+            "knowledge-workspace",
+            "knowledge-items",
+            "knowledge-detail-form",
+            "knowledge-intent-dialog",
+            "trace-workspace",
+            "trace-list",
+            "trace-waterfall",
+            "trace-detail",
+        ):
+            self.assertIn(f'id="{required_id}"', self.html)
+        for token in (
+            "knowledgeItems",
+            "knowledgeIntent",
+            "conversationTrace",
+            "setWorkspace",
+            "refreshTrace",
+            "queueRunIntervention",
+        ):
+            self.assertIn(token, self.javascript)
+        self.assertIn(".full-workspace", self.css)
+        self.assertIn(".trace-node", self.css)
+        self.assertEqual(self.html.count('data-return-to-chat'), 2)
+        self.assertIn("返回对话", self.html)
 
     def test_ui_contains_all_visible_operational_states(self) -> None:
         for text in (
@@ -94,6 +121,9 @@ class StaticWebContractTests(unittest.TestCase):
             "reduceRunEvent",
             "renderRunNode",
             "run-transcript",
+            "progress-row",
+            "terminal-status",
+            "finalizeProgress",
             "answer_delta",
         ):
             self.assertIn(state_token, self.javascript + self.html)
@@ -207,6 +237,7 @@ class StaticWebContractTests(unittest.TestCase):
         self.assertIn("min-height: 44px", self.css)
         self.assertIn("env(safe-area-inset-bottom)", self.css)
         self.assertIn('id="navigation-toggle"', self.html)
+        self.assertIn('id="chat-toggle"', self.html)
         self.assertIn('id="navigation-scrim"', self.html)
         self.assertIn(".library-panel.is-open", self.css)
         self.assertIn("handleNavigationKeyboard", self.javascript)
@@ -219,7 +250,7 @@ class StaticWebContractTests(unittest.TestCase):
         self.assertNotIn(
             'id="inspector-close" class="icon-button mobile-only"', self.html
         )
-        self.assertIn("run-node-turn-tail", self.javascript + self.css)
+        self.assertIn("progress-label", self.javascript + self.css)
         self.assertIn('rows="1"', self.html)
 
     def test_approval_replaces_the_composer_without_a_second_dialog(self) -> None:
@@ -227,6 +258,21 @@ class StaticWebContractTests(unittest.TestCase):
         self.assertNotIn('<dialog id="tool-approval-dialog"', self.html)
         self.assertIn('elements.askForm.classList.add("is-approving")', self.javascript)
         self.assertIn(".composer.is-approving", self.css)
+
+    def test_composer_and_workspace_returns_have_separate_contracts(self) -> None:
+        self.assertIn('class="input-row"', self.html)
+        self.assertIn('class="tool-row"', self.html)
+        self.assertIn("grid-template-columns: 40px minmax(0, 1fr) 40px", self.css)
+        self.assertIn("function setWorkspace(name)", self.javascript)
+        self.assertIn('elements.chatToggle.addEventListener("click", () => setWorkspace("chat"))', self.javascript)
+        self.assertIn('control.addEventListener("click", () => setWorkspace("chat"))', self.javascript)
+        self.assertIn("input:checked + span", self.css)
+        self.assertIn("event.key === \"Enter\" && !event.shiftKey", self.javascript)
+
+    def test_completed_history_does_not_restore_run_transcript(self) -> None:
+        self.assertIn("const answerEvents", self.javascript)
+        self.assertNotIn("events.forEach((event) => {", self.javascript)
+        self.assertIn("runView.transcript.replaceChildren()", self.javascript)
 
 
 class RecommendationContractTests(unittest.TestCase):
