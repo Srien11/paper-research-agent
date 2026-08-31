@@ -37,6 +37,7 @@ class SearchHit(FrozenContract):
     page_end: int = Field(ge=1)
     text_sha256: Sha256
     evidence_type: Literal["text", "figure_summary"] = "text"
+    confidence_tier: Literal["high", "low"] = "high"
     figure: FigureRecord | None = None
     scores: dict[str, float] = {}
     ranks: dict[str, int] = {}

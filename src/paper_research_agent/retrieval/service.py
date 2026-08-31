@@ -37,20 +37,32 @@ class RetrievalService:
         *,
         top_k: int | None = None,
         filters: Mapping[str, str] | None = None,
+        include_low_confidence: bool = False,
     ) -> RetrievalRun:
         if variant not in {"A", "B", "C"}:
             raise ValueError("variant must be A, B, or C")
         limit = self.config.top_k if top_k is None else top_k
         if limit <= 0:
             raise ValueError("top_k must be positive")
-        vector = self.vector.search(query, self.config.vector_candidates, filters=filters)
+        effective_filters = dict(filters or {})
+        if not include_low_confidence:
+            effective_filters.setdefault("confidence_tier", "high")
+        vector = self.vector.search(
+            query,
+            self.config.vector_candidates,
+            filters=effective_filters,
+        )
         if variant == "A":
             candidates = [
                 (chunk, score, {"vector": rank}, {"vector": score})
                 for rank, (chunk, score) in enumerate(vector, start=1)
             ]
         else:
-            sparse = self.sparse.search(query, self.config.sparse_candidates, filters=filters)
+            sparse = self.sparse.search(
+                query,
+                self.config.sparse_candidates,
+                filters=effective_filters,
+            )
             candidates = reciprocal_rank_fusion(
                 sparse, vector, rrf_k=self.config.rrf_k, top_k=self.config.rerank_candidates
             )
@@ -66,6 +78,7 @@ class RetrievalService:
                 page_end=chunk.page_end,
                 text_sha256=chunk.text_sha256,
                 evidence_type=chunk.evidence_type,
+                confidence_tier=chunk.confidence_tier,
                 figure=chunk.figure,
                 scores=scores,
                 ranks={**ranks, "final": rank},

@@ -27,6 +27,7 @@ ElementType = Literal[
     "other",
 ]
 ContentOrigin = Literal["source_text", "generated"]
+ConfidenceTier = Literal["high", "low"]
 
 
 class FrozenContract(BaseModel):
@@ -62,6 +63,7 @@ class PageRecord(FrozenContract):
     source_sha256: Sha256
     parser_name: str = Field(min_length=1)
     parser_version: str = Field(min_length=1)
+    confidence_tier: ConfidenceTier = "high"
     error_code: str | None = None
     error_message: str | None = None
 
@@ -134,6 +136,7 @@ class DocumentElement(FrozenContract):
     generation_method: str | None = None
     generation_model: str | None = None
     generation_version: str | None = None
+    confidence_tier: ConfidenceTier = "high"
     source_sha256: Sha256
     parser_name: str = Field(min_length=1)
     parser_version: str = Field(min_length=1)
@@ -166,7 +169,7 @@ class DocumentElement(FrozenContract):
 
 
 class IngestionManifest(FrozenContract):
-    schema_version: Literal["ingestion-v1"] = "ingestion-v1"
+    schema_version: Literal["ingestion-v1", "ingestion-v2"] = "ingestion-v2"
     build_id: str = Field(min_length=1)
     corpus_version: str = Field(min_length=1)
     parser_name: str = Field(min_length=1)
@@ -181,6 +184,8 @@ class IngestionManifest(FrozenContract):
     section_count: int = Field(ge=0)
     element_count: int = Field(ge=0)
     artifact_sha256: dict[str, Sha256]
+    parent_build_id: str | None = None
+    added_asset_count: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
     def validate_page_counts(self) -> IngestionManifest:

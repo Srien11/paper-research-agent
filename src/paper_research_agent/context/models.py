@@ -28,6 +28,7 @@ class ContextEvidence(FrozenContract):
     text: str = Field(min_length=1)
     text_sha256: Sha256
     evidence_type: Literal["text", "figure_summary"] = "text"
+    confidence_tier: Literal["high", "low"] = "high"
     figure: FigureRecord | None = None
     storage_class: Literal["redistributable", "internal_research_only"] | None = None
     final_score: float
@@ -59,6 +60,7 @@ class CitationRef(FrozenContract):
     page_end: int = Field(ge=1)
     text_sha256: Sha256
     evidence_type: Literal["text", "figure_summary"] = "text"
+    confidence_tier: Literal["high", "low"] = "high"
     figure: FigureRecord | None = None
     storage_class: Literal["redistributable", "internal_research_only"] | None = None
 

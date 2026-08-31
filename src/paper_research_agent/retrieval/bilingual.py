@@ -581,6 +581,7 @@ def _build_hits(candidates: Sequence[Candidate], *, limit: int) -> tuple[SearchH
             page_end=chunk.page_end,
             text_sha256=chunk.text_sha256,
             evidence_type=chunk.evidence_type,
+            confidence_tier=chunk.confidence_tier,
             figure=chunk.figure,
             scores=scores,
             ranks={**ranks, "final": rank},

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import math
 import os
 import sqlite3
@@ -116,6 +117,7 @@ class SafeRetrievalHit(_FrozenWebModel):
     corpus_id: str
     final_rank: int = Field(gt=0)
     evidence_type: EvidenceType
+    confidence_tier: Literal["high", "low"] = "high"
     page_start: int = Field(gt=0)
     page_end: int = Field(gt=0)
     route_ranks: dict[str, int]
@@ -373,15 +375,24 @@ class RAGRuntime:
         environment variables.  This method deliberately does not load ``.env``.
         """
         root = project_root.resolve()
+        active_build = _active_knowledge_base_build(root)
         chunks_file = _project_path(
             root,
             chunks_path,
-            "data/processed/chunks/chunks.jsonl",
+            (
+                str(active_build / "chunks" / "chunks.jsonl")
+                if active_build is not None and chunks_path is None
+                else "data/processed/chunks/chunks.jsonl"
+            ),
         )
         paper_cards_file = _project_path(
             root,
             paper_cards_path,
-            "data/processed/chunks/paper_cards.jsonl",
+            (
+                str(active_build / "chunks" / "paper_cards.jsonl")
+                if active_build is not None and paper_cards_path is None
+                else "data/processed/chunks/paper_cards.jsonl"
+            ),
         )
         retrieval_file = _project_path(
             root,
@@ -420,7 +431,7 @@ class RAGRuntime:
         bilingual_config = load_bilingual_retrieval_config(bilingual_file)
         answer_config = load_answering_config(answer_file)
         memory_config = load_memory_config(memory_file)
-        index_dir = root / retrieval_config.index_dir
+        index_dir = active_build / "index" if active_build is not None else root / retrieval_config.index_dir
         manifest = IndexManifest.model_validate_json(
             (index_dir / "manifest.json").read_text(encoding="utf-8")
         )
@@ -430,11 +441,21 @@ class RAGRuntime:
         papers = load_frozen_papers(
             [corpus_dir / "core_frozen.jsonl", corpus_dir / "challenge_frozen.jsonl"]
         )
+        effective_sections = sections_path or (
+            active_build / "sections.jsonl" if active_build is not None else None
+        )
+        effective_elements = elements_path or (
+            active_build / "elements.jsonl" if active_build is not None else None
+        )
         sections = (
-            tuple(_load_sections(_project_path(root, sections_path, ""))) if sections_path else ()
+            tuple(_load_sections(_project_path(root, effective_sections, "")))
+            if effective_sections
+            else ()
         )
         elements = (
-            tuple(_load_elements(_project_path(root, elements_path, ""))) if elements_path else ()
+            tuple(_load_elements(_project_path(root, effective_elements, "")))
+            if effective_elements
+            else ()
         )
         paper_metadata = _safe_paper_metadata(papers)
         rights = CorpusRightsMap({paper.corpus_id: paper.storage_class for paper in papers})
@@ -972,6 +993,7 @@ class RAGRuntime:
                     corpus_id=hit.corpus_id,
                     final_rank=hit.final_rank,
                     evidence_type=hit.evidence_type,
+                    confidence_tier=hit.confidence_tier,
                     page_start=hit.page_start,
                     page_end=hit.page_end,
                     route_ranks=dict(hit.ranks),
@@ -1325,6 +1347,29 @@ def _load_elements(path: Path) -> list[DocumentElement]:
 def _project_path(root: Path, value: Path | None, default: str) -> Path:
     candidate = value if value is not None else Path(default)
     return candidate if candidate.is_absolute() else root / candidate
+
+
+def _active_knowledge_base_build(root: Path) -> Path | None:
+    pointer = root / "data" / "processed" / "current_knowledge_base.json"
+    if not pointer.is_file():
+        return None
+    try:
+        value = json.loads(pointer.read_text(encoding="utf-8"))
+        build_path = value["build_path"]
+    except (OSError, KeyError, TypeError, json.JSONDecodeError) as error:
+        raise ValueError("当前知识库指针无效") from error
+    if not isinstance(build_path, str):
+        raise TypeError("当前知识库指针中的 build_path 必须是字符串")
+    candidate = (pointer.parent / build_path).resolve()
+    if pointer.parent.resolve() not in candidate.parents:
+        raise ValueError("当前知识库指针越出解析产物根目录")
+    required = (
+        candidate / "chunks" / "chunks.jsonl",
+        candidate / "index" / "manifest.json",
+    )
+    if not all(path.is_file() for path in required):
+        raise ValueError("当前知识库构建不完整")
+    return candidate
 
 
 def _optional_env_path(name: str) -> Path | None:

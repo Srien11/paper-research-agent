@@ -41,6 +41,7 @@ def join_retrieval_evidence(
             hit.text_sha256,
             hit.evidence_type,
             hit.figure,
+            hit.confidence_tier,
         )
         actual = (
             matched_chunk.corpus_id,
@@ -51,6 +52,7 @@ def join_retrieval_evidence(
             matched_chunk.text_sha256,
             matched_chunk.evidence_type,
             matched_chunk.figure,
+            matched_chunk.confidence_tier,
         )
         if expected != actual:
             raise EvidenceJoinError(
@@ -67,6 +69,7 @@ def join_retrieval_evidence(
                 text=matched_chunk.text,
                 text_sha256=matched_chunk.text_sha256,
                 evidence_type=matched_chunk.evidence_type,
+                confidence_tier=matched_chunk.confidence_tier,
                 figure=matched_chunk.figure,
                 storage_class=(
                     run.storage_classes[hit.corpus_id]

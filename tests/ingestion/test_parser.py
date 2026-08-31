@@ -102,6 +102,8 @@ class PdfParserTests(unittest.TestCase):
         self.assertEqual(result.elements[0].generation_method, "ocr")
         self.assertEqual(result.elements[0].generation_model, "fake-ocr:eng+chi_sim")
         self.assertEqual(result.elements[0].generation_version, "1.0")
+        self.assertEqual(result.pages[0].confidence_tier, "low")
+        self.assertEqual(result.elements[0].confidence_tier, "low")
 
     def test_digital_page_does_not_use_ocr(self) -> None:
         backend = FakeOcrBackend()

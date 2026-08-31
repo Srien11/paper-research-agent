@@ -168,9 +168,26 @@ winget install --id UB-Mannheim.TesseractOCR
 Linux 可安装 `tesseract-ocr tesseract-ocr-eng tesseract-ocr-chi-sim`。相关参数见
 `.env.example`；只有明确不处理扫描件时才将 `PRA_OCR_ENABLED` 设为 `false`。
 
-当前知识库构建仍是手工、全量的三阶段流水线：`parse_corpus.py` → `build_chunks.py` →
-`build_retrieval_index.py`。构建 ID 能保证重复执行和结果追溯，但项目尚未提供目录监听、自动
-增量摄取或新索引原子切换，因此不能视为持续知识库更新。
+持续知识库更新使用以下命令；它会检查冻结清单，仅解析新增 PDF，将旧产物原样合并到新的
+不可变构建，重新生成 chunk 与向量索引，并且只在全部成功后原子切换
+`data/processed/current_knowledge_base.json`。已存在的来源哈希、页面/元素/chunk ID 和父构建
+都不会被改写；删除既有来源、为既有来源重分配 `corpus_id`、或更改解析/OCR 配置都会被拒绝。
+新增文件仍须先经过现有冻结清单校验，并在清单中提供未使用的 `corpus_id`、内容哈希和版权
+元数据；更新器不从文件名猜测论文身份，避免破坏可追溯性。
+
+```powershell
+python scripts/update_knowledge_base.py `
+  --corpus-dir D:\path\to\research_collection
+
+# 持续轮询冻结清单；生产服务在下一次重启时读取已切换的完整构建。
+python scripts/update_knowledge_base.py `
+  --corpus-dir D:\path\to\research_collection `
+  --watch-interval-seconds 60
+```
+
+证据有两层置信度：原生 PDF 文本为 `high`；OCR 结果为 `low`。默认检索只使用高置信度
+证据；若确需使用 OCR，调用方必须显式设置 `include_low_confidence=True`，且该层级会随检索
+命中、上下文和引用元数据一同保留，供回答策略或人工复核使用。
 
 中文生产查询使用独立的双路入口，不改变原有 A/B/C 基线，也不需要重新分块或生成向量：
 

@@ -90,6 +90,9 @@ def build_chunks(
                     text=text,
                     text_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
                     config_sha256=config_hash,
+                    confidence_tier=(
+                        "low" if any(item.confidence_tier == "low" for item in group) else "high"
+                    ),
                 )
             )
             if start + len(window) >= len(tokens):

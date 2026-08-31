@@ -89,12 +89,13 @@ def write_chunk_metadata(
                 page_end INTEGER NOT NULL,
                 text_sha256 TEXT NOT NULL,
                 evidence_type TEXT NOT NULL,
+                confidence_tier TEXT NOT NULL,
                 figure_json TEXT
             )
             """
         )
         connection.executemany(
-            "INSERT INTO chunks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO chunks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 (
                     position,
@@ -106,6 +107,7 @@ def write_chunk_metadata(
                     chunk.page_end,
                     chunk.text_sha256,
                     chunk.evidence_type,
+                    chunk.confidence_tier,
                     (
                         chunk.figure.model_dump_json()
                         if chunk.figure is not None

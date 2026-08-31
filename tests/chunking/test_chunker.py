@@ -51,6 +51,17 @@ class DeterministicChunkerTests(unittest.TestCase):
         )
         self.assertEqual([(item.token_start, item.token_end) for item in chunks], [(0, 32), (28, 40)])
 
+    def test_low_confidence_source_keeps_chunk_id_but_marks_chunk_low(self) -> None:
+        config = ChunkingConfig(max_tokens=32, overlap_tokens=4)
+        high = element("e1", "OCR extracted text", "s1", 0)
+        low = high.model_copy(update={"confidence_tier": "low"})
+
+        high_chunk = build_chunks([high], config)[0]
+        low_chunk = build_chunks([low], config)[0]
+
+        self.assertEqual(low_chunk.chunk_id, high_chunk.chunk_id)
+        self.assertEqual(low_chunk.confidence_tier, "low")
+
     def test_figure_is_one_generated_chunk_with_full_metadata(self) -> None:
         figure = FigureRecord(
             figure_id="figure_001",

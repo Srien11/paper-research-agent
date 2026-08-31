@@ -400,6 +400,7 @@ def _build_page_records(
                 source_sha256=asset.source_sha256,
                 parser_name=draft.parser_name,
                 parser_version=draft.parser_version,
+                confidence_tier=("low" if draft.content_origin == "generated" else "high"),
                 status="failed",
                 error_code=draft.error_code,
                 error_message=draft.error_message,
@@ -422,6 +423,7 @@ def _build_page_records(
                 source_sha256=asset.source_sha256,
                 parser_name=draft.parser_name,
                 parser_version=draft.parser_version,
+                confidence_tier="high",
                 status="empty",
             ),
             (),
@@ -437,6 +439,7 @@ def _build_page_records(
         source_sha256=asset.source_sha256,
         parser_name=draft.parser_name,
         parser_version=draft.parser_version,
+        confidence_tier=("low" if draft.content_origin == "generated" else "high"),
         status="parsed",
         raw_text=raw_text,
         normalized_text=normalized_text,
@@ -459,6 +462,7 @@ def _build_page_records(
             generation_method=draft.generation_method,
             generation_model=draft.generation_model,
             generation_version=draft.generation_version,
+            confidence_tier=("low" if draft.content_origin == "generated" else "high"),
         )
         for reading_order, line in enumerate(cleaned_lines)
     )
@@ -480,6 +484,7 @@ def _build_element(
     generation_method: str | None,
     generation_model: str | None,
     generation_version: str | None,
+    confidence_tier: Literal["high", "low"],
 ) -> DocumentElement:
     normalized = normalize_text(line.text)
     normalized_hash = sha256_text(normalized)
@@ -507,6 +512,7 @@ def _build_element(
         generation_method=generation_method,
         generation_model=generation_model,
         generation_version=generation_version,
+        confidence_tier=confidence_tier,
         source_sha256=asset.source_sha256,
         parser_name=parser_name,
         parser_version=parser_version,

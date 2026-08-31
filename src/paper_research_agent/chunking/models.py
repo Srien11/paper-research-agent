@@ -31,6 +31,7 @@ class EvidenceChunk(FrozenContract):
     config_sha256: Sha256
     evidence_type: Literal["text", "figure_summary"] = "text"
     content_origin: Literal["source_text", "generated"] = "source_text"
+    confidence_tier: Literal["high", "low"] = "high"
     figure: FigureRecord | None = None
 
     @model_validator(mode="after")

@@ -159,6 +159,7 @@ def _citation(evidence: ContextEvidence, position: int) -> CitationRef:
         page_end=evidence.page_end,
         text_sha256=evidence.text_sha256,
         evidence_type=evidence.evidence_type,
+        confidence_tier=evidence.confidence_tier,
         figure=evidence.figure,
         storage_class=evidence.storage_class,
     )

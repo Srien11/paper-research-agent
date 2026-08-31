@@ -49,3 +49,31 @@ class HybridTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "top_k must be positive"):
             service.search("alpha", "C", top_k=0)
+
+    def test_low_confidence_chunks_require_explicit_opt_in(self) -> None:
+        high = chunk("high", "alpha")
+        low = chunk("low", "alpha").model_copy(update={"confidence_tier": "low"})
+        config = RetrievalConfig(
+            embedding_model="org/embed",
+            embedding_revision="a" * 40,
+            reranker_model="org/rerank",
+            reranker_revision="b" * 40,
+            sparse_candidates=2,
+            vector_candidates=2,
+            rerank_candidates=2,
+            top_k=2,
+        )
+        service = RetrievalService(
+            BM25Index([high, low]),
+            VectorIndex([high, low], FakeEncoder()),
+            FakeReranker(),
+            config,
+            index_id="i",
+        )
+
+        default_run = service.search("alpha", "B")
+        expanded_run = service.search("alpha", "B", include_low_confidence=True)
+
+        self.assertEqual([hit.chunk_id for hit in default_run.hits], ["high"])
+        self.assertEqual({hit.chunk_id for hit in expanded_run.hits}, {"high", "low"})
+        self.assertEqual(default_run.hits[0].confidence_tier, "high")

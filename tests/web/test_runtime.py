@@ -53,6 +53,7 @@ from paper_research_agent.web.runtime import (
     RuntimeClosedError,
     RuntimeDependencies,
     SafePaperMetadata,
+    _active_knowledge_base_build,
     _research_policy_from_environment,
 )
 from scripts.smoke_web_runtime import _comparison_stage_trace
@@ -63,6 +64,22 @@ def _digest(value: str) -> str:
 
 
 class SmokeTraceTests(unittest.TestCase):
+    def test_active_knowledge_base_pointer_requires_complete_build(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build = root / "data" / "processed" / "corpus-v1" / "build-1"
+            (build / "chunks").mkdir(parents=True)
+            (build / "index").mkdir()
+            (build / "chunks" / "chunks.jsonl").write_text("", encoding="utf-8")
+            (build / "index" / "manifest.json").write_text("{}", encoding="utf-8")
+            pointer = root / "data" / "processed" / "current_knowledge_base.json"
+            pointer.write_text(
+                '{"build_path":"corpus-v1/build-1"}',
+                encoding="utf-8",
+            )
+
+            self.assertEqual(_active_knowledge_base_build(root), build.resolve())
+
     def test_comparison_trace_uses_only_events_after_the_run_cursor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "events.sqlite3"
