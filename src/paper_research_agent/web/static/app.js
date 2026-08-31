@@ -417,9 +417,10 @@ function reduceRunEvent(runState, event) {
     status: event.status || previous.status,
     detail: event.detail && typeof event.detail === "object" ? event.detail : previous.detail,
     durationMs: Number.isFinite(event.duration_ms) ? event.duration_ms : previous.durationMs,
-    text: event.type === "answer_delta" && typeof event.delta === "string"
-      ? `${previous.text || ""}${event.delta}`
-      : previous.text,
+    text: event.type === "answer_started" ? ""
+      : event.type === "answer_delta" && typeof event.delta === "string"
+        ? `${previous.text || ""}${event.delta}`
+        : previous.text,
   };
   return {
     nodes,

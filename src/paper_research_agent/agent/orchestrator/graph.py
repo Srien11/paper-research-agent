@@ -570,6 +570,8 @@ def build_main_agent_graph(
             result,
             child_calls_used=used_calls,
             replans_used=used_replans,
+            max_child_calls=max_child_calls,
+            max_replans=max_replans,
         )
         return {"evaluation": evaluation}
 
@@ -590,19 +592,20 @@ def build_main_agent_graph(
         )
         active_task_id = str(state["active_task_id"])
         completed = evaluation.outcome == "complete"
-        await publish_product_event(
-            state,
-            "task_completed" if completed else "task_failed",
-            node_id=f"task:{active_task_id}",
-            status="completed" if completed else "failed",
-            title="任务完成" if completed else "任务未完成",
-            summary=evaluation.reason,
-            task_id=active_task_id,
-            idempotency_key=(
-                f"task:{active_task_id}:evaluation:{evaluation.outcome}:"
-                f"{int(state.get('remaining_replans', max_replans))}"
-            ),
-        )
+        if evaluation.outcome in {"complete", "fail"}:
+            await publish_product_event(
+                state,
+                "task_completed" if completed else "task_failed",
+                node_id=f"task:{active_task_id}",
+                status="completed" if completed else "failed",
+                title="任务完成" if completed else "任务未完成",
+                summary=evaluation.reason,
+                task_id=active_task_id,
+                idempotency_key=(
+                    f"task:{active_task_id}:evaluation:{evaluation.outcome}:"
+                    f"{int(state.get('remaining_replans', max_replans))}"
+                ),
+            )
         update: MainAgentGraphState = {"workspace_draft": workspace}
         if evaluation.outcome == "replan":
             update["remaining_replans"] = int(

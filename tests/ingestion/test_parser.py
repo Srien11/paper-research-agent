@@ -11,6 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from paper_research_agent.ingestion.models import DocumentAsset
+from paper_research_agent.ingestion.ocr import OcrLine, OcrPageResult
 from paper_research_agent.ingestion.parser import (
     TextLine,
     order_page_lines,
@@ -24,8 +25,14 @@ class FakePage:
     width = 600.0
     height = 800.0
 
-    def __init__(self, lines: list[dict[str, object]] | Exception) -> None:
+    def __init__(
+        self,
+        lines: list[dict[str, object]] | Exception,
+        *,
+        has_raster_image: bool = False,
+    ) -> None:
         self._lines = lines
+        self.images = [{}] if has_raster_image else []
         self.last_extract_kwargs: dict[str, object] | None = None
 
     def extract_text_lines(self, **kwargs: object) -> list[dict[str, object]]:
@@ -46,7 +53,79 @@ class FakeDocument:
         return None
 
 
+class FakeOcrBackend:
+    def __init__(self) -> None:
+        self.calls: list[int] = []
+
+    def config(self) -> dict[str, object]:
+        return {"engine": "fake-ocr", "engine_version": "1.0"}
+
+    def extract_page(
+        self,
+        _pdf_path: Path,
+        page_number: int,
+        *,
+        width_points: float,
+        height_points: float,
+    ) -> OcrPageResult:
+        self.calls.append(page_number)
+        return OcrPageResult(
+            lines=(
+                OcrLine(
+                    "Scanned evidence text",
+                    20.0,
+                    30.0,
+                    width_points - 20.0,
+                    min(height_points, 50.0),
+                ),
+            ),
+            engine="fake-ocr",
+            engine_version="1.0",
+            model="fake-ocr:eng+chi_sim",
+        )
+
+
 class PdfParserTests(unittest.TestCase):
+    def test_scanned_page_uses_ocr_and_records_generated_lineage(self) -> None:
+        backend = FakeOcrBackend()
+
+        result = self._parse(
+            [FakePage([], has_raster_image=True)],
+            ocr_backend=backend,
+        )
+
+        self.assertEqual(backend.calls, [1])
+        self.assertEqual(result.pages[0].status, "parsed")
+        self.assertEqual(result.pages[0].parser_name, "fake-ocr")
+        self.assertEqual(result.elements[0].raw_text, "Scanned evidence text")
+        self.assertEqual(result.elements[0].content_origin, "generated")
+        self.assertEqual(result.elements[0].generation_method, "ocr")
+        self.assertEqual(result.elements[0].generation_model, "fake-ocr:eng+chi_sim")
+        self.assertEqual(result.elements[0].generation_version, "1.0")
+
+    def test_digital_page_does_not_use_ocr(self) -> None:
+        backend = FakeOcrBackend()
+        body = "A sufficiently long native text layer"
+
+        result = self._parse(
+            [FakePage([self._line(body, top=100)], has_raster_image=True)],
+            ocr_backend=backend,
+        )
+
+        self.assertEqual(backend.calls, [])
+        self.assertEqual(result.elements[0].raw_text, body)
+        self.assertEqual(result.elements[0].content_origin, "source_text")
+
+    def test_scanned_page_fails_explicitly_when_ocr_is_disabled(self) -> None:
+        result = self._parse(
+            [FakePage([], has_raster_image=True)],
+            ocr_backend=None,
+        )
+
+        self.assertEqual(result.pages[0].status, "failed")
+        self.assertEqual(result.pages[0].error_code, "ocr_disabled")
+        self.assertEqual(result.elements, ())
+
     def test_word_spacing_uses_stricter_horizontal_tolerance(self) -> None:
         page = FakePage([self._line("Body text", top=100)])
 
@@ -224,7 +303,12 @@ class PdfParserTests(unittest.TestCase):
         self.assertEqual([element.raw_text for element in result.elements], ["Partial", "Body"])
         self.assertEqual(result.elements[0].bbox, (0.0, 100.0, 100.0, 110.0))
 
-    def _parse(self, pages: list[FakePage]):
+    def _parse(
+        self,
+        pages: list[FakePage],
+        *,
+        ocr_backend=None,
+    ):
         with tempfile.TemporaryDirectory() as directory:
             pdf_path = Path(directory) / "fixture.pdf"
             pdf_path.touch()
@@ -241,7 +325,7 @@ class PdfParserTests(unittest.TestCase):
                 "paper_research_agent.ingestion.parser.pdfplumber.open",
                 return_value=FakeDocument(pages),
             ):
-                return parse_pdf_asset(pdf_path, asset)
+                return parse_pdf_asset(pdf_path, asset, ocr_backend=ocr_backend)
 
     @staticmethod
     def _line(text: str, *, top: float) -> dict[str, object]:

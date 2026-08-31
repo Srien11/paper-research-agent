@@ -39,6 +39,11 @@ mcp = [
   "mcp>=1.28,<2",
   "jsonschema>=4.23,<5",
 ]
+ragas-eval = [
+  "ragas==0.4.3",
+  # Ragas 0.4.3 still imports the legacy VertexAI module removed in 0.4.x.
+  "langchain-community>=0.3.31,<0.4",
+]
 dev = [
   "mypy>=1.15",
   "pytest>=8.3",

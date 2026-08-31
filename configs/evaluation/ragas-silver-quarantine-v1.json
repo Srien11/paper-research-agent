@@ -1,0 +1,63 @@
+{
+  "schema_version": "silver-quarantine-v1",
+  "dataset_id": "rag-answer-candidates-v1",
+  "scope_question_ids": [
+    "GQ001",
+    "GQ002",
+    "GQ003",
+    "GQ004",
+    "GQ005",
+    "GQ006",
+    "GQ007",
+    "GQ008",
+    "GQ009",
+    "GQ010",
+    "GQ011",
+    "GQ012",
+    "GQ013",
+    "GQ014",
+    "GQ015",
+    "GQ016",
+    "GQ017",
+    "GQ018",
+    "GQ019",
+    "GQ020"
+  ],
+  "entries": [
+    {
+      "question_id": "GQ003",
+      "reason_code": "cross_paper_attribution",
+      "review_status": "confirmed"
+    },
+    {
+      "question_id": "GQ009",
+      "reason_code": "question_reference_mismatch",
+      "review_status": "high_risk"
+    },
+    {
+      "question_id": "GQ011",
+      "reason_code": "degraded_ocr_evidence",
+      "review_status": "confirmed"
+    },
+    {
+      "question_id": "GQ012",
+      "reason_code": "incomplete_reference",
+      "review_status": "confirmed"
+    },
+    {
+      "question_id": "GQ013",
+      "reason_code": "question_reference_mismatch",
+      "review_status": "confirmed"
+    },
+    {
+      "question_id": "GQ014",
+      "reason_code": "non_atomic_reference",
+      "review_status": "confirmed"
+    },
+    {
+      "question_id": "GQ017",
+      "reason_code": "incomplete_reference",
+      "review_status": "confirmed"
+    }
+  ]
+}

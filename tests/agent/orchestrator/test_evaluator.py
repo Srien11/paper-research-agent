@@ -112,21 +112,15 @@ class EvaluateTaskTests(unittest.TestCase):
         self.assertEqual(evaluation.outcome, "complete")
         self.assertEqual(evaluation.satisfied_criteria, ("找到至少两篇论文证据",))
 
-    def test_insufficient_evidence_retries_when_attempt_available(self) -> None:
+    def test_insufficient_evidence_replans_without_blind_retry(self) -> None:
         task = _task(attempt_count=0)
         result = _result(status="insufficient_evidence", citation_kind="none")
         evaluation = self._evaluate(task, result)
-        self.assertEqual(evaluation.outcome, "retry")
+        self.assertEqual(evaluation.outcome, "replan")
         self.assertEqual(evaluation.missing_criteria, ("找到至少两篇论文证据",))
 
-    def test_insufficient_evidence_replans_when_attempts_exhausted(self) -> None:
-        task = _task(attempt_count=1)
-        result = _result(status="insufficient_evidence", citation_kind="none")
-        evaluation = self._evaluate(task, result, replans_used=0)
-        self.assertEqual(evaluation.outcome, "replan")
-
-    def test_insufficient_evidence_fails_without_budget(self) -> None:
-        task = _task(attempt_count=1)
+    def test_insufficient_evidence_fails_without_replan_budget(self) -> None:
+        task = _task(attempt_count=0)
         result = _result(status="insufficient_evidence", citation_kind="none")
         evaluation = self._evaluate(task, result, replans_used=1)
         self.assertEqual(evaluation.outcome, "fail")

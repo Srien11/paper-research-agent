@@ -864,29 +864,38 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["final_answer"], "你想比较哪两个方案？")
 
     async def test_replan_path_replans_then_succeeds(self) -> None:
+        store = InMemoryConversationStore()
+        bus = RunEventBus(store)
         first_plan = _plan_decision((_task(task_id="local", capability="local_rag"),))
         second_plan = _plan_decision(
             (_task(task_id="local", capability="local_rag"),),
             action="revise",
         )
         graph, _store, dispatcher, planner = self._build(
+            store=store,
             plan_decisions=(first_plan, second_plan),
             dispatch_results=(
                 _result(status="insufficient_evidence", task_id="local"),
-                _result(status="insufficient_evidence", task_id="local"),
                 _result(task_id="local", source_id="chunk-1"),
             ),
+            run_event_publisher=bus.publisher,
         )
         request = MainAgentRequest(
-            request_id="request-1",
+            request_id="request-replan-path-1234",
             conversation_id="conversation-1",
             message="比较 RAG 与 GraphRAG",
             rag_mode="preferred",
         )
         state = await self._run(graph, request)
+        event_types = [
+            item.to_stream_event().type
+            for item in store.run_events(request.request_id)
+        ]
         self.assertEqual(planner.calls, 2)
-        self.assertEqual(len(dispatcher.calls), 3)
+        self.assertEqual(len(dispatcher.calls), 2)
+        self.assertNotIn("task_failed", event_types)
         self.assertIn("[local_paper]", state["final_answer"])
+        await bus.aclose()
 
     async def test_approval_pause_commits_waiting(self) -> None:
         plan = _plan_decision((_task(task_id="save", capability="dynamic_tools"),))

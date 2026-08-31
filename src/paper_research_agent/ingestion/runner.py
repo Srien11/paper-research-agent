@@ -18,6 +18,7 @@ from paper_research_agent.ingestion.identity import (
     sha256_text,
 )
 from paper_research_agent.ingestion.models import DocumentAsset, IngestionManifest
+from paper_research_agent.ingestion.ocr import create_default_ocr_backend
 from paper_research_agent.ingestion.parser import (
     PARSER_NAME,
     PARSER_VERSION,
@@ -57,7 +58,8 @@ def run_corpus_ingestion(
     if len(versions) != 1:
         raise IngestionRunError(f"语料版本不唯一: {sorted(versions)}")
     corpus_version = next(iter(versions))
-    config = parser_config()
+    ocr_backend = create_default_ocr_backend()
+    config = parser_config(ocr_backend)
     config_json = _canonical_json(config)
     config_sha256 = sha256_text(config_json)
     build_id = make_build_id(
@@ -74,7 +76,9 @@ def run_corpus_ingestion(
     for paper in papers:
         asset = _asset_from_paper(paper)
         assets.append(asset)
-        parsed_documents.append(parse_pdf_asset(paper.local_pdf_path, asset))
+        parsed_documents.append(
+            parse_pdf_asset(paper.local_pdf_path, asset, ocr_backend=ocr_backend)
+        )
 
     pages = sorted(
         (page for document in parsed_documents for page in document.pages),

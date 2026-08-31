@@ -13,7 +13,7 @@ from paper_research_agent.ingestion.parser import (
 )
 
 
-def fake_parse(path: Path, asset) -> ParsedDocument:
+def fake_parse(path: Path, asset, *, ocr_backend=None) -> ParsedDocument:
     page_id = make_page_id(asset.source_sha256, 1)
     text = "Evidence\u2028continued"
     text_hash = sha256_text(text)

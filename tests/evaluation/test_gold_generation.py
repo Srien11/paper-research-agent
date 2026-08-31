@@ -13,6 +13,7 @@ from paper_research_agent.evaluation.gold_generation import (
     GeneratedCandidate,
     SourceEvidence,
     build_gold_question,
+    validate_generated_candidate_quality,
 )
 from paper_research_agent.evaluation.gold_selection import CandidateBlueprint
 
@@ -56,9 +57,7 @@ class GoldGenerationTests(unittest.TestCase):
                 "must_have_claims": [
                     {"claim_id": "M1", "text": "包含异构检索任务。", "span_ids": ["S001"]}
                 ],
-                "forbidden_claims": [
-                    {"claim_id": "F1", "text": "只包含单一类型任务。"}
-                ],
+                "forbidden_claims": [{"claim_id": "F1", "text": "只包含单一类型任务。"}],
             }
         )
         question = build_gold_question(
@@ -99,9 +98,7 @@ class GoldGenerationTests(unittest.TestCase):
         draft = GeneratedCandidate.model_validate(
             {
                 "question": "问题",
-                "must_have_claims": [
-                    {"claim_id": "M1", "text": "事实", "span_ids": ["missing"]}
-                ],
+                "must_have_claims": [{"claim_id": "M1", "text": "事实", "span_ids": ["missing"]}],
                 "forbidden_claims": [],
             }
         )
@@ -113,6 +110,84 @@ class GoldGenerationTests(unittest.TestCase):
                 corpus_version="corpus-v1",
                 knowledge_cutoff=date(2026, 7, 26),
             )
+
+    def test_unreferenced_candidate_evidence_becomes_distractor(self) -> None:
+        second = _source().model_copy(
+            update={
+                "span_id": "S002",
+                "paper_id": "C002",
+                "element_id": "element-2",
+                "projected_chunk_ids": ("chk_002",),
+            }
+        )
+        draft = GeneratedCandidate.model_validate(
+            {
+                "question": "该基准覆盖什么类型的检索任务？",
+                "must_have_claims": [
+                    {"claim_id": "M1", "text": "包含异构检索任务。", "span_ids": ["S001"]}
+                ],
+                "forbidden_claims": [],
+            }
+        )
+        question = build_gold_question(
+            _blueprint(),
+            [_source(), second],
+            draft,
+            corpus_version="corpus-v1",
+            knowledge_cutoff=date(2026, 7, 26),
+        )
+        self.assertEqual(question.evidence_spans[0].support_role, "required")
+        self.assertEqual(question.evidence_spans[1].support_role, "distractor")
+
+    def test_quality_gate_rejects_cross_paper_attribution(self) -> None:
+        other = _source().model_copy(update={"paper_id": "C002"})
+        draft = GeneratedCandidate.model_validate(
+            {
+                "question": "AlphaBench 在哪里发表？",
+                "must_have_claims": [
+                    {
+                        "claim_id": "M1",
+                        "text": "AlphaBench 发表于某会议。",
+                        "span_ids": ["S001"],
+                    }
+                ],
+                "forbidden_claims": [],
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "cross-paper"):
+            validate_generated_candidate_quality(
+                draft,
+                [other],
+                {"C001": "AlphaBench: A Reliable Benchmark", "C002": "BetaSuite"},
+            )
+
+    def test_quality_gate_rejects_vague_claim_and_degraded_evidence(self) -> None:
+        vague = GeneratedCandidate.model_validate(
+            {
+                "question": "第一步是什么？",
+                "must_have_claims": [
+                    {"claim_id": "M1", "text": "It proposes something.", "span_ids": ["S001"]}
+                ],
+                "forbidden_claims": [],
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "vague placeholder"):
+            validate_generated_candidate_quality(vague, [_source()], {"C001": "Benchmark"})
+
+        degraded_source = _source().model_copy(
+            update={"raw_quote": " ".join("x" for _ in range(40))}
+        )
+        grounded = GeneratedCandidate.model_validate(
+            {
+                "question": "结果是什么？",
+                "must_have_claims": [
+                    {"claim_id": "M1", "text": "结果为一。", "span_ids": ["S001"]}
+                ],
+                "forbidden_claims": [],
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "degraded evidence"):
+            validate_generated_candidate_quality(grounded, [degraded_source], {"C001": "Benchmark"})
 
 
 if __name__ == "__main__":

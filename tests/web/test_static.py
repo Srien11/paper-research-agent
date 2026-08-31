@@ -194,6 +194,12 @@ class StaticWebContractTests(unittest.TestCase):
         )
         self.assertIn("else finalizeRunAnswers(runView)", self.javascript)
 
+    def test_answer_retry_resets_previous_attempt_text(self) -> None:
+        self.assertIn(
+            'event.type === "answer_started" ? ""',
+            self.javascript,
+        )
+
     def test_styles_cover_focus_reduced_motion_and_mobile_layout(self) -> None:
         self.assertIn(":focus-visible", self.css)
         self.assertIn("prefers-reduced-motion", self.css)

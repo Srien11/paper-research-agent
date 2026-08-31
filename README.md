@@ -152,6 +152,26 @@ python scripts/evaluate_retrieval.py `
   --chunks data/processed/chunks/chunks.jsonl
 ```
 
+PDF 解析默认启用 OCR（光学字符识别）降级：普通数字版页面继续使用 `pdfplumber`，仅当
+页面含栅格图像且原生文本少于 24 个字符，或原生页面提取失败时，才渲染该页并调用
+Tesseract。OCR 文字会标记为 `generated`，同时记录引擎、语言模型和版本；扫描页需要 OCR
+但运行时不可用时会明确记为失败，不会静默作为空白页进入索引。
+
+先安装摄取依赖和 Tesseract 5，并安装 `eng`、`chi_sim` 语言包：
+
+```powershell
+python -m pip install -e ".[ingestion]"
+# Windows 示例；也可通过 PRA_TESSERACT_CMD 指向已有 tesseract.exe
+winget install --id UB-Mannheim.TesseractOCR
+```
+
+Linux 可安装 `tesseract-ocr tesseract-ocr-eng tesseract-ocr-chi-sim`。相关参数见
+`.env.example`；只有明确不处理扫描件时才将 `PRA_OCR_ENABLED` 设为 `false`。
+
+当前知识库构建仍是手工、全量的三阶段流水线：`parse_corpus.py` → `build_chunks.py` →
+`build_retrieval_index.py`。构建 ID 能保证重复执行和结果追溯，但项目尚未提供目录监听、自动
+增量摄取或新索引原子切换，因此不能视为持续知识库更新。
+
 中文生产查询使用独立的双路入口，不改变原有 A/B/C 基线，也不需要重新分块或生成向量：
 
 ```powershell
@@ -518,6 +538,13 @@ python scripts/serve_web.py
 
 完整安装、升级审查、隐私、监控与回滚步骤见
 [MCP 工具接入与运维](docs/MCP工具接入与运维.md)。
+
+## Ragas 评测
+
+论文研究回答可使用固定版本 `ragas==0.4.3` 评估入选上下文精确率/召回率、回答忠实度、
+回答相关性和逐 claim 引用忠实度。评分会按 `chunk_id` 水化实际入选的完整证据块，并仅在内存中处理真实问题、回答和证据正文；结果文件只保存
+案例 ID、数字分数、耗时和安全异常类型。安装、准备检查、小规模冒烟和裁判校准步骤见
+[Ragas 论文研究 Agent 评测运行手册](docs/Ragas评测运行手册.md)。
 
 ## 可中断、可编辑的计划执行
 

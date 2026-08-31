@@ -1,0 +1,23 @@
+{
+  "schema_version": "ragas-evaluation-config-v1",
+  "ragas_version": "0.4.3",
+  "judge_model": "qwen3.7-plus-2026-05-26",
+  "embedding_model": "text-embedding-v4",
+  "max_concurrency": 4,
+  "enabled_metrics": [
+    "selected_context_precision",
+    "selected_context_recall",
+    "response_faithfulness",
+    "answer_relevancy",
+    "citation_faithfulness"
+  ],
+  "diagnostic_thresholds": {
+    "selected_context_precision": 0.8,
+    "selected_context_recall": 0.8,
+    "response_faithfulness": 0.9,
+    "answer_relevancy": 0.8,
+    "citation_faithfulness": 0.9,
+    "paper_id_recall": 0.8
+  },
+  "release_gate_enabled": false
+}

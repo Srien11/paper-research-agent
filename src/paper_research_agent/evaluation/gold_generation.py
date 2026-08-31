@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+from collections.abc import Mapping, Sequence
 from datetime import date
 from typing import Literal
 
@@ -50,6 +52,83 @@ class GeneratedCandidate(FrozenModel):
         return value.strip() if value is not None else None
 
 
+_VAGUE_CLAIM_PATTERNS = (
+    re.compile(r"\b(?:something|somehow|implied|unspecified)\b", re.IGNORECASE),
+    re.compile(r"具体(?:指标|维度)|某种(?:指标|维度|内容)"),
+)
+_TITLE_TOKEN_STOPWORDS = {
+    "about",
+    "against",
+    "benchmark",
+    "benchmarks",
+    "evaluation",
+    "framework",
+    "language",
+    "large",
+    "model",
+    "models",
+    "paper",
+    "reasoning",
+    "results",
+    "study",
+    "using",
+    "with",
+}
+
+
+def validate_generated_candidate_quality(
+    draft: GeneratedCandidate,
+    evidence: Sequence[SourceEvidence],
+    titles: Mapping[str, str],
+) -> None:
+    """Reject deterministic silver defects before they enter the candidate cache."""
+
+    evidence_by_span = {span.span_id: span for span in evidence}
+    title_markers = _unique_title_markers(titles)
+    for claim in draft.must_have_claims:
+        if any(pattern.search(claim.text) for pattern in _VAGUE_CLAIM_PATTERNS):
+            raise ValueError(f"must-have claim contains vague placeholder: {claim.claim_id}")
+        supporting = [evidence_by_span[span_id] for span_id in claim.span_ids]
+        if supporting and all(_looks_degraded_evidence(span.raw_quote) for span in supporting):
+            raise ValueError(f"must-have claim relies only on degraded evidence: {claim.claim_id}")
+
+        named_papers = {
+            paper_id
+            for marker, paper_id in title_markers.items()
+            if re.search(rf"(?<![\w]){re.escape(marker)}(?![\w])", claim.text, re.IGNORECASE)
+        }
+        supporting_papers = {span.paper_id for span in supporting}
+        if named_papers and not named_papers & supporting_papers:
+            raise ValueError(f"must-have claim has cross-paper attribution: {claim.claim_id}")
+
+
+def _unique_title_markers(titles: Mapping[str, str]) -> dict[str, str]:
+    owners: dict[str, set[str]] = {}
+    for paper_id, title in titles.items():
+        tokens = {
+            token.lower()
+            for token in re.findall(r"[A-Za-z][A-Za-z0-9+.-]{4,}", title)
+            if token.lower() not in _TITLE_TOKEN_STOPWORDS
+        }
+        for token in tokens:
+            owners.setdefault(token, set()).add(paper_id)
+    return {
+        marker: next(iter(paper_ids)) for marker, paper_ids in owners.items() if len(paper_ids) == 1
+    }
+
+
+def _looks_degraded_evidence(value: str) -> bool:
+    if len(re.findall(r"%[0-9A-Fa-f]{2}", value)) >= 3:
+        return True
+    tokens = re.findall(r"\S+", value)
+    if len(tokens) < 30:
+        return False
+    single_character_tokens = sum(
+        len(re.sub(r"[^\w]", "", token, flags=re.UNICODE)) <= 1 for token in tokens
+    )
+    return single_character_tokens / len(tokens) >= 0.45
+
+
 def build_gold_question(
     blueprint: CandidateBlueprint,
     evidence: list[SourceEvidence],
@@ -69,6 +148,7 @@ def build_gold_question(
         raise ValueError("unanswerable draft cannot contain must-have claims")
 
     citation_relations: list[dict[str, str]] = []
+    required_span_ids: set[str] = set()
     for claim in draft.must_have_claims:
         if not claim.span_ids:
             raise ValueError(f"must-have claim {claim.claim_id} has no evidence span")
@@ -78,6 +158,7 @@ def build_gold_question(
             citation_relations.append(
                 {"claim_id": claim.claim_id, "span_id": span_id, "relation": "supports"}
             )
+            required_span_ids.add(span_id)
 
     question_id = "GQ" + blueprint.case_id[1:]
     return GoldQuestion.model_validate(
@@ -90,12 +171,10 @@ def build_gold_question(
             "question": draft.question,
             "answerable": blueprint.answerable,
             "must_have_claims": [
-                {"claim_id": claim.claim_id, "text": claim.text}
-                for claim in draft.must_have_claims
+                {"claim_id": claim.claim_id, "text": claim.text} for claim in draft.must_have_claims
             ],
             "forbidden_claims": [
-                {"claim_id": claim.claim_id, "text": claim.text}
-                for claim in draft.forbidden_claims
+                {"claim_id": claim.claim_id, "text": claim.text} for claim in draft.forbidden_claims
             ],
             "evidence_spans": [
                 {
@@ -108,7 +187,9 @@ def build_gold_question(
                     "raw_span_end": len(span.raw_quote),
                     "raw_quote": span.raw_quote,
                     "span_hash": span.span_hash,
-                    "support_role": span.support_role,
+                    "support_role": (
+                        "required" if span.span_id in required_span_ids else "distractor"
+                    ),
                     "projected_chunk_ids": span.projected_chunk_ids,
                 }
                 for span in evidence

@@ -58,17 +58,6 @@ def evaluate_task(
             "子图执行失败",
         )
     if result.status == "insufficient_evidence":
-        if (
-            child_calls_used < max_child_calls
-            and task.attempt_count + 1 < max_attempts
-        ):
-            return TaskEvaluation(
-                task_id=task.task_id,
-                outcome="retry",
-                missing_criteria=task.success_criteria,
-                summary=result.summary,
-                reason="证据不足，重试任务",
-            )
         if child_calls_used < max_child_calls and replans_used < max_replans:
             return TaskEvaluation(
                 task_id=task.task_id,
@@ -82,7 +71,7 @@ def evaluate_task(
             outcome="fail",
             missing_criteria=task.success_criteria,
             summary=result.summary,
-            reason="证据不足且无重试与重规划预算",
+            reason="证据不足且无可用重规划预算",
         )
     if result.capability == "local_rag" and result.citation_kind != "local_paper":
         return TaskEvaluation(

@@ -140,14 +140,23 @@ class RAGRuntimeChildExecutor:
         )
         if self._run_event_publisher is not None:
             safe_sources = _answer_sources(result, answer)
+            evidence_sufficient = answer.status == "answered"
             await self._run_event_publisher.publish(
                 _task_event(
                     request,
                     "retrieval_completed",
                     node_id=f"retrieval:{request.task_id}",
-                    status="completed",
-                    title="本地论文检索完成",
-                    summary=f"找到 {len(citations)} 条来源",
+                    status="completed" if evidence_sufficient else "failed",
+                    title=(
+                        "本地论文检索完成"
+                        if evidence_sufficient
+                        else "本地论文证据不足"
+                    ),
+                    summary=(
+                        f"找到 {len(citations)} 条来源"
+                        if evidence_sufficient
+                        else "未找到足以支持回答的可引用来源"
+                    ),
                     detail=SafeRunEventDetail(
                         capability="local_rag",
                         delivery_mode="event_only",
@@ -157,14 +166,15 @@ class RAGRuntimeChildExecutor:
                 ),
                 idempotency_key=_task_event_key(request, "retrieval:completed"),
             )
-            answer_publisher = _TaskAnswerPublisher(
-                self._run_event_publisher,
-                request,
-                delivery_mode="validated_replay",
-            )
-            for chunk in _text_chunks(artifact.text):
-                await answer_publisher.publish(chunk)
-            await answer_publisher.complete(artifact.metrics, citations=safe_sources)
+            if evidence_sufficient:
+                answer_publisher = _TaskAnswerPublisher(
+                    self._run_event_publisher,
+                    request,
+                    delivery_mode="validated_replay",
+                )
+                for chunk in _text_chunks(artifact.text):
+                    await answer_publisher.publish(chunk)
+                await answer_publisher.complete(artifact.metrics, citations=safe_sources)
         return artifact
 
 

@@ -11,17 +11,19 @@ from collections import defaultdict
 from datetime import date
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+from paper_research_agent.evaluation.gold_dataset import GoldQuestion
 from paper_research_agent.evaluation.gold_generation import (
     GeneratedCandidate,
     SourceEvidence,
     build_gold_question,
+    validate_generated_candidate_quality,
 )
 from paper_research_agent.evaluation.gold_selection import (
     CandidateBlueprint,
@@ -86,9 +88,15 @@ class DraftModel:
                 body = response.json()
                 content = body["choices"][0]["message"]["content"]
                 draft = GeneratedCandidate.model_validate(json.loads(content))
-                _validate_generated_draft(blueprint, draft, titles)
+                _validate_generated_draft(blueprint, draft, evidence, titles)
                 return draft
-            except (httpx.HTTPError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            except (
+                httpx.HTTPError,
+                KeyError,
+                TypeError,
+                ValueError,
+                json.JSONDecodeError,
+            ) as error:
                 last_error = error
         raise CandidateGenerationError(
             f"candidate {blueprint.case_id} failed after retries: {type(last_error).__name__}"
@@ -119,19 +127,17 @@ async def run(args: argparse.Namespace) -> None:
     chunks_by_element = _chunk_projection(args.chunks)
     evidence_pool = _load_evidence_pool(args.elements, chunks_by_element)
     titles = {str(row["corpus_id"]): str(row["title"]) for row in papers}
-    selected_by_case = {
-        slot.case_id: _select_evidence(slot, evidence_pool) for slot in blueprint
-    }
+    selected_by_case = {slot.case_id: _select_evidence(slot, evidence_pool) for slot in blueprint}
     config = json.loads(MODEL_CONFIG.read_text(encoding="utf-8"))
     model = DraftModel(api_key=api_key, base_url=base_url, model=str(config["model"]))
     semaphore = asyncio.Semaphore(args.concurrency)
 
-    async def generate_one(slot: CandidateBlueprint) -> object:
+    async def generate_one(slot: CandidateBlueprint) -> GoldQuestion:
         selected = selected_by_case[slot.case_id]
         cache_path = args.cache_dir / f"{slot.case_id}.json"
         if cache_path.exists():
             draft = GeneratedCandidate.model_validate_json(cache_path.read_text(encoding="utf-8"))
-            _validate_generated_draft(slot, draft, titles)
+            _validate_generated_draft(slot, draft, selected, titles)
         else:
             async with semaphore:
                 draft = await model.generate(slot, selected, titles)
@@ -232,7 +238,7 @@ def _load_evidence_pool(
             or element_id not in chunks_by_element
         ):
             continue
-        item = {
+        item: dict[str, Any] = {
             "paper_id": str(element["corpus_id"]),
             "evidence_version_id": str(element["asset_id"]),
             "page": int(element["page_number"]),
@@ -241,7 +247,7 @@ def _load_evidence_pool(
             "raw_quote": raw_text,
             "projected_chunk_ids": chunks_by_element[element_id],
         }
-        pool[item["paper_id"]].append(item)
+        pool[str(item["paper_id"])].append(item)
     return pool
 
 
@@ -261,7 +267,7 @@ def _select_evidence(
                 selected.append(item)
     if not selected:
         raise CandidateGenerationError(f"candidate {slot.case_id} has no source evidence")
-    role = "required" if slot.answerable else "distractor"
+    role: Literal["required", "distractor"] = "required" if slot.answerable else "distractor"
     return [
         SourceEvidence(
             span_id=f"S{index:03d}",
@@ -288,9 +294,13 @@ def _evidence_score(slot: CandidateBlueprint, item: dict[str, Any]) -> int:
         score += 200
     if slot.task_type == "experimental_result" and re.search(r"\d|%|result|accuracy|score", text):
         score += 100
-    if slot.task_type == "method_mechanism" and re.search(r"method|approach|framework|we (?:use|propose)", text):
+    if slot.task_type == "method_mechanism" and re.search(
+        r"method|approach|framework|we (?:use|propose)", text
+    ):
         score += 80
-    if slot.task_type == "definition_scope" and re.search(r"define|consist|include|benchmark|evaluate", text):
+    if slot.task_type == "definition_scope" and re.search(
+        r"define|consist|include|benchmark|evaluate", text
+    ):
         score += 60
     if re.search(r"references|acknowledg", text):
         score -= 200
@@ -323,15 +333,11 @@ def _generation_input(
         "unanswerable_taxonomy": slot.unanswerable_reason,
         "required_output": {
             "question": "string",
-            "must_have_claims": [
-                {"claim_id": "M1", "text": "atomic claim", "span_ids": ["S001"]}
-            ],
+            "must_have_claims": [{"claim_id": "M1", "text": "atomic claim", "span_ids": ["S001"]}],
             "forbidden_claims": [
                 {"claim_id": "F1", "text": "plausible false claim", "span_ids": []}
             ],
-            "unanswerable_reason": (
-                "null for answerable; concise reason for unanswerable"
-            ),
+            "unanswerable_reason": ("null for answerable; concise reason for unanswerable"),
         },
         "rules": (
             "For unanswerable cases return no must-have claims and construct a difficult "
@@ -352,6 +358,7 @@ def _generation_input(
 def _validate_generated_draft(
     slot: CandidateBlueprint,
     draft: GeneratedCandidate,
+    evidence: list[SourceEvidence],
     titles: dict[str, str],
 ) -> None:
     if slot.answerable != bool(draft.must_have_claims):
@@ -368,6 +375,7 @@ def _validate_generated_draft(
         similarity = SequenceMatcher(a=normalized, b=title).ratio() if title else 0.0
         if title and (normalized == title or similarity >= 0.92):
             raise ValueError("generated question copies a paper title")
+    validate_generated_candidate_quality(draft, evidence, titles)
 
 
 def _normalized_question(value: str) -> str:

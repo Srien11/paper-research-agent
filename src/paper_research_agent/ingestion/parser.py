@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TypeGuard
 
 import pdfplumber
 
@@ -22,12 +22,18 @@ from paper_research_agent.ingestion.models import (
     PageRecord,
     SectionRecord,
 )
+from paper_research_agent.ingestion.ocr import (
+    OcrBackend,
+    OcrError,
+    OcrUnavailableError,
+    create_default_ocr_backend,
+)
 from paper_research_agent.ingestion.structure import infer_document_structure
 from paper_research_agent.ingestion.text import normalize_text
 
 PARSER_NAME = "pdfplumber"
 PARSER_VERSION = pdfplumber.__version__
-PARSER_CONFIG_SCHEMA_VERSION = "pdf-parser-config-v1"
+PARSER_CONFIG_SCHEMA_VERSION = "pdf-parser-config-v2"
 X_TOLERANCE = 2.0
 COLUMN_SPLIT_GAP_RATIO = 0.018
 MARGIN_RATIO = 0.08
@@ -38,6 +44,8 @@ _PAGE_NUMBER = re.compile(
     re.IGNORECASE,
 )
 _DIGITS = re.compile(r"\d+")
+MIN_NATIVE_TEXT_CHARS = 24
+_DEFAULT_OCR = object()
 
 
 class PdfParseError(RuntimeError):
@@ -60,6 +68,13 @@ class PageDraft:
     width: float
     height: float
     lines: tuple[TextLine, ...]
+    has_raster_image: bool = False
+    content_origin: Literal["source_text", "generated"] = "source_text"
+    parser_name: str = PARSER_NAME
+    parser_version: str = PARSER_VERSION
+    generation_method: str | None = None
+    generation_model: str | None = None
+    generation_version: str | None = None
     error_code: str | None = None
     error_message: str | None = None
 
@@ -71,9 +86,16 @@ class ParsedDocument:
     elements: tuple[DocumentElement, ...]
 
 
-def parser_config() -> dict[str, object]:
+def parser_config(
+    ocr_backend: OcrBackend | None | object = _DEFAULT_OCR,
+) -> dict[str, object]:
     """返回会影响解析结果的确定性配置。"""
 
+    backend = (
+        create_default_ocr_backend()
+        if ocr_backend is _DEFAULT_OCR
+        else ocr_backend
+    )
     return {
         "schema_version": PARSER_CONFIG_SCHEMA_VERSION,
         "parser_name": PARSER_NAME,
@@ -105,6 +127,11 @@ def parser_config() -> dict[str, object]:
             "discard_fully_outside_page": True,
             "clip_partially_visible_lines": True,
             "discard_rotated_side_margin_lines": True,
+        },
+        "ocr_fallback": {
+            "enabled": _is_ocr_backend(backend),
+            "trigger": "raster_page_with_less_than_24_native_text_characters",
+            "backend": backend.config() if _is_ocr_backend(backend) else None,
         },
     }
 
@@ -273,7 +300,12 @@ def clean_page_lines(
     return tuple(kept)
 
 
-def parse_pdf_asset(pdf_path: Path, asset: DocumentAsset) -> ParsedDocument:
+def parse_pdf_asset(
+    pdf_path: Path,
+    asset: DocumentAsset,
+    *,
+    ocr_backend: OcrBackend | None | object = _DEFAULT_OCR,
+) -> ParsedDocument:
     """解析一个已通过冻结清单校验的 PDF 资产。"""
 
     if not pdf_path.is_file():
@@ -293,6 +325,22 @@ def parse_pdf_asset(pdf_path: Path, asset: DocumentAsset) -> ParsedDocument:
             _extract_page_draft(page, page_number)
             for page_number, page in enumerate(document.pages, start=1)
         )
+
+    backend = (
+        create_default_ocr_backend()
+        if ocr_backend is _DEFAULT_OCR
+        else ocr_backend
+    )
+    drafts = tuple(
+        _apply_ocr_fallback(
+            pdf_path,
+            draft,
+            backend if _is_ocr_backend(backend) else None,
+        )
+        if _needs_ocr_fallback(draft)
+        else draft
+        for draft in drafts
+    )
 
     repeated = find_repeated_margin_signatures(drafts)
     pages: list[PageRecord] = []
@@ -314,13 +362,21 @@ def _extract_page_draft(page: object, page_number: int) -> PageDraft:
     height = float(page.height)  # type: ignore[attr-defined]
     try:
         lines = order_page_lines(extract_lines(page), width)
-        return PageDraft(page_number, width, height, lines)
+        images = getattr(page, "images", ())
+        return PageDraft(
+            page_number,
+            width,
+            height,
+            lines,
+            has_raster_image=bool(images),
+        )
     except Exception as exc:  # noqa: BLE001 - isolate one malformed PDF page
         return PageDraft(
             page_number,
             width,
             height,
             (),
+            has_raster_image=bool(getattr(page, "images", ())),
             error_code="page_extraction_error",
             error_message=f"{type(exc).__name__}: {exc}",
         )
@@ -342,8 +398,8 @@ def _build_page_records(
                 width_points=draft.width,
                 height_points=draft.height,
                 source_sha256=asset.source_sha256,
-                parser_name=PARSER_NAME,
-                parser_version=PARSER_VERSION,
+                parser_name=draft.parser_name,
+                parser_version=draft.parser_version,
                 status="failed",
                 error_code=draft.error_code,
                 error_message=draft.error_message,
@@ -364,8 +420,8 @@ def _build_page_records(
                 width_points=draft.width,
                 height_points=draft.height,
                 source_sha256=asset.source_sha256,
-                parser_name=PARSER_NAME,
-                parser_version=PARSER_VERSION,
+                parser_name=draft.parser_name,
+                parser_version=draft.parser_version,
                 status="empty",
             ),
             (),
@@ -379,8 +435,8 @@ def _build_page_records(
         width_points=draft.width,
         height_points=draft.height,
         source_sha256=asset.source_sha256,
-        parser_name=PARSER_NAME,
-        parser_version=PARSER_VERSION,
+        parser_name=draft.parser_name,
+        parser_version=draft.parser_version,
         status="parsed",
         raw_text=raw_text,
         normalized_text=normalized_text,
@@ -397,6 +453,12 @@ def _build_page_records(
             asset=asset,
             page_id=page_id,
             page_number=draft.page_number,
+            content_origin=draft.content_origin,
+            parser_name=draft.parser_name,
+            parser_version=draft.parser_version,
+            generation_method=draft.generation_method,
+            generation_model=draft.generation_model,
+            generation_version=draft.generation_version,
         )
         for reading_order, line in enumerate(cleaned_lines)
     )
@@ -412,6 +474,12 @@ def _build_element(
     asset: DocumentAsset,
     page_id: str,
     page_number: int,
+    content_origin: Literal["source_text", "generated"],
+    parser_name: str,
+    parser_version: str,
+    generation_method: str | None,
+    generation_model: str | None,
+    generation_version: str | None,
 ) -> DocumentElement:
     normalized = normalize_text(line.text)
     normalized_hash = sha256_text(normalized)
@@ -435,10 +503,86 @@ def _build_element(
         raw_end=raw_end,
         bbox=(line.x0, line.top, line.x1, line.bottom),
         normalized_text_sha256=normalized_hash,
+        content_origin=content_origin,
+        generation_method=generation_method,
+        generation_model=generation_model,
+        generation_version=generation_version,
         source_sha256=asset.source_sha256,
-        parser_name=PARSER_NAME,
-        parser_version=PARSER_VERSION,
+        parser_name=parser_name,
+        parser_version=parser_version,
     )
+
+
+def _needs_ocr_fallback(draft: PageDraft) -> bool:
+    if draft.error_code is not None:
+        return True
+    native_text = normalize_text("\n".join(line.text for line in draft.lines))
+    return draft.has_raster_image and len(native_text) < MIN_NATIVE_TEXT_CHARS
+
+
+def _apply_ocr_fallback(
+    pdf_path: Path,
+    draft: PageDraft,
+    backend: OcrBackend | None,
+) -> PageDraft:
+    if backend is None:
+        if draft.error_code is not None:
+            return draft
+        return _ocr_failure_draft(draft, "ocr_disabled", "扫描页需要 OCR，但 OCR 已关闭")
+    try:
+        result = backend.extract_page(
+            pdf_path,
+            draft.page_number,
+            width_points=draft.width,
+            height_points=draft.height,
+        )
+    except OcrUnavailableError as exc:
+        return _ocr_failure_draft(draft, "ocr_unavailable", str(exc))
+    except OcrError as exc:
+        return _ocr_failure_draft(draft, "ocr_failed", str(exc))
+    lines = tuple(
+        TextLine(line.text, line.x0, line.top, line.x1, line.bottom)
+        for line in result.lines
+        if normalize_text(line.text)
+    )
+    if not lines:
+        return _ocr_failure_draft(draft, "ocr_empty", "OCR 未识别出文本")
+    return PageDraft(
+        page_number=draft.page_number,
+        width=draft.width,
+        height=draft.height,
+        lines=order_page_lines(lines, draft.width),
+        has_raster_image=draft.has_raster_image,
+        content_origin="generated",
+        parser_name=result.engine,
+        parser_version=result.engine_version,
+        generation_method="ocr",
+        generation_model=result.model,
+        generation_version=result.engine_version,
+    )
+
+
+def _ocr_failure_draft(
+    draft: PageDraft,
+    error_code: str,
+    error_message: str,
+) -> PageDraft:
+    # 低文本但仍有原生文本时保留更可信的文本层；完全无文本时明确失败。
+    if draft.error_code is None and normalize_text("\n".join(line.text for line in draft.lines)):
+        return draft
+    return PageDraft(
+        page_number=draft.page_number,
+        width=draft.width,
+        height=draft.height,
+        lines=(),
+        has_raster_image=draft.has_raster_image,
+        error_code=error_code,
+        error_message=error_message,
+    )
+
+
+def _is_ocr_backend(value: object) -> TypeGuard[OcrBackend]:
+    return hasattr(value, "config") and hasattr(value, "extract_page")
 
 
 def _raw_offsets(lines: tuple[TextLine, ...]) -> dict[int, tuple[int, int]]:

@@ -165,6 +165,32 @@ class _DelayedDeterministicRAGRuntime(_FakeRAGRuntime):
         return result
 
 
+class _InsufficientRAGRuntime(_FakeRAGRuntime):
+    async def ask(self, question: str, **kwargs: object) -> object:
+        result = await super().ask(question, **kwargs)
+        result.answer = RAGAnswer(
+            status="insufficient_evidence",
+            answer_markdown="当前证据不足。",
+            claims=(),
+            citations=(),
+            requested_model="test-model",
+            actual_model="test-model",
+            prompt_version="test-v1",
+            input_tokens=10,
+            output_tokens=5,
+            latency_ms=8,
+            attempts=1,
+        )
+        result.retrieval = SimpleNamespace(
+            index_id="idx-test",
+            resolved_question="测试问题",
+            degraded=False,
+            hits=(),
+        )
+        result.sources = ()
+        return result
+
+
 class ConversationChildExecutorTests(unittest.IsolatedAsyncioTestCase):
     async def test_rag_child_elapsed_is_wall_time_not_answer_provider_time(self) -> None:
         artifact = await RAGRuntimeChildExecutor(
@@ -212,6 +238,37 @@ class ConversationChildExecutorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(completed.detail.citations[0].citation_id, "E1")
         self.assertEqual(completed.detail.citations[0].title, "测试论文")
         self.assertEqual(completed.detail.citations[0].excerpt, "受控证据预览")
+        await bus.aclose()
+
+    async def test_insufficient_rag_is_status_only_not_answer_replay(self) -> None:
+        store = InMemoryConversationStore()
+        started = store.begin_agent_run(
+            request_id="req_child_12345678901",
+            conversation_id="conversation-1",
+            user_question="测试问题",
+        )
+        bus = RunEventBus(store)
+        executor = RAGRuntimeChildExecutor(
+            _InsufficientRAGRuntime(),
+            run_event_publisher=bus.publisher,
+        )
+
+        artifact = await executor.answer(
+            _request(
+                capability="local_rag",
+                rag_mode="required",
+                objective="测试问题",
+                run_id=started.run_id,
+                turn_id=started.turn_id,
+            )
+        )
+        events = [item.to_stream_event() for item in store.run_events(started.request_id)]
+
+        self.assertEqual(artifact.answer.status, "insufficient_evidence")
+        self.assertEqual([item.type for item in events], ["retrieval_completed"])
+        self.assertEqual(events[0].status, "failed")
+        self.assertEqual(events[0].title, "本地论文证据不足")
+        self.assertEqual(events[0].detail.source_count, 0)
         await bus.aclose()
 
     async def test_provider_deltas_are_persisted_before_child_returns(self) -> None:
