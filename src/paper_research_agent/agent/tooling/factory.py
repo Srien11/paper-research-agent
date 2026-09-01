@@ -6,7 +6,7 @@ import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 import httpx
 
@@ -16,7 +16,15 @@ from paper_research_agent.agent.tooling.analysis import AnalysisResearchTools
 from paper_research_agent.agent.tooling.approval import ApprovalManager
 from paper_research_agent.agent.tooling.content import ContentResearchTools
 from paper_research_agent.agent.tooling.local import LocalResearchTools
-from paper_research_agent.agent.tooling.scholarly import ScholarlyResearchTools
+from paper_research_agent.agent.tooling.scholarly import (
+    ScholarlyResearchTools,
+    SemanticScholarCrossrefProvider,
+)
+from paper_research_agent.agent.tooling.scholarly_providers import (
+    OfflineScholarlyProvider,
+    ScholarlyProvider,
+    ScholarlyProviderRegistry,
+)
 from paper_research_agent.agent.tooling.service import ExtendedResearchToolkit
 from paper_research_agent.agent.tooling.workspace import WorkspaceResearchTools
 from paper_research_agent.chunking.models import EvidenceChunk
@@ -31,15 +39,16 @@ class AsyncClosable(Protocol):
 @dataclass
 class ExtendedToolkitHandle:
     toolkit: ExtendedResearchToolkit
-    client: httpx.AsyncClient
+    client: httpx.AsyncClient | None
     mcp_manager: AsyncClosable | None = None
 
     async def aclose(self) -> None:
         failures: list[Exception] = []
-        try:
-            await self.client.aclose()
-        except Exception as exc:  # noqa: BLE001 - still close the independent MCP lifecycle
-            failures.append(exc)
+        if self.client is not None:
+            try:
+                await self.client.aclose()
+            except Exception as exc:  # noqa: BLE001 - still close independent resources
+                failures.append(exc)
         if self.mcp_manager is not None:
             try:
                 await self.mcp_manager.aclose()
@@ -60,17 +69,31 @@ def create_extended_research_toolkit(
     elements: Sequence[DocumentElement] = (),
     event_sink: AgentEventSink | None = None,
     semantic_scholar_api_key: str | None = None,
+    scholarly_mode: str | None = None,
+    scholarly_provider: ScholarlyProvider | None = None,
+    environ: Mapping[str, str] | None = None,
 ) -> ExtendedToolkitHandle:
     approvals = ApprovalManager()
-    client = httpx.AsyncClient(
-        timeout=httpx.Timeout(10),
-        follow_redirects=False,
-        headers={"User-Agent": "paper-research-agent/0.1 (local research)"},
-    )
-    scholarly = ScholarlyResearchTools(
-        client,
-        api_key=semantic_scholar_api_key or os.getenv("SEMANTIC_SCHOLAR_API_KEY"),
-    )
+    source = os.environ if environ is None else environ
+    client: httpx.AsyncClient | None = None
+    provider = scholarly_provider
+    if provider is None:
+        mode = _resolve_scholarly_mode(
+            scholarly_mode if scholarly_mode is not None else source.get("PRA_SCHOLARLY_MODE")
+        )
+        if mode == "offline":
+            provider = OfflineScholarlyProvider()
+        else:
+            client = httpx.AsyncClient(
+                timeout=httpx.Timeout(10),
+                follow_redirects=False,
+                headers={"User-Agent": "paper-research-agent/0.1 (local research)"},
+            )
+            provider = SemanticScholarCrossrefProvider(
+                client,
+                api_key=semantic_scholar_api_key or source.get("SEMANTIC_SCHOLAR_API_KEY"),
+            )
+    scholarly = ScholarlyResearchTools(ScholarlyProviderRegistry((provider,)))
     toolkit = ExtendedResearchToolkit(
         local=LocalResearchTools(
             chunks=chunks,
@@ -91,3 +114,13 @@ def create_extended_research_toolkit(
         approvals=approvals,
     )
     return ExtendedToolkitHandle(toolkit=toolkit, client=client)
+
+
+ScholarlyMode = Literal["offline", "live"]
+
+
+def _resolve_scholarly_mode(value: str | None) -> ScholarlyMode:
+    normalized = (value or "offline").strip().casefold()
+    if normalized not in {"offline", "live"}:
+        raise ValueError("PRA_SCHOLARLY_MODE must be offline or live")
+    return "live" if normalized == "live" else "offline"

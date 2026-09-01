@@ -15,13 +15,23 @@ from paper_research_agent.agent.tooling.registry import (
     ToolProvider,
     ToolRegistrySnapshot,
 )
+from paper_research_agent.agent.tooling.scholarly_providers import (
+    OfflineScholarlyProvider,
+    ScholarlyProvider,
+    ScholarlyProviderRegistry,
+    ScholarlyProviderResult,
+)
 
 __all__ = [
     "EXTENDED_TOOL_SPECS",
     "TOOL_INPUT_SCHEMAS",
     "ExtendedToolPolicy",
     "ExtendedToolkitHandle",
+    "OfflineScholarlyProvider",
     "RegisteredTool",
+    "ScholarlyProvider",
+    "ScholarlyProviderRegistry",
+    "ScholarlyProviderResult",
     "ToolExecutionResult",
     "ToolProvider",
     "ToolRegistrySnapshot",

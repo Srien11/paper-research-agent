@@ -16,7 +16,7 @@
 - **状态、安全与审批**：SQLite Checkpoint 恢复 thread；笔记、报告和长期记忆写入使用与工具名、参数哈希绑定的一次性审批令牌，避免旧确认复用到新参数。
 - **后端智能路由**：前端提交问题、附件和明确的 `rag_mode`（`disabled` / `preferred` / `required`）；关闭时禁止本地检索，优先模式允许本地 RAG、普通聊天和联网研究动态分流，仅本地模式则强制使用论文库。策略层继续校验路由合法性，高风险覆盖、删除和外发仍要求确认。
 - **隐私可观测性**：可恢复产品事件流按游标持久化阶段、任务、工具、路由和安全原因码，支持刷新续传、历史回放、暂停、继续与取消；事件账本和安全遥测均不记录问题、证据正文或 Provider 原始载荷。
-- **本机资源调度**：面向 16 逻辑线程的单用户工作站采用单进程共享索引、六路比较检索和有界本地模型线程池；远端模型 I/O 与本地检索分层限流，避免用多 worker 重复加载模型。最近一次全量工程门禁为 922 项测试、162 个子测试全部通过。
+- **本机资源调度**：面向 16 逻辑线程的单用户工作站采用单进程共享索引、六路比较检索和有界本地模型线程池；远端模型 I/O 与本地检索分层限流，避免用多 worker 重复加载模型。最近一次全量工程门禁为 956 项测试、162 个子测试全部通过。
 
 ## 当前里程碑
 
@@ -526,6 +526,27 @@ python scripts/serve_web.py --host 127.0.0.1 --port 8092
 分类、短摘录，以及改写状态、入选证据/记忆数量和 Token 预算。它不会返回 PDF 路径、图片
 路径、完整 figure JSON、系统提示词、Provider 原始响应或未选中证据全文。部署模板见
 `deploy/`，推荐问题见 `configs/web/recommended-questions-v1.json`。
+
+## 学术元数据 Provider 底座
+
+`search_scholarly_sources`、`resolve_paper_identifier`、`get_citation_graph` 和
+`check_paper_status` 保持稳定的公开工具契约，内部通过有序 Provider（提供方）注册表执行。
+默认模式为 `offline`：不创建 HTTP 客户端、不读取论文 API Key，四个工具统一返回
+`provider_not_configured`，不会用测试假数据冒充真实论文。
+
+```powershell
+$env:PRA_SCHOLARLY_MODE = 'offline'
+python scripts/serve_web.py
+```
+
+单元测试通过依赖注入使用确定性 Fixture Provider（测试假提供方），可覆盖成功、无结果、
+限流、超时和多提供方降级；该实现只存在于测试代码，不能进入生产 Registry（注册表）。
+未来真实接入经审查后，必须显式设置 `PRA_SCHOLARLY_MODE=live`。现有
+Semantic Scholar/Crossref 适配器会继续从 `SEMANTIC_SCHOLAR_API_KEY` 读取可选凭据，后续
+OpenAlex 等提供方可加入同一有序注册表，而无需改变 Agent 路由、工具参数或结果信任等级。
+
+所有学术网络结果仍是低信任 `research_context`，不能直接成为论文引用；外部论文必须经过
+许可核验、受控导入、冻结、解析和本地索引后，才能进入 `citation_evidence` 证据链。
 
 ## 可选 MCP 只读工具
 
