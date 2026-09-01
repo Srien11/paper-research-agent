@@ -51,6 +51,7 @@ class SynthesizedSection(_FrozenSynthesisModel):
 
 class SynthesizedAnswer(_FrozenSynthesisModel):
     text: str = Field(min_length=1, max_length=120_000)
+    conclusion: str = Field(min_length=1, max_length=20_000)
     source_ids: tuple[str, ...] = Field(default=(), max_length=1_200)
     sections: tuple[SynthesizedSection, ...] = Field(min_length=1, max_length=12)
 
@@ -62,10 +63,15 @@ class _DraftSection(_FrozenSynthesisModel):
 
 
 class _SynthesisDraft(_FrozenSynthesisModel):
-    sections: tuple[_DraftSection, ...] = Field(min_length=1, max_length=12)
+    conclusion: str = Field(min_length=1, max_length=8_000)
+    evidence_sections: tuple[_DraftSection, ...] = Field(min_length=1, max_length=12)
 
 
 class _UnknownSourceError(ValueError):
+    pass
+
+
+class SynthesisUnavailableError(RuntimeError):
     pass
 
 
@@ -103,11 +109,19 @@ class AnswerSynthesizer:
         user = HumanMessage(content=_model_input(context, results))
         try:
             raw = await self._model.ainvoke([system, user])
-        except Exception:  # noqa: BLE001 - deterministic synthesis is the fallback
+        except Exception as error:
+            if _all_evidence_unavailable(results):
+                raise SynthesisUnavailableError(
+                    "model synthesis failed with no evidence branch available"
+                ) from error
             return _deterministic_answer(results)
         try:
             draft = raw if isinstance(raw, _SynthesisDraft) else _SynthesisDraft.model_validate(raw)
-        except (ValidationError, TypeError):
+        except (ValidationError, TypeError) as error:
+            if _all_evidence_unavailable(results):
+                raise SynthesisUnavailableError(
+                    "model synthesis returned invalid background-only output"
+                ) from error
             return _deterministic_answer(results)
         try:
             return _answer_from_draft(draft, results)
@@ -134,6 +148,7 @@ def _single_answer(result: ChildTaskResult) -> SynthesizedAnswer:
     text = section.text if result.artifact is not None else _render_sections((section,))
     return SynthesizedAnswer(
         text=text,
+        conclusion=section.text,
         source_ids=section.source_ids,
         sections=(section,),
     )
@@ -145,9 +160,11 @@ def _deterministic_answer(
     if not results:
         raise ValueError("cannot synthesize an answer with no child results")
     sections = tuple(_section_from_result(result) for result in results)
+    conclusion = _deterministic_conclusion(results)
     return SynthesizedAnswer(
-        text=_render_sections(sections),
-        source_ids=_ordered_source_ids(sections),
+        text=_render_answer(conclusion, sections, results),
+        conclusion=conclusion,
+        source_ids=() if _all_evidence_unavailable(results) else _ordered_source_ids(sections),
         sections=sections,
     )
 
@@ -157,13 +174,13 @@ def _answer_from_draft(
     results: tuple[ChildTaskResult, ...],
 ) -> SynthesizedAnswer:
     by_task = {result.task_id: result for result in results}
-    draft_task_ids = tuple(section.task_id for section in draft.sections)
+    draft_task_ids = tuple(section.task_id for section in draft.evidence_sections)
     if len(draft_task_ids) != len(set(draft_task_ids)):
         raise ValueError("synthesis returned duplicate task sections")
     if set(draft_task_ids) != set(by_task):
         raise ValueError("synthesis did not return exactly one section per task")
     sections: list[SynthesizedSection] = []
-    for draft_section in draft.sections:
+    for draft_section in draft.evidence_sections:
         result = by_task[draft_section.task_id]
         result_source_ids = _validated_result_source_ids(result)
         allowed = set(result_source_ids)
@@ -176,7 +193,11 @@ def _answer_from_draft(
             raise _UnknownSourceError(
                 f"synthesis returned unknown source IDs for {result.task_id}: {unknown}"
             )
-        if isinstance(result.artifact, LocalRAGArtifact):
+        source_ids: tuple[str, ...]
+        if result.status != "completed":
+            text = _section_from_result(result).text
+            source_ids = ()
+        elif isinstance(result.artifact, LocalRAGArtifact):
             text = result.artifact.answer.answer_markdown
             source_ids = result_source_ids
         else:
@@ -192,8 +213,13 @@ def _answer_from_draft(
         )
     section_tuple = tuple(sections)
     return SynthesizedAnswer(
-        text=_render_sections(section_tuple),
-        source_ids=_ordered_source_ids(section_tuple),
+        text=_render_answer(draft.conclusion, section_tuple, results),
+        conclusion=draft.conclusion,
+        source_ids=(
+            ()
+            if _all_evidence_unavailable(results)
+            else _ordered_source_ids(section_tuple)
+        ),
         sections=section_tuple,
     )
 
@@ -250,6 +276,79 @@ def _render_sections(sections: tuple[SynthesizedSection, ...]) -> str:
     )
 
 
+def _render_answer(
+    conclusion: str,
+    sections: tuple[SynthesizedSection, ...],
+    results: tuple[ChildTaskResult, ...],
+) -> str:
+    notices = _degradation_notices(results)
+    blocks = [*notices, f"### 综合结论\n\n{conclusion}"]
+    by_task = {result.task_id: result for result in results}
+    labels = {
+        "local_rag": "本地论文依据",
+        "dynamic_tools": "外部学术核验",
+        "direct_chat": "模型回答",
+        "attachment_qa": "附件依据",
+        "file_edit": "文件处理",
+    }
+    for section in sections:
+        result = by_task[section.task_id]
+        blocks.append(
+            f"### {labels[result.capability]}\n\n{section.text}"
+        )
+    if notices:
+        incomplete = tuple(
+            result
+            for result in results
+            if result.capability in {"local_rag", "dynamic_tools"}
+            and result.status != "completed"
+        )
+        details = "；".join(_status_text(result) for result in incomplete)
+        blocks.append(f"### 未完成项\n\n{details}")
+    return "\n\n".join(blocks)
+
+
+def _degradation_notices(results: tuple[ChildTaskResult, ...]) -> tuple[str, ...]:
+    local = tuple(result for result in results if result.capability == "local_rag")
+    external = tuple(result for result in results if result.capability == "dynamic_tools")
+    local_available = bool(local) and any(result.status == "completed" for result in local)
+    external_available = bool(external) and any(
+        result.status == "completed" for result in external
+    )
+    if local and external and not local_available and not external_available:
+        return (
+            "> ⚠️ 以下仅为大模型背景知识，未经本地或外部证据核验；涉及最新状态的信息仍未核验。",
+        )
+    notices: list[str] = []
+    if local and not local_available:
+        notices.append(
+            "> ⚠️ 本地论文证据不足；以下结论不能视为由本地语料支持。"
+        )
+    if external and not external_available:
+        notices.append(
+            "> ⚠️ 外部学术核验未完成；涉及最新、当前、发布或维护状态的信息仍未核验。"
+        )
+    return tuple(notices)
+
+
+def _all_evidence_unavailable(results: tuple[ChildTaskResult, ...]) -> bool:
+    relevant = tuple(
+        result
+        for result in results
+        if result.capability in {"local_rag", "dynamic_tools"}
+    )
+    capabilities = {result.capability for result in relevant}
+    return capabilities == {"local_rag", "dynamic_tools"} and all(
+        result.status != "completed" for result in relevant
+    )
+
+
+def _deterministic_conclusion(results: tuple[ChildTaskResult, ...]) -> str:
+    if _all_evidence_unavailable(results):
+        return "当前没有可用于核验的本地论文或外部学术证据，只能给出一般性背景说明。"
+    return "以下结论综合了当前成功返回的证据分支，并保留各来源边界。"
+
+
 def _ordered_source_ids(sections: tuple[SynthesizedSection, ...]) -> tuple[str, ...]:
     return tuple(
         dict.fromkeys(
@@ -278,6 +377,9 @@ def _model_input(
             {
                 "task_id": result.task_id,
                 "source_kind": result.citation_kind,
+                "capability": result.capability,
+                "status": result.status,
+                "error_code": result.error_code,
                 "allowed_source_ids": result.source_ids,
                 "artifact_text": text,
             }

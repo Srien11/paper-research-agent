@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from paper_research_agent.agent.dynamic.models import (
     DynamicResearchResult,
     PendingApproval,
+    ToolObservation,
 )
 from paper_research_agent.agent.dynamic.runtime import DynamicResearchRuntime
 from paper_research_agent.agent.orchestrator.artifacts import (
@@ -20,6 +21,7 @@ from paper_research_agent.agent.orchestrator.models import (
     ContextMessage,
     RecalledContext,
 )
+from paper_research_agent.agent.tooling.contracts import ToolExecutionResult
 from paper_research_agent.answering.models import (
     AnswerCitation,
     AnswerClaim,
@@ -147,8 +149,10 @@ class _FakeDynamicExecutor:
             tuple[
                 str,
                 str,
-                tuple[dict[str, object], ...],
+                tuple[dict[str, object], ...] | None,
                 dict[str, object] | None,
+                tuple[str, ...] | None,
+                tuple[str, ...] | None,
             ]
         ] = []
         self.resume_calls: list[tuple[str, bool]] = []
@@ -158,10 +162,21 @@ class _FakeDynamicExecutor:
         question: str,
         *,
         thread_id: str,
-        memory_context: tuple[dict[str, object], ...] = (),
+        memory_context: tuple[dict[str, object], ...] | None = None,
         child_context: dict[str, object] | None = None,
+        allowed_tool_risks: tuple[str, ...] | None = None,
+        allowed_tool_names: tuple[str, ...] | None = None,
     ) -> DynamicResearchResult:
-        self.calls.append((question, thread_id, memory_context, child_context))
+        self.calls.append(
+            (
+                question,
+                thread_id,
+                memory_context,
+                child_context,
+                allowed_tool_risks,
+                allowed_tool_names,
+            )
+        )
         return self.result
 
     async def resume(self, *, thread_id: str, approved: bool) -> DynamicResearchResult:
@@ -325,7 +340,52 @@ class ChildGraphDispatcherTests(unittest.TestCase):
         )
         dispatcher = ChildGraphDispatcher(dynamic_tools=fake)
         asyncio.run(dispatcher.dispatch(_request(capability="dynamic_tools", task_id="task-x")))
+        self.assertIsNone(fake.calls[0][2])
+
+    def test_parallel_dynamic_without_memory_skips_internal_recall(self) -> None:
+        fake = _FakeDynamicExecutor(
+            DynamicResearchResult(
+                run_id="a" * 32,
+                thread_id="t",
+                status="completed",
+                final_summary="完成",
+            )
+        )
+        dispatcher = ChildGraphDispatcher(dynamic_tools=fake)
+        asyncio.run(
+            dispatcher.dispatch(
+                _request(
+                    capability="dynamic_tools",
+                    task_id="task-parallel",
+                    parallel_group_id="parallel-1",
+                    allowed_tool_risks=("network_read",),
+                    allowed_tool_names=("search_scholarly_sources",),
+                )
+            )
+        )
         self.assertEqual(fake.calls[0][2], ())
+
+    def test_dynamic_receives_task_tool_scope(self) -> None:
+        fake = _FakeDynamicExecutor(
+            DynamicResearchResult(
+                run_id="a" * 32,
+                thread_id="t",
+                status="completed",
+                final_summary="完成",
+            )
+        )
+        dispatcher = ChildGraphDispatcher(dynamic_tools=fake)
+        request = _request(
+            capability="dynamic_tools",
+            task_id="task-scope",
+            allowed_tool_risks=("network_read",),
+            allowed_tool_names=("search_scholarly_sources",),
+        )
+
+        asyncio.run(dispatcher.dispatch(request))
+
+        self.assertEqual(fake.calls[0][4], ("network_read",))
+        self.assertEqual(fake.calls[0][5], ("search_scholarly_sources",))
 
     def test_runtime_passes_memory_supplied_flag_when_provided(self) -> None:
         graph = _FakeGraph()
@@ -364,7 +424,73 @@ class ChildGraphDispatcherTests(unittest.TestCase):
         )
         self.assertEqual(child.status, "waiting_approval")
         self.assertIsNotNone(child.pending_approval)
+        assert child.pending_approval is not None
         self.assertEqual(child.pending_approval["task_id"], "task-3")
+
+    def test_parallel_write_denial_is_projected_as_failed_without_approval(self) -> None:
+        fake = _FakeDynamicExecutor(
+            DynamicResearchResult(
+                run_id="a" * 32,
+                thread_id="t",
+                status="completed",
+                final_summary="写操作已被只读学术分支拒绝。",
+                termination_reason="parallel_write_not_allowed",
+            )
+        )
+        dispatcher = ChildGraphDispatcher(dynamic_tools=fake)
+
+        child = asyncio.run(
+            dispatcher.dispatch(
+                _request(capability="dynamic_tools", task_id="task-write-denied")
+            )
+        )
+
+        self.assertEqual(child.status, "failed")
+        self.assertEqual(child.error_code, "parallel_write_not_allowed")
+        self.assertIsNone(child.pending_approval)
+        self.assertEqual(child.citation_kind, "none")
+
+    def test_live_scholarly_provider_failure_is_not_projected_as_success(self) -> None:
+        observation = ToolObservation(
+            sequence=1,
+            decision_fingerprint="f" * 64,
+            tool_name="search_scholarly_sources",
+            purpose="核验最新论文状态",
+            result=ToolExecutionResult(
+                tool_name="search_scholarly_sources",
+                status="insufficient",
+                summary={
+                    "reason_code": "all_providers_unavailable",
+                    "provider_attempts": (
+                        {
+                            "provider": "semantic_scholar_crossref",
+                            "status": "failed",
+                            "reason_code": "provider_timeout",
+                        },
+                    ),
+                },
+            ),
+        )
+        fake = _FakeDynamicExecutor(
+            DynamicResearchResult(
+                run_id="a" * 32,
+                thread_id="t",
+                status="completed",
+                observations=(observation,),
+                final_summary="外部请求未完成",
+                termination_reason="router_finished",
+            )
+        )
+        dispatcher = ChildGraphDispatcher(dynamic_tools=fake)
+
+        child = asyncio.run(
+            dispatcher.dispatch(
+                _request(capability="dynamic_tools", task_id="task-provider-timeout")
+            )
+        )
+
+        self.assertEqual(child.status, "failed")
+        self.assertEqual(child.error_code, "external_research_timeout")
         self.assertEqual(child.citation_kind, "none")
 
     def test_dynamic_resume_uses_same_checkpoint_namespace(self) -> None:

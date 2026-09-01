@@ -22,6 +22,7 @@ from paper_research_agent.agent.orchestrator.models import (
     ConversationWorkspace,
     GoalDecision,
     GoalState,
+    MainAgentResult,
     RecalledContext,
     TaskPlan,
     TaskPlanDecision,
@@ -209,6 +210,104 @@ class MainAgentModelTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             _plan(revision=0)
 
+    def test_task_plan_accepts_local_and_scholarly_parallel_group(self) -> None:
+        plan = _plan(
+            tasks=(
+                _task(
+                    task_id="local-research",
+                    parallel_group_id="hybrid-research",
+                ),
+                _task(
+                    task_id="external-research",
+                    capability="dynamic_tools",
+                    parallel_group_id="hybrid-research",
+                    allowed_tool_risks=("network_read",),
+                    allowed_tool_names=(
+                        "search_scholarly_sources",
+                        "resolve_paper_identifier",
+                        "get_citation_graph",
+                        "check_paper_status",
+                    ),
+                ),
+            )
+        )
+
+        self.assertEqual(plan.tasks[0].parallel_group_id, "hybrid-research")
+        self.assertEqual(plan.tasks[1].allowed_tool_risks, ("network_read",))
+
+    def test_task_plan_rejects_incomplete_or_wrong_parallel_groups(self) -> None:
+        with self.assertRaisesRegex(ValidationError, "exactly two"):
+            _plan(tasks=(_task(parallel_group_id="hybrid-research"),))
+        with self.assertRaisesRegex(ValidationError, "local_rag and dynamic_tools"):
+            _plan(
+                tasks=(
+                    _task(task_id="local-a", parallel_group_id="hybrid-research"),
+                    _task(task_id="local-b", parallel_group_id="hybrid-research"),
+                )
+            )
+
+    def test_task_plan_rejects_parallel_dependency_or_permission_escalation(self) -> None:
+        scholarly_names = (
+            "search_scholarly_sources",
+            "resolve_paper_identifier",
+            "get_citation_graph",
+            "check_paper_status",
+        )
+        with self.assertRaisesRegex(ValidationError, "must not depend on each other"):
+            _plan(
+                tasks=(
+                    _task(
+                        task_id="local-research",
+                        parallel_group_id="hybrid-research",
+                        depends_on=("external-research",),
+                    ),
+                    _task(
+                        task_id="external-research",
+                        capability="dynamic_tools",
+                        parallel_group_id="hybrid-research",
+                        allowed_tool_risks=("network_read",),
+                        allowed_tool_names=scholarly_names,
+                    ),
+                )
+            )
+        with self.assertRaisesRegex(ValidationError, "network_read only"):
+            _plan(
+                tasks=(
+                    _task(task_id="local-research", parallel_group_id="hybrid-research"),
+                    _task(
+                        task_id="external-research",
+                        capability="dynamic_tools",
+                        parallel_group_id="hybrid-research",
+                        allowed_tool_risks=("network_read", "write"),
+                        allowed_tool_names=scholarly_names,
+                    ),
+                )
+            )
+        with self.assertRaisesRegex(ValidationError, "scholarly tool allowlist"):
+            _plan(
+                tasks=(
+                    _task(task_id="local-research", parallel_group_id="hybrid-research"),
+                    _task(
+                        task_id="external-research",
+                        capability="dynamic_tools",
+                        parallel_group_id="hybrid-research",
+                        allowed_tool_risks=("network_read",),
+                        allowed_tool_names=("github__search_code",),
+                    ),
+                )
+            )
+
+    def test_new_task_fields_preserve_old_single_task_serialization(self) -> None:
+        restored = AgentTask.model_validate(_task().model_dump(exclude={
+            "parallel_group_id",
+            "allowed_tool_risks",
+            "allowed_tool_names",
+        }))
+
+        self.assertIsNone(restored.parallel_group_id)
+        self.assertEqual(restored.allowed_tool_risks, ())
+        self.assertEqual(restored.allowed_tool_names, ())
+
     def test_workspace_requires_schema_version_and_enforces_enum(self) -> None:
         with self.assertRaises(ValidationError):
             _workspace(schema_version="conversation-workspace-v2")
@@ -346,6 +445,38 @@ class MainAgentModelTests(unittest.TestCase):
             pending_approval={"title": "报告"},
         )
         self.assertIsNotNone(pending.pending_approval)
+
+    def test_main_agent_result_validates_degradation_codes(self) -> None:
+        result = MainAgentResult(
+            run_id="run-1",
+            request_id="request-1",
+            conversation_id="conversation-1",
+            status="completed",
+            degraded=True,
+            degradation_codes=("external_research_unavailable",),
+        )
+        self.assertTrue(result.degraded)
+        with self.assertRaisesRegex(ValidationError, "unique"):
+            MainAgentResult(
+                run_id="run-2",
+                request_id="request-2",
+                conversation_id="conversation-1",
+                status="completed",
+                degraded=True,
+                degradation_codes=(
+                    "external_research_unavailable",
+                    "external_research_unavailable",
+                ),
+            )
+        with self.assertRaisesRegex(ValidationError, "exactly"):
+            MainAgentResult(
+                run_id="run-3",
+                request_id="request-3",
+                conversation_id="conversation-1",
+                status="completed",
+                degraded=False,
+                degradation_codes=("external_research_unavailable",),
+            )
 
 
 if __name__ == "__main__":

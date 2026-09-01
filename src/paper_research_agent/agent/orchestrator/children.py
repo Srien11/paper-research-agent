@@ -13,9 +13,12 @@ from paper_research_agent.agent.orchestrator.artifacts import (
 )
 from paper_research_agent.agent.orchestrator.identifiers import dynamic_thread_id
 from paper_research_agent.agent.orchestrator.models import ChildTaskRequest, ChildTaskResult
+from paper_research_agent.agent.tooling.catalog import SCHOLARLY_NETWORK_TOOL_NAMES, ToolRisk
 
 if TYPE_CHECKING:
     from paper_research_agent.agent.dynamic.models import DynamicResearchResult
+
+
 class LocalRagChildExecutor(Protocol):
     async def answer(self, request: ChildTaskRequest) -> LocalRAGArtifact: ...
 
@@ -40,8 +43,10 @@ class DynamicToolsChildExecutor(Protocol):
         question: str,
         *,
         thread_id: str,
-        memory_context: tuple[dict[str, object], ...] = (),
+        memory_context: tuple[dict[str, object], ...] | None = None,
         child_context: dict[str, object] | None = None,
+        allowed_tool_risks: tuple[ToolRisk, ...] | None = None,
+        allowed_tool_names: tuple[str, ...] | None = None,
     ) -> DynamicResearchResult: ...
 
     async def resume(
@@ -148,6 +153,8 @@ class ChildGraphDispatcher:
                 thread_id=_dynamic_thread_id(request),
                 memory_context=_memory_context_from_request(request),
                 child_context=_child_context_from_request(request),
+                allowed_tool_risks=(request.allowed_tool_risks or None),
+                allowed_tool_names=(request.allowed_tool_names or None),
             )
         return _dynamic_result(request, result)
 
@@ -164,17 +171,24 @@ class ChildGraphDispatcher:
         return _completed(request, artifact=artifact, citation_kind="none")
 
 
-def _memory_context_from_request(request: ChildTaskRequest) -> tuple[dict[str, object], ...]:
-    return tuple(
-        {
-            "memory_id": item.source_id,
-            "content": item.content,
-            "kind": "long_term_memory",
-            "trust": "research_context",
-        }
+def _memory_context_from_request(
+    request: ChildTaskRequest,
+) -> tuple[dict[str, object], ...] | None:
+    selected_memory = tuple(
+        dict[str, object](
+            memory_id=item.source_id,
+            content=item.content,
+            kind="long_term_memory",
+            trust="research_context",
+        )
         for item in request.selected_context
         if item.kind == "long_term_memory"
     )
+    if selected_memory:
+        return selected_memory
+    if request.parallel_group_id is not None:
+        return ()
+    return None
 
 
 def _child_context_from_request(request: ChildTaskRequest) -> dict[str, object]:
@@ -214,6 +228,33 @@ def _dynamic_result(
             summary=result.final_summary or "审批未执行",
             citation_kind="none",
             error_code=result.termination_reason,
+        )
+    if result.termination_reason in {
+        "parallel_tool_risk_denied",
+        "parallel_tool_name_denied",
+        "parallel_write_not_allowed",
+        "external_research_unavailable",
+        "external_research_timeout",
+    }:
+        return ChildTaskResult(
+            child_run_id=result.run_id,
+            task_id=request.task_id,
+            capability="dynamic_tools",
+            status="failed",
+            summary=result.final_summary or "联网研究工具权限不足。",
+            citation_kind="none",
+            error_code=result.termination_reason,
+        )
+    scholarly_failure = _scholarly_failure_code(result)
+    if scholarly_failure is not None:
+        return ChildTaskResult(
+            child_run_id=result.run_id,
+            task_id=request.task_id,
+            capability="dynamic_tools",
+            status="failed",
+            summary=result.final_summary or "外部学术 Provider 请求未能完成。",
+            citation_kind="none",
+            error_code=scholarly_failure,
         )
     return ChildTaskResult(
         child_run_id=result.run_id,
@@ -265,3 +306,32 @@ def _dynamic_thread_id(request: ChildTaskRequest) -> str:
         request.run_id,
         request.task_id,
     )
+
+
+def _scholarly_failure_code(result: DynamicResearchResult) -> str | None:
+    unavailable = False
+    for observation in result.observations:
+        if observation.tool_name not in SCHOLARLY_NETWORK_TOOL_NAMES:
+            continue
+        if observation.result.status != "insufficient":
+            continue
+        reason = str(
+            observation.result.summary.get("reason_code")
+            or observation.result.summary.get("reason")
+            or ""
+        )
+        attempts = observation.result.summary.get("provider_attempts", ())
+        attempt_reasons = {
+            str(item.get("reason_code", ""))
+            for item in attempts
+            if isinstance(item, dict)
+        }
+        if "timeout" in reason or any("timeout" in item for item in attempt_reasons):
+            return "external_research_timeout"
+        if reason in {
+            "provider_not_configured",
+            "all_providers_unavailable",
+            "provider_capability_not_configured",
+        } or attempt_reasons:
+            unavailable = True
+    return "external_research_unavailable" if unavailable else None

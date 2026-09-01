@@ -103,6 +103,11 @@ class DynamicResearchResult(FrozenModel):
             "repeated_tool_call",
             "approval_denied",
             "approval_expired",
+            "parallel_tool_risk_denied",
+            "parallel_tool_name_denied",
+            "parallel_write_not_allowed",
+            "external_research_unavailable",
+            "external_research_timeout",
         ]
         | None
     ) = None

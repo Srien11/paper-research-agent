@@ -14,6 +14,7 @@ from paper_research_agent.agent.dynamic.models import DynamicResearchResult
 from paper_research_agent.agent.observability import AgentEvent, SQLiteAgentEventLogger
 from paper_research_agent.agent.orchestrator.memory import ToolkitLongTermMemoryProvider
 from paper_research_agent.agent.orchestrator.models import ChildTaskRequest
+from paper_research_agent.agent.tooling.scholarly_providers import CapabilityReadiness
 from paper_research_agent.conversation.store import SQLiteConversationStore
 from paper_research_agent.web.app import create_app
 from paper_research_agent.web.bootstrap import (
@@ -43,6 +44,7 @@ class _StreamingDynamicRuntime:
         self.started = asyncio.Event()
         self.release = asyncio.Event()
         self._observer = None
+        self.scope = None
 
     @contextmanager
     def capture_agent_events(self, observer):
@@ -52,8 +54,23 @@ class _StreamingDynamicRuntime:
         finally:
             self._observer = None
 
-    async def run_dynamic_tools(self, question: str, *, thread_id: str):
+    async def run_dynamic_tools(
+        self,
+        question: str,
+        *,
+        thread_id: str,
+        memory_context=None,
+        child_context=None,
+        allowed_tool_risks=None,
+        allowed_tool_names=None,
+    ):
         del question
+        self.scope = (
+            memory_context,
+            child_context,
+            allowed_tool_risks,
+            allowed_tool_names,
+        )
         assert self._observer is not None
         self._observer(
             AgentEvent(
@@ -106,6 +123,8 @@ def _dynamic_request() -> ChildTaskRequest:
         capability="dynamic_tools",
         current_message="查找相关工作",
         rag_mode="preferred",
+        allowed_tool_risks=("network_read",),
+        allowed_tool_names=("search_scholarly_sources",),
     )
 
 
@@ -156,6 +175,7 @@ def _environment(root: Path, *, mode: str, api_key: str = "test-key") -> Applica
         main_model="qwen-test",
         corpus_configured=False,
         main_agent_fast_path_enabled=True,
+        parallel_hybrid_research_enabled=True,
     )
 
 
@@ -184,6 +204,38 @@ class ApplicationBootstrapTests(unittest.IsolatedAsyncioTestCase):
                 }
             )
 
+    def test_parallel_hybrid_environment_flag_is_strict_and_defaults_false(self) -> None:
+        default = ApplicationEnvironment.from_environment(
+            {"PRA_PROJECT_ROOT": str(Path.cwd())}
+        )
+        enabled = ApplicationEnvironment.from_environment(
+            {
+                "PRA_PROJECT_ROOT": str(Path.cwd()),
+                "PRA_PARALLEL_HYBRID_RESEARCH_ENABLED": "TrUe",
+            }
+        )
+        disabled = ApplicationEnvironment.from_environment(
+            {
+                "PRA_PROJECT_ROOT": str(Path.cwd()),
+                "PRA_PARALLEL_HYBRID_RESEARCH_ENABLED": "FALSE",
+            }
+        )
+
+        self.assertFalse(default.parallel_hybrid_research_enabled)
+        self.assertTrue(enabled.parallel_hybrid_research_enabled)
+        self.assertFalse(disabled.parallel_hybrid_research_enabled)
+        for invalid in ("1", "yes", "", "   ", "enabled"):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                ValueError,
+                "PRA_PARALLEL_HYBRID_RESEARCH_ENABLED",
+            ):
+                ApplicationEnvironment.from_environment(
+                    {
+                        "PRA_PROJECT_ROOT": str(Path.cwd()),
+                        "PRA_PARALLEL_HYBRID_RESEARCH_ENABLED": invalid,
+                    }
+                )
+
     async def test_dynamic_tool_events_arrive_before_child_completion(self) -> None:
         runtime = _StreamingDynamicRuntime()
         publisher = _CapturingPublisher()
@@ -210,12 +262,37 @@ class ApplicationBootstrapTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(publisher.events[0].node_id, publisher.events[1].node_id)
         self.assertEqual(publisher.events[1].detail.returned_count, 2)
+        self.assertEqual(runtime.scope[2], ("network_read",))
+        self.assertEqual(runtime.scope[3], ("search_scholarly_sources",))
         serialized = "\n".join(item.model_dump_json() for item in publisher.events)
         self.assertNotIn(
             "arguments",
             publisher.events[1].detail.model_dump(exclude_none=True),
         )
         self.assertNotIn("查找相关工作", serialized)
+
+    async def test_offline_scholarly_readiness_skips_dynamic_graph(self) -> None:
+        runtime = _StreamingDynamicRuntime()
+        runtime.external_scholarly_readiness = CapabilityReadiness(
+            capability="external_scholarly",
+            ready=False,
+            reason_code="provider_offline",
+            provider_ids=("offline",),
+        )
+        publisher = _CapturingPublisher()
+        adapter = _DynamicChildAdapter(
+            runtime,  # type: ignore[arg-type]
+            run_event_publisher=publisher,  # type: ignore[arg-type]
+        )
+        request = _dynamic_request().model_copy(
+            update={"parallel_group_id": "hybrid-offline"}
+        )
+
+        result = await adapter.run_task(request)
+
+        self.assertEqual(result.termination_reason, "external_research_unavailable")
+        self.assertFalse(runtime.started.is_set())
+        self.assertEqual(publisher.events, [])
 
     async def test_primary_mode_builds_main_runtime_with_shared_store(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -264,6 +341,9 @@ class ApplicationBootstrapTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertIsNone(build_main.call_args.kwargs["memory_provider"])
             self.assertTrue(build_main.call_args.kwargs["fast_path_enabled"])
+            self.assertTrue(
+                build_main.call_args.kwargs["parallel_hybrid_research_enabled"]
+            )
             started = services.conversation_store.begin_agent_run(
                 request_id="request-checkpoint",
                 conversation_id="conversation-a",

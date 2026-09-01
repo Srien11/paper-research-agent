@@ -154,6 +154,7 @@ class AgentPlanTaskResponse(WebModel):
     result_ref: str | None = None
     blocked_reason: str | None = None
     execution_reason: str
+    parallel_group_id: str | None = None
     max_seconds: float | None = None
     max_calls: int | None = None
     max_cost_usd: float | None = None

@@ -11,6 +11,7 @@ from paper_research_agent.agent.orchestrator.models import (
     AgentTask,
     ChildTaskResult,
     ConversationWorkspace,
+    DegradationCode,
     FrozenModel,
     GoalDecision,
     TaskPlanDecision,
@@ -28,6 +29,37 @@ class TaskEvaluation(FrozenModel):
     missing_criteria: tuple[str, ...] = Field(default=(), max_length=8)
     summary: str = Field(default="", max_length=5000)
     reason: str = Field(min_length=1, max_length=200)
+
+
+def degradation_codes_for_results(
+    child_results: tuple[ChildTaskResult, ...],
+) -> tuple[DegradationCode, ...]:
+    """Derive stable user-visible degradation codes from the latest branch attempts."""
+    latest: dict[str, ChildTaskResult] = {}
+    for result in child_results:
+        latest[result.task_id] = result
+    local = tuple(result for result in latest.values() if result.capability == "local_rag")
+    external = tuple(
+        result for result in latest.values() if result.capability == "dynamic_tools"
+    )
+    local_available = bool(local) and any(result.status == "completed" for result in local)
+    external_available = bool(external) and any(
+        result.status == "completed" for result in external
+    )
+    codes: list[DegradationCode] = []
+    if local and not local_available:
+        codes.append("local_evidence_insufficient")
+    if external and not external_available:
+        error_codes = {result.error_code for result in external}
+        if "parallel_write_not_allowed" in error_codes:
+            codes.append("parallel_write_not_allowed")
+        elif any(code is not None and "timeout" in code for code in error_codes):
+            codes.append("external_research_timeout")
+        else:
+            codes.append("external_research_unavailable")
+    if local and external and not local_available and not external_available:
+        codes.append("model_background_only")
+    return tuple(codes)
 
 
 def evaluate_task(
@@ -133,6 +165,45 @@ def reduce_workspace(
     if task_id is not None and evaluation is not None:
         updated = _apply_task_result(updated, task_id, evaluation, result)
     return updated
+
+
+def reduce_workspace_batch(
+    workspace: ConversationWorkspace,
+    *,
+    evaluations: tuple[TaskEvaluation, ...],
+    results: tuple[ChildTaskResult, ...],
+) -> ConversationWorkspace:
+    """Validate a whole batch first, then apply every task update in one workspace copy."""
+    if not evaluations or len(evaluations) != len(results):
+        raise ValueError("batch evaluations and results must be non-empty and equal length")
+    evaluation_ids = tuple(item.task_id for item in evaluations)
+    result_ids = tuple(item.task_id for item in results)
+    if len(evaluation_ids) != len(set(evaluation_ids)):
+        raise ValueError("batch evaluation task IDs must be unique")
+    if set(evaluation_ids) != set(result_ids):
+        raise ValueError("batch evaluation and result task IDs must match")
+    plan = workspace.task_plan
+    if plan is None:
+        raise ValueError("cannot reduce a task batch without a task plan")
+    known_ids = {task.task_id for task in plan.tasks}
+    unknown = set(evaluation_ids) - known_ids
+    if unknown:
+        raise ValueError(f"batch contains unknown task IDs: {sorted(unknown)}")
+    evaluations_by_id = {item.task_id: item for item in evaluations}
+    results_by_id = {item.task_id: item for item in results}
+    updated_tasks = tuple(
+        _updated_task(
+            task,
+            evaluations_by_id[task.task_id],
+            results_by_id[task.task_id],
+        )
+        if task.task_id in evaluations_by_id
+        else task
+        for task in plan.tasks
+    )
+    now = datetime.now(UTC)
+    new_plan = plan.model_copy(update={"tasks": updated_tasks, "updated_at": now})
+    return workspace.model_copy(update={"task_plan": new_plan, "updated_at": now})
 
 
 def _apply_goal_decision(

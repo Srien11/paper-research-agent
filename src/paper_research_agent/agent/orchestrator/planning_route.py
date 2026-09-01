@@ -28,6 +28,12 @@ class PlanningRouteDecision(FrozenModel):
     reason_code: PlanningRouteReason
 
 
+class SourceRequirements(FrozenModel):
+    local_required: bool
+    external_required: bool
+    reason_codes: tuple[str, ...] = ()
+
+
 _LOCAL_CORPUS_ID = re.compile(r"(?<![A-Za-z0-9])[CT]\d{3}(?!\d)", re.IGNORECASE)
 _LOCAL_RESEARCH_OBJECT = re.compile(
     r"(?:本地论文|论文|研究|方法|模型|算法|实验|数据集|指标|架构|"
@@ -49,6 +55,16 @@ _EXTERNAL_OR_DYNAMIC = re.compile(
     r"(?:最新|实时|今天|当前).{0,20}(?:网页|网站|官网|互联网|状态|新闻|价格)|"
     r"(?:网页|网站|互联网|web|online).{0,20}(?:搜索|查询|检索)|"
     r"(?:运行命令|调用工具|调用\s*API|动态工具|发送消息|发送邮件)",
+    re.IGNORECASE,
+)
+_EXPLICIT_EXTERNAL_SOURCE = re.compile(
+    r"(?:联网|网络|网上|外部资料|外部来源|官网|实时|最新|"
+    r"\bweb\b|\bonline\b)",
+    re.IGNORECASE,
+)
+_EXPLICIT_LOCAL_SOURCE = re.compile(
+    r"(?:本地论文|本地语料|知识库|论文库|私有论文|"
+    r"(?<![A-Za-z0-9])[CT]\d{3}(?!\d))",
     re.IGNORECASE,
 )
 _MULTI_TASK = re.compile(
@@ -84,6 +100,8 @@ def classify_planning_route(
         return _full("complex_or_ambiguous")
     if len(message) > 1000:
         return _full("contract_bounds_exceeded")
+    if infer_source_requirements(message).external_required:
+        return _full("complex_or_ambiguous")
     if (
         _FILE_OR_CONTROL.search(message)
         or _EXTERNAL_OR_DYNAMIC.search(message)
@@ -116,6 +134,23 @@ def classify_planning_route(
             reason_code="clear_single_local_rag",
         )
     return _full("complex_or_ambiguous")
+
+
+def infer_source_requirements(message: str) -> SourceRequirements:
+    """Identify explicit local and external evidence requirements without planning tasks."""
+    normalized = " ".join(message.split())
+    local_required = _EXPLICIT_LOCAL_SOURCE.search(normalized) is not None
+    external_required = _EXPLICIT_EXTERNAL_SOURCE.search(normalized) is not None
+    reasons: list[str] = []
+    if local_required:
+        reasons.append("explicit_local_source")
+    if external_required:
+        reasons.append("explicit_external_source")
+    return SourceRequirements(
+        local_required=local_required,
+        external_required=external_required,
+        reason_codes=tuple(reasons),
+    )
 
 
 def _full(reason_code: PlanningRouteReason) -> PlanningRouteDecision:

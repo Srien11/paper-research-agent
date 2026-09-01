@@ -29,6 +29,7 @@ from paper_research_agent.agent.orchestrator.identifiers import main_checkpoint_
 from paper_research_agent.agent.orchestrator.models import (
     AgentRunStart,
     ChildTaskResult,
+    CommitOutcome,
     ConversationWorkspace,
     MainAgentRequest,
     MainAgentResult,
@@ -436,6 +437,7 @@ class MainAgentRuntime:
                 event_type="run_completed",
                 status="completed",
                 summary="运行完成",
+                degraded=result.degraded,
             )
         elif result.status == "cancelled":
             await self._publish_run_boundary(
@@ -473,6 +475,7 @@ class MainAgentRuntime:
         status: RunNodeStatus,
         summary: str,
         reason_code: str | None = None,
+        degraded: bool | None = None,
     ) -> None:
         await self._publish_product_event(
             request,
@@ -481,7 +484,7 @@ class MainAgentRuntime:
             status=status,
             title=summary,
             summary=summary,
-            detail=SafeRunEventDetail(reason_code=reason_code),
+            detail=SafeRunEventDetail(reason_code=reason_code, degraded=degraded),
             idempotency_key=f"boundary:{event_type}",
         )
 
@@ -889,13 +892,24 @@ def _result_from_state(
     }
     status = statuses.get(reason, "failed")
     base_workspace_version = int(state.get("base_workspace_version", 0))
-    workspace_version = (
-        base_workspace_version + 1
-        if status in {"completed", "waiting_approval", "paused", "cancelled"}
-        and reason
-        not in {"cached", "waiting_approval_cached", "paused_cached", "cancelled_cached"}
-        else base_workspace_version
-    )
+    commit_outcome_payload = state.get("commit_outcome")
+    if commit_outcome_payload is not None:
+        workspace_version = CommitOutcome.model_validate(
+            commit_outcome_payload
+        ).workspace_version
+    else:
+        workspace_version = (
+            base_workspace_version + 1
+            if status in {"completed", "waiting_approval", "paused", "cancelled"}
+            and reason
+            not in {
+                "cached",
+                "waiting_approval_cached",
+                "paused_cached",
+                "cancelled_cached",
+            }
+            else base_workspace_version
+        )
     return MainAgentResult(
         run_id=str(state.get("run_id", "")),
         request_id=request.request_id,
@@ -909,6 +923,8 @@ def _result_from_state(
         ),
         pending_approval=state.get("pending_approval"),
         workspace_version=workspace_version,
+        degraded=bool(state.get("degraded", False)),
+        degradation_codes=tuple(state.get("degradation_codes", ())),
     )
 
 

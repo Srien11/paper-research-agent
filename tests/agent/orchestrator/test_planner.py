@@ -300,17 +300,98 @@ class TaskPlannerTests(unittest.TestCase):
                             "objective": "核验项目 2026 年维护状态",
                             "success_criteria": ("得到最新状态",),
                             "capability": "dynamic_tools",
-                            "depends_on": ("local",),
+                            "depends_on": (),
                         },
                     )
                 }
             ]
         )
-        decision = self._plan_via(TaskPlanner(model=fake), _envelope(), _goal_decision())
+        decision = self._plan_via(
+            TaskPlanner(model=fake),
+            _envelope(current_message="结合本地论文与外部资料核验最新状态"),
+            _goal_decision(),
+        )
         self.assertEqual(len(decision.plan.tasks), 2)
         self.assertEqual(
-            {task.capability for task in decision.plan.tasks},
-            {"local_rag", "dynamic_tools"},
+            tuple(task.capability for task in decision.plan.tasks),
+            ("local_rag", "dynamic_tools"),
+        )
+        self.assertEqual(
+            {task.parallel_group_id for task in decision.plan.tasks},
+            {"hybrid-research"},
+        )
+        dynamic = decision.plan.tasks[1]
+        self.assertEqual(dynamic.allowed_tool_risks, ("network_read",))
+        self.assertEqual(len(dynamic.allowed_tool_names), 4)
+
+    def test_mixed_research_supplements_missing_dynamic_task(self) -> None:
+        fake = _FakeModel(
+            [
+                {
+                    "tasks": (
+                        {
+                            "task_id": "local",
+                            "title": "本地论文",
+                            "objective": "整理本地论文证据",
+                            "success_criteria": ("找到证据",),
+                            "capability": "local_rag",
+                        },
+                    )
+                }
+            ]
+        )
+        decision = self._plan_via(
+            TaskPlanner(model=fake),
+            _envelope(current_message="参考知识库，同时网上查最新版本"),
+            _goal_decision(),
+        )
+
+        self.assertEqual(
+            tuple(task.capability for task in decision.plan.tasks),
+            ("local_rag", "dynamic_tools"),
+        )
+
+    def test_preferred_external_research_supplements_missing_local_task(self) -> None:
+        fake = _FakeModel(
+            [
+                {
+                    "tasks": (
+                        {
+                            "task_id": "external",
+                            "title": "外部学术核验",
+                            "objective": "查最新论文状态",
+                            "success_criteria": ("得到外部结果",),
+                            "capability": "dynamic_tools",
+                        },
+                    )
+                }
+            ]
+        )
+        decision = self._plan_via(
+            TaskPlanner(model=fake),
+            _envelope(current_message="联网核验最新论文状态"),
+            _goal_decision(),
+        )
+
+        self.assertEqual(
+            tuple(task.capability for task in decision.plan.tasks),
+            ("local_rag", "dynamic_tools"),
+        )
+
+    def test_mixed_research_model_failure_uses_parallel_fallback(self) -> None:
+        decision = self._plan_via(
+            TaskPlanner(model=_FakeModel([RuntimeError("down")])),
+            _envelope(current_message="结合 C001 和联网搜索核验最新状态"),
+            _goal_decision(),
+        )
+
+        self.assertEqual(
+            tuple(task.capability for task in decision.plan.tasks),
+            ("local_rag", "dynamic_tools"),
+        )
+        self.assertEqual(
+            {task.parallel_group_id for task in decision.plan.tasks},
+            {"hybrid-research"},
         )
 
     def test_task_id_stable_and_completed_not_regressed_across_revision(self) -> None:

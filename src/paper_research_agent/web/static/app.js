@@ -623,6 +623,7 @@ function cancelKnowledgeIntent() {
 function runNodeKind(type) {
   if (type.startsWith("reasoning_")) return "execution";
   if (type === "plan_updated" || type === "goal_updated") return "plan";
+  if (type.startsWith("parallel_group_")) return "execution";
   if (type.startsWith("tool_")) return "tool";
   if (type === "retrieval_completed") return "execution";
   if (type === "file_created") return "tool";
@@ -887,6 +888,7 @@ async function consumeAgentStream(response, pendingRequest, sourceNote = "") {
   let rawText = answerTextFromRunView(runView);
   let route = "direct_chat";
   let finalStatus = "running";
+  let runDegraded = false;
   let waitingApproval = false;
   const outputAttachmentIds = [];
   let lastPaint = 0;
@@ -925,6 +927,7 @@ async function consumeAgentStream(response, pendingRequest, sourceNote = "") {
           }
         } else if (event.type === "run_completed") {
           finalStatus = "completed";
+          runDegraded = event.detail?.degraded === true;
           stopPlanRefresh();
         } else if (event.type === "run_failed") {
           finalStatus = "failed";
@@ -1041,6 +1044,11 @@ async function consumeAgentStream(response, pendingRequest, sourceNote = "") {
     return;
   }
   finalizeProgress(runView, "completed");
+  if (runDegraded) {
+    article.classList.add("is-degraded");
+    meta.append(createElement("small", "source-note source-note-warning", "部分证据未完成"));
+    showNotice("回答已完成，但部分证据分支未完成；请查看回答中的未核验说明。", "warning");
+  }
   outputAttachmentIds.forEach((attachmentId) => {
     article.append(createServerDownloadButton(attachmentId));
   });
@@ -1136,7 +1144,7 @@ function syncPlanButtons(status) {
 function planStatusLabel(status) {
   return ({
     running: "执行中",
-    pause_requested: "正在暂停",
+    pause_requested: "当前并行批次完成后暂停",
     paused: "已暂停",
     resuming: "正在继续",
     cancel_requested: "正在取消",
@@ -1158,12 +1166,31 @@ function renderPlanControl(plan) {
   if (!plan.tasks.length) {
     elements.planTaskList.append(createElement("p", "history-empty", "正在生成任务节点…"));
   }
+  const parallelGroups = new Map();
+  plan.tasks.forEach((task) => {
+    if (!task.parallel_group_id) return;
+    const members = parallelGroups.get(task.parallel_group_id) || [];
+    members.push(task.task_id);
+    parallelGroups.set(task.parallel_group_id, members);
+  });
   plan.tasks.forEach((task, index) => {
     const card = createElement("article", "plan-task");
     const header = createElement("header");
+    const badges = createElement("span", "plan-task-badges");
+    const parallelMembers = parallelGroups.get(task.parallel_group_id) || [];
+    if (parallelMembers.length > 1) {
+      badges.append(
+        createElement(
+          "span",
+          "plan-parallel-badge",
+          `并行 ${parallelMembers.indexOf(task.task_id) + 1}/${parallelMembers.length}`,
+        ),
+      );
+    }
+    badges.append(createElement("small", "", planStatusLabel(task.status)));
     header.append(
       createElement("strong", "", `${index + 1}. ${task.title}`),
-      createElement("small", "", planStatusLabel(task.status)),
+      badges,
     );
     const reason = createElement("p", "", task.execution_reason);
     const usage = createElement(
@@ -1305,6 +1332,9 @@ async function sendRunControl(action) {
     state.controlRevision = control.revision;
     elements.planControlStatus.textContent = planStatusLabel(control.status);
     syncPlanButtons(control.status);
+    if (action === "pause") {
+      showNotice("已请求暂停；当前并行批次完成后暂停。", "warning");
+    }
     schedulePlanRefresh(250);
   } catch (error) {
     showToast(error.message);

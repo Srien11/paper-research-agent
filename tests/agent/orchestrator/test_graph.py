@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import unittest
 from collections import deque
 from collections.abc import Callable
@@ -202,18 +203,25 @@ class FakeDispatcher:
     ) -> None:
         self.results = deque(results)
         self.calls: list[object] = []
+        self.started_at: list[float] = []
         self.on_dispatch = on_dispatch
         self.delay_seconds = delay_seconds
 
     async def dispatch(self, request: object) -> ChildTaskResult:
         self.calls.append(request)
+        self.started_at.append(time.perf_counter())
         if self.on_dispatch is not None:
             self.on_dispatch(len(self.calls))
         if self.delay_seconds:
             await asyncio.sleep(self.delay_seconds)
         if not self.results:
             raise AssertionError("dispatcher exhausted its results")
-        return self.results.popleft()
+        task_id = getattr(request, "task_id", None)
+        result = next((item for item in self.results if item.task_id == task_id), None)
+        if result is None:
+            return self.results.popleft()
+        self.results.remove(result)
+        return result
 
 
 class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
@@ -231,6 +239,7 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
         run_event_publisher: object | None = None,
         event_sink: object | None = None,
         fast_path_enabled: bool = False,
+        parallel_hybrid_research_enabled: bool = True,
     ) -> tuple[object, InMemoryConversationStore, FakeDispatcher, FakePlanner]:
         resolved_store = store or InMemoryConversationStore()
         planner = FakePlanner(*plan_decisions)
@@ -252,6 +261,7 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
             run_event_publisher=run_event_publisher,
             event_sink=event_sink,
             fast_path_enabled=fast_path_enabled,
+            parallel_hybrid_research_enabled=parallel_hybrid_research_enabled,
         )
         return graph, resolved_store, dispatcher, planner
 
@@ -514,6 +524,275 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[local_paper]", state["final_answer"])
         task = store.load_workspace("conversation-1").task_plan.tasks[0]
         self.assertEqual(task.status, "completed")
+
+    async def test_hybrid_research_dispatches_local_and_external_in_parallel(self) -> None:
+        scholarly_names = (
+            "search_scholarly_sources",
+            "resolve_paper_identifier",
+            "get_citation_graph",
+            "check_paper_status",
+        )
+        local = _task(
+            task_id="local-research",
+            capability="local_rag",
+            parallel_group_id="hybrid-research",
+        )
+        dynamic = _task(
+            task_id="external-research",
+            capability="dynamic_tools",
+            parallel_group_id="hybrid-research",
+            allowed_tool_risks=("network_read",),
+            allowed_tool_names=scholarly_names,
+        )
+        event_store = InMemoryConversationStore()
+        event_bus = RunEventBus(event_store)
+        graph, store, dispatcher, _planner = self._build(
+            store=event_store,
+            plan_decisions=(_plan_decision((local, dynamic)),),
+            dispatch_results=(
+                _result(task_id=local.task_id, source_id="chunk-1"),
+                _result(
+                    task_id=dynamic.task_id,
+                    capability="dynamic_tools",
+                    citation_kind="external",
+                    source_id="semantic-scholar:1",
+                ),
+            ),
+            dispatch_delay_seconds=0.2,
+            run_event_publisher=event_bus.publisher,
+        )
+        request = MainAgentRequest(
+            request_id="request-hybrid-parallel",
+            conversation_id="conversation-hybrid-parallel",
+            message="结合本地论文和外部学术检索回答",
+            rag_mode="preferred",
+        )
+
+        state = await self._run(graph, request)
+
+        self.assertEqual(len(dispatcher.calls), 2)
+        self.assertLess(dispatcher.started_at[1] - dispatcher.started_at[0], 0.05)
+        self.assertEqual(
+            tuple(call.capability for call in dispatcher.calls),
+            ("local_rag", "dynamic_tools"),
+        )
+        self.assertEqual(tuple(state["route_trace"]), ("local_rag", "dynamic_tools"))
+        persisted = store.load_workspace(request.conversation_id)
+        self.assertEqual(
+            tuple(task.status for task in persisted.task_plan.tasks),
+            ("completed", "completed"),
+        )
+        events = [
+            item.to_stream_event()
+            for item in store.run_events(request.request_id)
+        ]
+        event_types = [event.type for event in events]
+        group_started_index = event_types.index("parallel_group_started")
+        task_started_indices = [
+            index for index, value in enumerate(event_types) if value == "task_started"
+        ]
+        task_completed_indices = [
+            index
+            for index, value in enumerate(event_types)
+            if value == "task_completed"
+        ]
+        group_completed_index = event_types.index("parallel_group_completed")
+        self.assertLess(group_started_index, min(task_started_indices))
+        self.assertLess(max(task_started_indices), min(task_completed_indices))
+        self.assertLess(max(task_completed_indices), group_completed_index)
+        group_completed = events[group_completed_index]
+        self.assertEqual(group_completed.detail.parallel_group_id, "hybrid-research")
+        self.assertEqual(group_completed.detail.requested_count, 2)
+        self.assertEqual(group_completed.detail.returned_count, 2)
+        self.assertFalse(group_completed.detail.degraded)
+        self.assertGreaterEqual(group_completed.duration_ms or 0, 150)
+        self.assertEqual(
+            [event.event_id for event in events],
+            list(range(1, len(events) + 1)),
+        )
+        serialized = "\n".join(event.model_dump_json() for event in events)
+        self.assertNotIn(request.message, serialized)
+        await event_bus.aclose()
+
+    async def test_hybrid_partial_failure_is_completed_with_external_degradation(self) -> None:
+        scholarly_names = (
+            "search_scholarly_sources",
+            "resolve_paper_identifier",
+            "get_citation_graph",
+            "check_paper_status",
+        )
+        local = _task(
+            task_id="local-research",
+            capability="local_rag",
+            parallel_group_id="hybrid-research",
+        )
+        dynamic = _task(
+            task_id="external-research",
+            capability="dynamic_tools",
+            parallel_group_id="hybrid-research",
+            allowed_tool_risks=("network_read",),
+            allowed_tool_names=scholarly_names,
+        )
+        dynamic_failure = _result(
+            status="failed",
+            capability="dynamic_tools",
+            task_id=dynamic.task_id,
+        ).model_copy(update={"error_code": "provider_offline"})
+        graph, store, dispatcher, _planner = self._build(
+            plan_decisions=(_plan_decision((local, dynamic)),),
+            dispatch_results=(
+                _result(task_id=local.task_id, source_id="chunk-1"),
+                dynamic_failure,
+                dynamic_failure,
+            ),
+        )
+        request = MainAgentRequest(
+            request_id="request-hybrid-partial",
+            conversation_id="conversation-hybrid-partial",
+            message="结合本地论文和外部学术检索回答",
+            rag_mode="preferred",
+        )
+
+        state = await self._run(graph, request)
+
+        self.assertEqual(len(dispatcher.calls), 3)
+        self.assertEqual(state["termination_reason"], "completed")
+        self.assertTrue(state["degraded"])
+        self.assertEqual(
+            tuple(state["degradation_codes"]),
+            ("external_research_unavailable",),
+        )
+        self.assertIn("外部学术核验未完成", state["final_answer"])
+        persisted = store.load_agent_run(request.request_id)
+        self.assertIsNotNone(persisted)
+        self.assertTrue(persisted.degraded)
+        self.assertEqual(
+            persisted.degradation_codes,
+            ("external_research_unavailable",),
+        )
+
+    async def test_disabled_parallel_hybrid_fails_closed_before_dispatch(self) -> None:
+        scholarly_names = (
+            "search_scholarly_sources",
+            "resolve_paper_identifier",
+            "get_citation_graph",
+            "check_paper_status",
+        )
+        local = _task(
+            task_id="local-disabled",
+            capability="local_rag",
+            parallel_group_id="hybrid-disabled",
+        )
+        dynamic = _task(
+            task_id="external-disabled",
+            capability="dynamic_tools",
+            parallel_group_id="hybrid-disabled",
+            allowed_tool_risks=("network_read",),
+            allowed_tool_names=scholarly_names,
+        )
+        store = InMemoryConversationStore()
+        bus = RunEventBus(store)
+        graph, _, dispatcher, _planner = self._build(
+            store=store,
+            plan_decisions=(_plan_decision((local, dynamic)),),
+            run_event_publisher=bus.publisher,
+            parallel_hybrid_research_enabled=False,
+        )
+        request = MainAgentRequest(
+            request_id="request-hybrid-disabled",
+            conversation_id="conversation-hybrid-disabled",
+            message="结合本地论文和外部学术检索回答",
+            rag_mode="preferred",
+        )
+
+        state = await self._run(graph, request)
+
+        self.assertEqual(dispatcher.calls, [])
+        self.assertEqual(state["termination_reason"], "failed")
+        self.assertIn("parallel_hybrid_disabled", state["final_answer"])
+        child_results = tuple(
+            ChildTaskResult.model_validate(item) for item in state["child_results"]
+        )
+        self.assertEqual(
+            tuple(result.error_code for result in child_results),
+            ("parallel_hybrid_disabled", "parallel_hybrid_disabled"),
+        )
+        persisted = store.load_agent_run(request.request_id)
+        self.assertIsNotNone(persisted)
+        assert persisted is not None
+        self.assertEqual(persisted.status, "failed")
+        self.assertEqual(
+            tuple(task.status for task in store.load_workspace(request.conversation_id).task_plan.tasks),
+            ("failed", "failed"),
+        )
+        event_types = [
+            item.to_stream_event().type
+            for item in store.run_events(request.request_id)
+        ]
+        self.assertNotIn("parallel_group_started", event_types)
+        self.assertNotIn("task_started", event_types)
+        await bus.aclose()
+
+    async def test_hybrid_total_failure_returns_source_free_background_degradation(self) -> None:
+        scholarly_names = (
+            "search_scholarly_sources",
+            "resolve_paper_identifier",
+            "get_citation_graph",
+            "check_paper_status",
+        )
+        local = _task(
+            task_id="local-research",
+            capability="local_rag",
+            parallel_group_id="hybrid-research",
+        )
+        dynamic = _task(
+            task_id="external-research",
+            capability="dynamic_tools",
+            parallel_group_id="hybrid-research",
+            allowed_tool_risks=("network_read",),
+            allowed_tool_names=scholarly_names,
+        )
+        graph, store, dispatcher, _planner = self._build(
+            plan_decisions=(_plan_decision((local, dynamic)),),
+            dispatch_results=(
+                _result(status="failed", task_id=local.task_id),
+                _result(
+                    status="failed",
+                    capability="dynamic_tools",
+                    task_id=dynamic.task_id,
+                ),
+            ),
+        )
+        request = MainAgentRequest(
+            request_id="request-hybrid-background",
+            conversation_id="conversation-hybrid-background",
+            message="结合本地论文和外部学术检索回答",
+            rag_mode="preferred",
+        )
+
+        state = await self._run(graph, request)
+
+        self.assertEqual(len(dispatcher.calls), 2)
+        self.assertEqual(state["termination_reason"], "completed")
+        self.assertEqual(
+            tuple(state["degradation_codes"]),
+            (
+                "local_evidence_insufficient",
+                "external_research_unavailable",
+                "model_background_only",
+            ),
+        )
+        self.assertIn("未经本地或外部证据核验", state["final_answer"])
+        persisted = store.load_agent_run(request.request_id)
+        self.assertIsNotNone(persisted)
+        self.assertEqual(
+            tuple(
+                source_id
+                for result in persisted.child_results
+                for source_id in result.source_ids
+            ),
+            (),
+        )
 
     async def test_clear_local_comparison_skips_all_three_model_stages(self) -> None:
         class EchoDispatcher:

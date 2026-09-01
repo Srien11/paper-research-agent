@@ -125,6 +125,10 @@ class StaticWebContractTests(unittest.TestCase):
             "terminal-status",
             "finalizeProgress",
             "answer_delta",
+            "parallel_group_",
+            "plan-parallel-badge",
+            "部分证据未完成",
+            "当前并行批次完成后暂停",
         ):
             self.assertIn(state_token, self.javascript + self.html)
         self.assertNotIn('id="pipeline-status"', self.html)

@@ -13,6 +13,7 @@ from paper_research_agent.agent.orchestrator.models import (
 from paper_research_agent.agent.orchestrator.planning_route import (
     PlanningRouteDecision,
     classify_planning_route,
+    infer_source_requirements,
 )
 
 
@@ -138,6 +139,20 @@ class PlanningRouteTests(unittest.TestCase):
 
         self.assertEqual(decision.route, "full_planner")
         self.assertEqual(decision.reason_code, "feature_disabled")
+
+    def test_external_intent_never_uses_local_only_fast_path(self) -> None:
+        messages = (
+            "结合本地论文 C001 和联网搜索，分析 RAG",
+            "比较 C001 与 C002，并用外部资料核验",
+            "参考知识库，同时网上查最新版本",
+            "根据 C001，再从网络来源确认项目状态",
+        )
+        for message in messages:
+            with self.subTest(message=message):
+                requirements = infer_source_requirements(message)
+                decision = classify_planning_route(_envelope(message), enabled=True)
+                self.assertTrue(requirements.external_required)
+                self.assertEqual(decision.route, "full_planner")
 
 
 if __name__ == "__main__":

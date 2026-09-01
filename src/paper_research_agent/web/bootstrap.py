@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import warnings
 from collections.abc import Awaitable, Callable, Mapping
@@ -15,6 +16,7 @@ from typing import Any, Literal, Protocol, cast
 import aiosqlite
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
+from paper_research_agent.agent.dynamic.models import DynamicResearchResult
 from paper_research_agent.agent.factory import (
     create_main_agent_model,
     create_main_agent_runtime_from_model,
@@ -25,6 +27,7 @@ from paper_research_agent.agent.orchestrator.identifiers import dynamic_thread_i
 from paper_research_agent.agent.orchestrator.memory import ToolkitLongTermMemoryProvider
 from paper_research_agent.agent.orchestrator.models import ChildTaskRequest
 from paper_research_agent.agent.orchestrator.runtime import MainAgentRuntime
+from paper_research_agent.agent.tooling.catalog import ToolRisk
 from paper_research_agent.conversation.store import ConversationStore, SQLiteConversationStore
 from paper_research_agent.web.chat_runtime import ConversationRuntime
 from paper_research_agent.web.child_executors import (
@@ -48,7 +51,16 @@ class ClosableRuntime(Protocol):
 
 
 class DynamicResearchRuntimeLike(Protocol):
-    async def run_dynamic_tools(self, question: str, *, thread_id: str) -> object: ...
+    async def run_dynamic_tools(
+        self,
+        question: str,
+        *,
+        thread_id: str,
+        memory_context: tuple[dict[str, object], ...] | None = None,
+        child_context: dict[str, object] | None = None,
+        allowed_tool_risks: tuple[ToolRisk, ...] | None = None,
+        allowed_tool_names: tuple[str, ...] | None = None,
+    ) -> object: ...
 
     async def resume_dynamic_tools(self, *, thread_id: str, approved: bool) -> object: ...
 
@@ -72,6 +84,7 @@ class ApplicationEnvironment:
     corpus_configured: bool
     timeout_seconds: float = 180
     main_agent_fast_path_enabled: bool = True
+    parallel_hybrid_research_enabled: bool = False
 
     @classmethod
     def from_environment(
@@ -111,6 +124,11 @@ class ApplicationEnvironment:
                 source,
                 "PRA_MAIN_AGENT_FAST_PATH_ENABLED",
                 default=True,
+            ),
+            parallel_hybrid_research_enabled=_strict_boolean_from_environment(
+                source,
+                "PRA_PARALLEL_HYBRID_RESEARCH_ENABLED",
+                default=False,
             ),
         )
 
@@ -186,11 +204,19 @@ class _DynamicChildAdapter:
         question: str,
         *,
         thread_id: str,
-        memory_context: tuple[dict[str, object], ...] = (),
+        memory_context: tuple[dict[str, object], ...] | None = None,
         child_context: dict[str, object] | None = None,
+        allowed_tool_risks: tuple[ToolRisk, ...] | None = None,
+        allowed_tool_names: tuple[str, ...] | None = None,
     ) -> object:
-        del memory_context, child_context
-        return await self._runtime.run_dynamic_tools(question, thread_id=thread_id)
+        return await self._runtime.run_dynamic_tools(
+            question,
+            thread_id=thread_id,
+            memory_context=memory_context,
+            child_context=child_context,
+            allowed_tool_risks=allowed_tool_risks,
+            allowed_tool_names=allowed_tool_names,
+        )
 
     async def resume(self, *, thread_id: str, approved: bool) -> object:
         return await self._runtime.resume_dynamic_tools(
@@ -198,6 +224,41 @@ class _DynamicChildAdapter:
         )
 
     async def run_task(self, request: ChildTaskRequest) -> object:
+        selected_memory = tuple(
+            dict[str, object](
+                memory_id=item.source_id,
+                content=item.content,
+                kind="long_term_memory",
+                trust="research_context",
+            )
+            for item in request.selected_context
+            if item.kind == "long_term_memory"
+        )
+        memory_context: tuple[dict[str, object], ...] | None
+        if selected_memory:
+            memory_context = selected_memory
+        elif request.parallel_group_id is not None:
+            memory_context = ()
+        else:
+            memory_context = None
+        readiness = getattr(self._runtime, "external_scholarly_readiness", None)
+        if (
+            request.parallel_group_id is not None
+            and readiness is not None
+            and not bool(getattr(readiness, "ready", False))
+        ):
+            child_run_id = hashlib.sha256(
+                f"{request.run_id}:{request.task_id}:external-scholarly".encode()
+            ).hexdigest()[:32]
+            return DynamicResearchResult(
+                run_id=child_run_id,
+                thread_id=dynamic_thread_id(
+                    request.conversation_id, request.run_id, request.task_id
+                ),
+                status="completed",
+                final_summary="外部学术 Provider 当前不可用，未发起联网请求。",
+                termination_reason="external_research_unavailable",
+            )
         return await self._run_with_product_events(
             request,
             self._runtime.run_dynamic_tools(
@@ -205,6 +266,17 @@ class _DynamicChildAdapter:
                 thread_id=dynamic_thread_id(
                     request.conversation_id, request.run_id, request.task_id
                 ),
+                memory_context=memory_context,
+                child_context={
+                    "goal_id": request.goal_id,
+                    "goal_objective": request.goal_objective,
+                    "task_id": request.task_id,
+                    "objective": request.objective,
+                    "success_criteria": list(request.success_criteria),
+                    "constraints": list(request.constraints),
+                },
+                allowed_tool_risks=(request.allowed_tool_risks or None),
+                allowed_tool_names=(request.allowed_tool_names or None),
             ),
         )
 
@@ -457,6 +529,9 @@ async def create_application_services(
                 memory_provider=memory_provider,
                 run_event_publisher=run_events.publisher,
                 fast_path_enabled=environment.main_agent_fast_path_enabled,
+                parallel_hybrid_research_enabled=(
+                    environment.parallel_hybrid_research_enabled
+                ),
             )
             own(main)
         return ApplicationServices(

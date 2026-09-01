@@ -29,6 +29,7 @@ InterfaceScenario = Literal[
 RAGMode = Literal["disabled", "preferred", "required"]
 ApprovalOutcome = Literal["none", "approved", "rejected", "expired"]
 ArtifactKind = Literal["chat", "local_rag", "dynamic_tools", "attachment_qa", "file_edit"]
+ExecutionMode = Literal["single", "parallel"]
 
 
 class MainAgentInterfaceCase(FrozenModel):
@@ -42,6 +43,11 @@ class MainAgentInterfaceCase(FrozenModel):
     expected_capabilities: tuple[Capability, ...] = Field(min_length=1, max_length=5)
     expected_artifact_kinds: tuple[ArtifactKind, ...] = Field(min_length=1, max_length=5)
     expected_status: RunStatus
+    expected_execution_mode: ExecutionMode
+    expected_parallel_groups: tuple[tuple[Capability, ...], ...]
+    expected_degraded: bool
+    expected_model_synthesis: bool
+    forbidden_capabilities: tuple[Capability, ...]
     requires_citation_preservation: bool = False
     approval_outcome: ApprovalOutcome = "none"
     duplicate_request: bool = False
@@ -68,6 +74,10 @@ class MainAgentInterfaceRecord(FrozenModel):
     event_types: tuple[str, ...] = Field(default=(), max_length=64)
     event_ids: tuple[int, ...] = Field(default=(), max_length=64)
     done_count: int = Field(default=0, ge=0)
+    execution_mode: ExecutionMode = "single"
+    parallel_groups: tuple[tuple[Capability, ...], ...] = ()
+    degraded: bool = False
+    model_synthesis_count: int = Field(default=0, ge=0)
 
 
 class MainAgentInterfaceScoringResult(FrozenModel):
@@ -79,6 +89,8 @@ class MainAgentInterfaceScoringResult(FrozenModel):
     duplicate_side_effect: float = Field(ge=0, le=1)
     commit_rejection: float = Field(ge=0, le=1)
     event_contract_validity: float = Field(ge=0, le=1)
+    parallel_contract: float = Field(ge=0, le=1)
+    model_synthesis: float = Field(ge=0, le=1)
     overall: float = Field(ge=0, le=1)
 
 
@@ -91,6 +103,10 @@ class MainAgentTurnRecord(FrozenModel):
     status: str
     memory_recalled_before_route: bool = False
     side_effect_count: int = Field(default=0, ge=0)
+    execution_mode: ExecutionMode = "single"
+    parallel_groups: tuple[tuple[str, ...], ...] = ()
+    degraded: bool = False
+    model_synthesis_count: int = Field(default=0, ge=0)
 
 
 class MainAgentConversationCase(FrozenModel):
@@ -101,6 +117,11 @@ class MainAgentConversationCase(FrozenModel):
     goal_continuous: bool = False
     expected_capabilities: tuple[str, ...] = Field(default=(), max_length=8)
     expected_final_status: str = "completed"
+    expected_execution_mode: ExecutionMode = "single"
+    expected_parallel_groups: tuple[tuple[str, ...], ...] = ()
+    expected_degraded: bool = False
+    expected_model_synthesis: bool = True
+    forbidden_capabilities: tuple[str, ...] = ()
 
 
 class MainAgentScoringResult(FrozenModel):
@@ -109,6 +130,8 @@ class MainAgentScoringResult(FrozenModel):
     route_correctness: float = Field(ge=0, le=1)
     memory_before_routing: float = Field(ge=0, le=1)
     duplicate_side_effect: float = Field(ge=0, le=1)
+    parallel_contract: float = Field(ge=0, le=1)
+    model_synthesis: float = Field(ge=0, le=1)
     overall: float = Field(ge=0, le=1)
 
 
@@ -153,6 +176,17 @@ def score_main_agent_interface_case(
     duplicate_side_effect = _score_interface_side_effects(case, record)
     commit_rejection = _score_interface_commit(case, record)
     event_contract_validity = _score_interface_events(case, record)
+    parallel_contract = float(
+        record.execution_mode == case.expected_execution_mode
+        and record.parallel_groups == case.expected_parallel_groups
+        and record.degraded == case.expected_degraded
+        and not set(record.capabilities).intersection(case.forbidden_capabilities)
+    )
+    model_synthesis = float(
+        (record.model_synthesis_count >= 1)
+        if case.expected_model_synthesis
+        else record.model_synthesis_count == 0
+    )
     axes = (
         route_correctness,
         goal_continuity,
@@ -162,6 +196,8 @@ def score_main_agent_interface_case(
         duplicate_side_effect,
         commit_rejection,
         event_contract_validity,
+        parallel_contract,
+        model_synthesis,
     )
     return MainAgentInterfaceScoringResult(
         route_correctness=route_correctness,
@@ -172,6 +208,8 @@ def score_main_agent_interface_case(
         duplicate_side_effect=duplicate_side_effect,
         commit_rejection=commit_rejection,
         event_contract_validity=event_contract_validity,
+        parallel_contract=parallel_contract,
+        model_synthesis=model_synthesis,
         overall=round(sum(axes) / len(axes), 4),
     )
 
@@ -256,6 +294,8 @@ def score_main_agent_case(
             route_correctness=0.0,
             memory_before_routing=0.0,
             duplicate_side_effect=0.0,
+            parallel_contract=0.0,
+            model_synthesis=0.0,
             overall=0.0,
         )
     goal_continuity = _score_goal_continuity(case, turn_records)
@@ -263,12 +303,20 @@ def score_main_agent_case(
     route_correctness = _score_route_correctness(case, turn_records)
     memory_before_routing = _score_memory_before_routing(turn_records)
     duplicate_side_effect = _score_duplicate_side_effect(turn_records)
+    parallel_contract = _score_conversation_parallel(case, turn_records)
+    model_synthesis = float(
+        (sum(record.model_synthesis_count for record in turn_records) >= 1)
+        if case.expected_model_synthesis
+        else all(record.model_synthesis_count == 0 for record in turn_records)
+    )
     axes = (
         goal_continuity,
         plan_continuity,
         route_correctness,
         memory_before_routing,
         duplicate_side_effect,
+        parallel_contract,
+        model_synthesis,
     )
     overall = sum(axes) / len(axes)
     return MainAgentScoringResult(
@@ -277,6 +325,8 @@ def score_main_agent_case(
         route_correctness=route_correctness,
         memory_before_routing=memory_before_routing,
         duplicate_side_effect=duplicate_side_effect,
+        parallel_contract=parallel_contract,
+        model_synthesis=model_synthesis,
         overall=round(overall, 4),
     )
 
@@ -304,11 +354,35 @@ def _score_plan_continuity(records: tuple[MainAgentTurnRecord, ...]) -> float:
 def _score_route_correctness(
     case: MainAgentConversationCase, records: tuple[MainAgentTurnRecord, ...]
 ) -> float:
-    expected = set(case.expected_capabilities)
-    actual = {capability for record in records for capability in record.capabilities}
+    expected = case.expected_capabilities
+    actual = tuple(
+        dict.fromkeys(
+            capability for record in records for capability in record.capabilities
+        )
+    )
     if not expected:
         return 1.0
     return 1.0 if actual == expected else 0.0
+
+
+def _score_conversation_parallel(
+    case: MainAgentConversationCase,
+    records: tuple[MainAgentTurnRecord, ...],
+) -> float:
+    modes = tuple(record.execution_mode for record in records if record.capabilities)
+    groups = tuple(
+        group for record in records for group in record.parallel_groups
+    )
+    capabilities = {
+        capability for record in records for capability in record.capabilities
+    }
+    return float(
+        bool(modes)
+        and all(mode == case.expected_execution_mode for mode in modes)
+        and groups == case.expected_parallel_groups
+        and all(record.degraded == case.expected_degraded for record in records)
+        and not capabilities.intersection(case.forbidden_capabilities)
+    )
 
 
 def _score_memory_before_routing(records: tuple[MainAgentTurnRecord, ...]) -> float:

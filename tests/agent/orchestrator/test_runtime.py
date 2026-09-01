@@ -10,6 +10,7 @@ from paper_research_agent.agent.orchestrator.artifacts import ChatArtifact
 from paper_research_agent.agent.orchestrator.models import (
     AgentTask,
     ChildTaskResult,
+    CommitOutcome,
     ConversationWorkspace,
     MainAgentRequest,
     MainAgentResult,
@@ -121,6 +122,35 @@ class MainAgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(event_types[-1], "run_completed")
         self.assertEqual(event_types.count("run_completed"), 1)
+        await bus.aclose()
+
+    async def test_completed_product_boundary_projects_degraded_warning_flag(self) -> None:
+        store = InMemoryConversationStore()
+        bus = RunEventBus(store)
+        runtime = MainAgentRuntime(
+            graph=_FakeGraph(
+                state_updates={
+                    "degraded": True,
+                    "degradation_codes": ("external_research_unavailable",),
+                }
+            ),
+            repository=store,
+            run_event_publisher=bus.publisher,
+        )
+        request = _request(
+            conversation_id="conversation-product-degraded",
+            request_id="req_product_degraded_1234",
+        )
+
+        result = await runtime.run(request)
+        completed = next(
+            item.to_stream_event()
+            for item in store.run_events(request.request_id)
+            if item.to_stream_event().type == "run_completed"
+        )
+
+        self.assertTrue(result.degraded)
+        self.assertTrue(completed.detail.degraded)
         await bus.aclose()
 
     async def test_load_workspace_for_run_prefers_live_checkpoint_draft(self) -> None:
@@ -276,6 +306,28 @@ class MainAgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.workspace_version, 3)
+
+    async def test_failed_committed_graph_returns_persisted_workspace_version(self) -> None:
+        runtime = MainAgentRuntime(
+            graph=_FakeGraph(
+                termination_reason="failed",
+                base_workspace_version=3,
+                state_updates={
+                    "commit_outcome": CommitOutcome(
+                        committed=True,
+                        reason="committed",
+                        workspace_version=4,
+                    )
+                },
+            ),
+            repository=InMemoryConversationStore(),
+            timeout_seconds=5,
+        )
+
+        result = await runtime.run(_request(request_id="request-failed-committed"))
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.workspace_version, 4)
 
     async def test_run_times_out_when_graph_is_slow(self) -> None:
         store = InMemoryConversationStore()

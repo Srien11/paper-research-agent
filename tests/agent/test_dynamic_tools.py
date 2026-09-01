@@ -181,6 +181,139 @@ class DynamicToolModelTests(unittest.TestCase):
 
 
 class DynamicToolGraphTests(unittest.IsolatedAsyncioTestCase):
+    async def test_task_scope_rejects_write_without_creating_approval(self) -> None:
+        toolkit = FakeToolkit()
+        graph = build_dynamic_tool_graph(
+            router=SequenceRouter(
+                ToolDecision(
+                    action="call_tool",
+                    tool_name="save_research_note",
+                    arguments={"title": "Finding", "content": "Do not write"},
+                    purpose="Attempt a write from the scholarly branch",
+                )
+            ),
+            toolkit=toolkit,  # type: ignore[arg-type]
+            max_steps=2,
+        )
+
+        result = await DynamicResearchRuntime(graph=graph, max_steps=2).run(
+            "保存这条外部论文检索结果",
+            thread_id="write-scope",
+            memory_context=(),
+            allowed_tool_risks=("network_read",),
+            allowed_tool_names=("search_scholarly_sources",),
+        )
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.termination_reason, "parallel_write_not_allowed")
+        self.assertIsNone(result.pending_approval)
+        self.assertEqual(toolkit.calls, [])
+
+    async def test_task_scope_rejects_disallowed_risk_before_execution(self) -> None:
+        toolkit = FakeToolkit()
+        graph = build_dynamic_tool_graph(
+            router=SequenceRouter(
+                ToolDecision(
+                    action="call_tool",
+                    tool_name="calculate",
+                    arguments={"expression": "6 * 7"},
+                    purpose="Use a tool outside the task scope",
+                )
+            ),
+            toolkit=toolkit,  # type: ignore[arg-type]
+            max_steps=2,
+        )
+
+        result = await DynamicResearchRuntime(graph=graph, max_steps=2).run(
+            "检索外部论文",
+            thread_id="risk-scope",
+            memory_context=(),
+            allowed_tool_risks=("network_read",),
+            allowed_tool_names=("search_scholarly_sources",),
+        )
+
+        self.assertEqual(result.termination_reason, "parallel_tool_risk_denied")
+        self.assertEqual(toolkit.calls, [])
+
+    async def test_task_allowlist_rejects_network_mcp_tool(self) -> None:
+        toolkit = FakeToolkit()
+        provider = McpValidationProvider()
+        tool = RegisteredTool(
+            public_name="zotero__search_online",
+            provider_id="zotero",
+            provider_kind="mcp",
+            remote_name="search_online",
+            spec=ToolSpec(
+                name="zotero__search_online",
+                risk="network_read",
+                trust="research_context",
+                timeout_seconds=5,
+                max_result_items=20,
+                description="Search an external catalog.",
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {"query": {"type": "string", "minLength": 1}},
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        )
+        graph = build_dynamic_tool_graph(
+            router=SequenceRouter(
+                ToolDecision(
+                    action="call_tool",
+                    tool_name=tool.public_name,
+                    arguments={"query": "agent"},
+                    purpose="Use an unapproved network provider",
+                )
+            ),
+            toolkit=toolkit,  # type: ignore[arg-type]
+            registry=ToolRegistrySnapshot({tool.public_name: tool}, {"zotero": provider}),
+            max_steps=2,
+        )
+
+        result = await DynamicResearchRuntime(graph=graph, max_steps=2).run(
+            "检索外部论文",
+            thread_id="name-scope",
+            memory_context=(),
+            allowed_tool_risks=("network_read",),
+            allowed_tool_names=("search_scholarly_sources",),
+        )
+
+        self.assertEqual(result.termination_reason, "parallel_tool_name_denied")
+        self.assertEqual(toolkit.calls, [])
+
+    async def test_task_scope_allows_named_scholarly_tool(self) -> None:
+        toolkit = FakeToolkit()
+        graph = build_dynamic_tool_graph(
+            router=SequenceRouter(
+                ToolDecision(
+                    action="call_tool",
+                    tool_name="search_scholarly_sources",
+                    arguments={"query": "retrieval augmented generation"},
+                    purpose="Search scholarly metadata",
+                ),
+                ToolDecision(
+                    action="finish",
+                    purpose="Return findings",
+                    final_summary="已完成外部学术检索。",
+                ),
+            ),
+            toolkit=toolkit,  # type: ignore[arg-type]
+            max_steps=2,
+        )
+
+        result = await DynamicResearchRuntime(graph=graph, max_steps=2).run(
+            "检索外部论文",
+            thread_id="scholarly-scope",
+            memory_context=(),
+            allowed_tool_risks=("network_read",),
+            allowed_tool_names=("search_scholarly_sources",),
+        )
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(toolkit.calls[0][0], "search_scholarly_sources")
+
     async def test_registered_mcp_tool_is_authorized_by_captured_snapshot(self) -> None:
         toolkit = FakeToolkit()
         provider = McpValidationProvider()

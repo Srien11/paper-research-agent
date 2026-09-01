@@ -26,6 +26,7 @@ from paper_research_agent.agent.dynamic.models import (
 )
 from paper_research_agent.agent.dynamic.router import DynamicToolRouter
 from paper_research_agent.agent.observability import AgentEvent, AgentEventSink, emit_agent_event
+from paper_research_agent.agent.tooling.catalog import ToolRisk, effective_tool_spec
 from paper_research_agent.agent.tooling.contracts import ToolExecutionResult
 from paper_research_agent.agent.tooling.registry import (
     RegisteredTool,
@@ -64,6 +65,8 @@ class DynamicToolState(TypedDict, total=False):
     memory_context: list[dict[str, Any]]
     memory_supplied: bool
     child_context: dict[str, Any]
+    allowed_tool_risks: list[ToolRisk] | None
+    allowed_tool_names: list[str] | None
     memory_proposal_completed: bool
     resume_after_execute: str | None
 
@@ -131,9 +134,24 @@ def build_dynamic_tool_graph(
                 "termination_reason": "router_finished",
                 "pending_decision": None,
                 "pending_approval": None,
-                "next_action": "propose_memory" if memory_proposer else "finalize",
+                "next_action": (
+                    "propose_memory"
+                    if memory_proposer and not _tool_access_is_restricted(state)
+                    else "finalize"
+                ),
             }
         validated_call = validate_tool_decision(decision, snapshot)
+        try:
+            _authorize_tool_call(
+                state,
+                validated_call.tool,
+                validated_call.arguments,
+            )
+        except _ToolScopeDenied as error:
+            return _finished(
+                "研究工具请求超出当前只读学术检索任务的权限范围。",
+                error.reason_code,
+            )
         decision = decision.model_copy(update={"arguments": validated_call.arguments})
         if decision.tool_name == "manage_long_term_memory" and decision.arguments.get("action") in {
             "add",
@@ -161,7 +179,11 @@ def build_dynamic_tool_graph(
         }
 
     async def propose_memory(state: DynamicToolState) -> DynamicToolState:
-        if memory_proposer is None or state.get("memory_proposal_completed", False):
+        if (
+            memory_proposer is None
+            or state.get("memory_proposal_completed", False)
+            or _tool_access_is_restricted(state)
+        ):
             return {"next_action": "finalize"}
         proposal = await memory_proposer.propose(
             _required_text(state, "question"),
@@ -186,6 +208,17 @@ def build_dynamic_tool_graph(
     async def execute(state: DynamicToolState) -> DynamicToolState:
         decision = ToolDecision.model_validate(state.get("pending_decision"))
         validated_call = validate_tool_decision(decision, snapshot)
+        try:
+            _authorize_tool_call(
+                state,
+                validated_call.tool,
+                validated_call.arguments,
+            )
+        except _ToolScopeDenied as error:
+            return _finished(
+                "研究工具请求超出当前只读学术检索任务的权限范围。",
+                error.reason_code,
+            )
         decision = decision.model_copy(update={"arguments": validated_call.arguments})
         tool_name = validated_call.tool.public_name
         result = await toolkit.execute(
@@ -446,6 +479,40 @@ def _required_text(state: DynamicToolState, key: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"dynamic graph {key} is missing")
     return value
+
+
+def _tool_access_is_restricted(state: DynamicToolState) -> bool:
+    return (
+        state.get("allowed_tool_risks") is not None
+        or state.get("allowed_tool_names") is not None
+    )
+
+
+class _ToolScopeDenied(PermissionError):
+    def __init__(self, reason_code: str) -> None:
+        super().__init__(reason_code)
+        self.reason_code = reason_code
+
+
+def _authorize_tool_call(
+    state: DynamicToolState,
+    tool: RegisteredTool,
+    arguments: dict[str, Any],
+) -> None:
+    allowed_risks = state.get("allowed_tool_risks")
+    allowed_names = state.get("allowed_tool_names")
+    if allowed_risks is None and allowed_names is None:
+        return
+    effective = effective_tool_spec(tool.spec, arguments)
+    if allowed_risks is not None and effective.risk not in allowed_risks:
+        reason = (
+            "parallel_write_not_allowed"
+            if effective.risk == "write"
+            else "parallel_tool_risk_denied"
+        )
+        raise _ToolScopeDenied(reason)
+    if allowed_names is not None and tool.public_name not in allowed_names:
+        raise _ToolScopeDenied("parallel_tool_name_denied")
 
 
 DynamicNode = Callable[[DynamicToolState], Awaitable[DynamicToolState]]

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from datetime import UTC, datetime
-from typing import Any, Literal, cast
+from typing import Any, Literal
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
@@ -23,8 +23,10 @@ from paper_research_agent.agent.orchestrator.evaluator import (
     MAX_CHILD_CALLS_PER_RUN,
     MAX_REPLANS_PER_RUN,
     TaskEvaluation,
+    degradation_codes_for_results,
     evaluate_task,
     reduce_workspace,
+    reduce_workspace_batch,
 )
 from paper_research_agent.agent.orchestrator.hydrator import ContextHydrator
 from paper_research_agent.agent.orchestrator.interpreter import TurnInterpreter
@@ -43,6 +45,13 @@ from paper_research_agent.agent.orchestrator.models import (
     MainAgentResumeRequest,
     RecalledContext,
     TurnInterpretationV2,
+)
+from paper_research_agent.agent.orchestrator.parallel import (
+    ParallelBatchCoordinator,
+    TaskBatch,
+)
+from paper_research_agent.agent.orchestrator.parallel import (
+    select_next_batch as select_next_batch_pure,
 )
 from paper_research_agent.agent.orchestrator.planner import (
     GoalReconciler,
@@ -84,6 +93,7 @@ def build_main_agent_graph(
     run_event_publisher: Any | None = None,
     event_sink: AgentEventSink | None = None,
     fast_path_enabled: bool = False,
+    parallel_hybrid_research_enabled: bool = False,
 ) -> CompiledStateGraph[Any, Any, Any, Any]:
     """Assemble the graph; only commit_turn and abort_turn write storage."""
     if max_child_calls <= 0 or max_child_calls > 12:
@@ -91,6 +101,7 @@ def build_main_agent_graph(
     if max_replans <= 0 or max_replans > 3:
         raise ValueError("max_replans must be between 1 and 3")
     answer_synthesizer = synthesizer or AnswerSynthesizer()
+    batch_coordinator = ParallelBatchCoordinator()
     full_planning_started: dict[str, float] = {}
 
     def emit_planning_event(
@@ -136,6 +147,7 @@ def build_main_agent_graph(
         summary: str | None = None,
         detail: SafeRunEventDetail | None = None,
         task_id: str | None = None,
+        duration_ms: int | None = None,
         idempotency_key: str,
     ) -> None:
         if run_event_publisher is None:
@@ -158,6 +170,7 @@ def build_main_agent_graph(
                 status=status,
                 title=title,
                 summary=summary,
+                duration_ms=duration_ms,
                 detail=detail or SafeRunEventDetail(delivery_mode="event_only"),
             ),
             idempotency_key=idempotency_key,
@@ -444,182 +457,314 @@ def build_main_agent_graph(
             return {"next_action": "synthesize"}
         if selection.outcome in {"clarify", "blocked"}:
             return {"next_action": "clarify"}
-        remaining = int(state.get("remaining_child_calls", max_child_calls))
-        if remaining <= 0:
-            task_id = str(selection.task_id)
-            selected_task = _task_by_id(workspace, task_id)
-            evaluation = TaskEvaluation(
-                task_id=task_id,
-                outcome="fail",
-                reason="整轮子图调用预算耗尽",
+        batch = select_next_batch_pure(workspace)
+        if batch is None:
+            raise ValueError("execute selection requires a task batch")
+        selected_tasks = tuple(
+            _task_by_id(workspace, task_id) for task_id in batch.task_ids
+        )
+        if batch.execution_mode == "parallel" and not parallel_hybrid_research_enabled:
+            disabled_results = tuple(
+                _budget_failure_result(
+                    task,
+                    reason="parallel_hybrid_disabled",
+                    summary="并行混合研究功能当前已关闭，子任务未启动。",
+                )
+                for task in selected_tasks
             )
-            workspace = reduce_workspace(
-                workspace, task_id=task_id, evaluation=evaluation
+            disabled_evaluations = tuple(
+                TaskEvaluation(
+                    task_id=task.task_id,
+                    outcome="fail",
+                    reason="parallel_hybrid_disabled",
+                )
+                for task in selected_tasks
             )
             child_results = list(state.get("child_results", []))
-            child_results.append(
+            child_results.extend(disabled_results)
+            return {
+                "workspace_draft": reduce_workspace_batch(
+                    workspace,
+                    evaluations=disabled_evaluations,
+                    results=disabled_results,
+                ),
+                "child_results": child_results,
+                "final_answer": (
+                    "并行混合研究功能当前已关闭（parallel_hybrid_disabled）；"
+                    "本地 RAG 与外部学术检索均未启动。"
+                ),
+                "termination_reason": "parallel_hybrid_disabled",
+                "next_action": "control_stop",
+            }
+        remaining = int(state.get("remaining_child_calls", max_child_calls))
+        if remaining < len(batch.task_ids):
+            evaluations = tuple(
+                TaskEvaluation(
+                    task_id=task.task_id,
+                    outcome="fail",
+                    reason="整轮子图调用预算耗尽",
+                )
+                for task in selected_tasks
+            )
+            budget_results = tuple(
                 _budget_failure_result(
-                    selected_task,
+                    task,
                     reason="run_call_budget_exhausted",
                     summary="整轮子任务调用预算已耗尽，当前任务未执行。",
                 )
+                for task in selected_tasks
             )
+            workspace = reduce_workspace_batch(
+                workspace,
+                evaluations=evaluations,
+                results=budget_results,
+            )
+            child_results = list(state.get("child_results", []))
+            child_results.extend(budget_results)
             return {
                 "workspace_draft": workspace,
                 "child_results": child_results,
                 "next_action": "synthesize",
             }
-        if selection.task_id is None:
-            raise ValueError("execute selection requires a task id")
-        selected_task = _task_by_id(workspace, selection.task_id)
-        budget_reason = task_budget_exhausted(selected_task)
-        if budget_reason is not None:
+        exhausted = tuple(
+            (task, reason)
+            for task in selected_tasks
+            if (reason := task_budget_exhausted(task)) is not None
+        )
+        if exhausted:
             child_results = list(state.get("child_results", []))
-            child_results.append(
+            budget_results = tuple(
                 _budget_failure_result(
-                    selected_task,
-                    reason=budget_reason,
-                    summary=f"任务因预算限制未执行：{budget_reason}。",
+                    task,
+                    reason=reason,
+                    summary=f"任务因预算限制未执行：{reason}。",
                 )
+                for task, reason in exhausted
             )
+            evaluations = tuple(
+                TaskEvaluation(task_id=task.task_id, outcome="fail", reason=reason)
+                for task, reason in exhausted
+            )
+            child_results.extend(budget_results)
             return {
-                "workspace_draft": _fail_task_for_budget(
-                    workspace, selected_task.task_id, budget_reason
+                "workspace_draft": reduce_workspace_batch(
+                    workspace,
+                    evaluations=evaluations,
+                    results=budget_results,
                 ),
                 "child_results": child_results,
                 "next_action": "select_next_task",
             }
-        await publish_product_event(
-            state,
-            "task_started",
-            node_id=f"task:{selected_task.task_id}",
-            status="running",
-            title=selected_task.title,
-            summary=selected_task.execution_reason,
-            detail=SafeRunEventDetail(capability=selected_task.capability),
-            task_id=selected_task.task_id,
-            idempotency_key=(
-                f"task:{selected_task.task_id}:attempt:{selected_task.attempt_count}:started"
-            ),
-        )
-        return {"active_task_id": selection.task_id, "next_action": "route"}
+        if batch.execution_mode == "parallel":
+            await publish_product_event(
+                state,
+                "parallel_group_started",
+                node_id=f"parallel:{batch.batch_id}",
+                status="running",
+                title="并行研究开始",
+                summary="本地论文检索与外部学术检索正在并行执行。",
+                detail=SafeRunEventDetail(
+                    parallel_group_id=batch.batch_id,
+                    requested_count=len(batch.task_ids),
+                ),
+                idempotency_key=f"parallel:{batch.batch_id}:started",
+            )
+        for selected_task in selected_tasks:
+            await publish_product_event(
+                state,
+                "task_started",
+                node_id=f"task:{selected_task.task_id}",
+                status="running",
+                title=selected_task.title,
+                summary=selected_task.execution_reason,
+                detail=SafeRunEventDetail(capability=selected_task.capability),
+                task_id=selected_task.task_id,
+                idempotency_key=(
+                    f"task:{selected_task.task_id}:attempt:{selected_task.attempt_count}:started"
+                ),
+            )
+        return {
+            "active_task_id": batch.task_ids[0],
+            "active_batch": batch,
+            "next_action": "route",
+        }
 
     async def route_task(state: MainAgentGraphState) -> MainAgentGraphState:
         workspace = ConversationWorkspace.model_validate(state["workspace_draft"])
-        task = _task_by_id(workspace, str(state["active_task_id"]))
+        batch = TaskBatch.model_validate(state["active_batch"])
         envelope = AgentContextEnvelope.model_validate(state["context"])
-        decision = route_task_pure(task, envelope)
-        return {"route": decision.capability}
+        routes: dict[str, Capability] = {
+            task_id: route_task_pure(_task_by_id(workspace, task_id), envelope).capability
+            for task_id in batch.task_ids
+        }
+        trace = [str(item) for item in state.get("route_trace", [])]
+        for task_id in batch.task_ids:
+            route = routes[task_id]
+            if route not in trace:
+                trace.append(route)
+        return {
+            "route": routes[batch.task_ids[0]],
+            "batch_routes": routes,
+            "route_trace": trace,
+        }
 
     async def dispatch_child(state: MainAgentGraphState) -> MainAgentGraphState:
-        child_request = _child_request(state)
+        batch = TaskBatch.model_validate(state["active_batch"])
+        routes = state.get("batch_routes", {})
+        child_requests = tuple(
+            _child_request_for(state, task_id=task_id, route=routes[task_id])
+            for task_id in batch.task_ids
+        )
         workspace = ConversationWorkspace.model_validate(state["workspace_draft"])
-        task = _task_by_id(workspace, child_request.task_id)
-        remaining_seconds = (
-            task.budget.max_seconds - task.usage.elapsed_seconds
-            if task.budget.max_seconds is not None
-            else None
-        )
-        started = time.perf_counter()
-        try:
-            if remaining_seconds is not None:
-                async with asyncio.timeout(max(0.001, remaining_seconds)):
-                    result = await dispatcher.dispatch(child_request)
-            else:
-                result = await dispatcher.dispatch(child_request)
-        except TimeoutError:
-            result = ChildTaskResult(
-                child_run_id=f"budget-{task.task_id}",
-                task_id=task.task_id,
-                capability=task.capability,
-                status="failed",
-                summary="任务超过单步时间预算。",
-                error_code="task_time_budget_exhausted",
+        timeouts: dict[str, float | None] = {}
+        branch_elapsed: dict[str, float] = {}
+        for request in child_requests:
+            task = _task_by_id(workspace, request.task_id)
+            timeouts[task.task_id] = (
+                max(0.001, task.budget.max_seconds - task.usage.elapsed_seconds)
+                if task.budget.max_seconds is not None
+                else None
             )
-        elapsed = max(0.0, time.perf_counter() - started)
-        workspace = _record_task_usage(
-            workspace,
-            task.task_id,
-            elapsed_seconds=elapsed,
-            cost_usd=result.estimated_cost_usd,
+
+        async def execute(request: ChildTaskRequest) -> ChildTaskResult:
+            started = time.perf_counter()
+            try:
+                return await dispatcher.dispatch(request)
+            finally:
+                branch_elapsed[request.task_id] = max(0.0, time.perf_counter() - started)
+
+        dispatched = await batch_coordinator.dispatch(
+            batch,
+            child_requests,
+            execute,
+            remaining_calls=int(state.get("remaining_child_calls", max_child_calls)),
+            timeout_seconds=timeouts,
         )
+        normalized_results = tuple(
+            result
+            if result.task_id == request.task_id
+            else result.model_copy(update={"task_id": request.task_id})
+            for request, result in zip(child_requests, dispatched.results, strict=True)
+        )
+        for result in normalized_results:
+            workspace = _record_task_usage(
+                workspace,
+                result.task_id,
+                elapsed_seconds=branch_elapsed.get(result.task_id, dispatched.elapsed_seconds),
+                cost_usd=result.estimated_cost_usd,
+            )
         child_results = list(state.get("child_results", []))
-        child_results.append(result)
+        child_results.extend(normalized_results)
         return {
             "workspace_draft": workspace,
             "child_results": child_results,
-            "child_result": result,
+            "child_result": normalized_results[0],
+            "batch_results": normalized_results,
+            "batch_elapsed_seconds": dispatched.elapsed_seconds,
             "remaining_child_calls": int(
                 state.get("remaining_child_calls", max_child_calls)
             )
-            - 1,
+            - len(normalized_results),
         }
 
     async def evaluate_result(state: MainAgentGraphState) -> MainAgentGraphState:
         workspace = ConversationWorkspace.model_validate(state["workspace_draft"])
-        result = ChildTaskResult.model_validate(state["child_result"])
-        task = _task_by_id(workspace, str(state["active_task_id"]))
+        results = tuple(
+            ChildTaskResult.model_validate(item) for item in state["batch_results"]
+        )
         used_calls = max_child_calls - int(
             state.get("remaining_child_calls", max_child_calls)
         )
         used_replans = max_replans - int(
             state.get("remaining_replans", max_replans)
         )
-        evaluation = evaluate_task(
-            task,
-            result,
-            child_calls_used=used_calls,
-            replans_used=used_replans,
-            max_child_calls=max_child_calls,
-            max_replans=max_replans,
+        evaluations = tuple(
+            evaluate_task(
+                _task_by_id(workspace, result.task_id),
+                result,
+                child_calls_used=used_calls,
+                replans_used=used_replans,
+                max_child_calls=max_child_calls,
+                max_replans=max_replans,
+            )
+            for result in results
         )
-        return {"evaluation": evaluation}
+        return {"evaluation": evaluations[0], "batch_evaluations": evaluations}
 
     async def update_task_state(state: MainAgentGraphState) -> MainAgentGraphState:
         workspace = ConversationWorkspace.model_validate(state["workspace_draft"])
-        evaluation = TaskEvaluation.model_validate(state["evaluation"])
-        raw_result = state.get("child_result")
-        result = (
-            ChildTaskResult.model_validate(raw_result)
-            if raw_result is not None
-            else None
+        evaluations = tuple(
+            TaskEvaluation.model_validate(item) for item in state["batch_evaluations"]
         )
-        workspace = reduce_workspace(
+        results = tuple(
+            ChildTaskResult.model_validate(item) for item in state["batch_results"]
+        )
+        workspace = reduce_workspace_batch(
             workspace,
-            task_id=str(state["active_task_id"]),
-            evaluation=evaluation,
-            result=result,
+            evaluations=evaluations,
+            results=results,
         )
-        active_task_id = str(state["active_task_id"])
-        completed = evaluation.outcome == "complete"
-        if evaluation.outcome in {"complete", "fail"}:
+        results_by_id = {result.task_id: result for result in results}
+        for evaluation in evaluations:
+            completed = evaluation.outcome == "complete"
+            if evaluation.outcome in {"complete", "fail"}:
+                await publish_product_event(
+                    state,
+                    "task_completed" if completed else "task_failed",
+                    node_id=f"task:{evaluation.task_id}",
+                    status="completed" if completed else "failed",
+                    title="任务完成" if completed else "任务未完成",
+                    summary=evaluation.reason,
+                    task_id=evaluation.task_id,
+                    idempotency_key=(
+                        f"task:{evaluation.task_id}:evaluation:{evaluation.outcome}:"
+                        f"{int(state.get('remaining_replans', max_replans))}"
+                    ),
+                )
+        batch = TaskBatch.model_validate(state["active_batch"])
+        if batch.execution_mode == "parallel":
+            degraded = any(evaluation.outcome != "complete" for evaluation in evaluations)
+            elapsed_seconds = max(0.0, float(state.get("batch_elapsed_seconds", 0.0)))
             await publish_product_event(
                 state,
-                "task_completed" if completed else "task_failed",
-                node_id=f"task:{active_task_id}",
-                status="completed" if completed else "failed",
-                title="任务完成" if completed else "任务未完成",
-                summary=evaluation.reason,
-                task_id=active_task_id,
-                idempotency_key=(
-                    f"task:{active_task_id}:evaluation:{evaluation.outcome}:"
-                    f"{int(state.get('remaining_replans', max_replans))}"
+                "parallel_group_completed",
+                node_id=f"parallel:{batch.batch_id}",
+                status="completed",
+                title="并行研究完成",
+                summary="并行证据分支已汇合。",
+                detail=SafeRunEventDetail(
+                    parallel_group_id=batch.batch_id,
+                    requested_count=len(batch.task_ids),
+                    returned_count=len(results),
+                    degraded=degraded,
                 ),
+                duration_ms=round(elapsed_seconds * 1000),
+                idempotency_key=f"parallel:{batch.batch_id}:completed",
             )
         update: MainAgentGraphState = {"workspace_draft": workspace}
-        if evaluation.outcome == "replan":
+        if any(evaluation.outcome == "replan" for evaluation in evaluations):
             update["remaining_replans"] = int(
                 state.get("remaining_replans", max_replans)
             ) - 1
             update["next_action"] = "plan_tasks"
-        elif evaluation.outcome == "wait_user":
-            if (
-                result is not None
-                and result.status == "waiting_approval"
-                and result.pending_approval is not None
-            ):
-                update["pending_approval"] = result.pending_approval
-                update["next_action"] = "pause_approval"
+        elif any(evaluation.outcome == "wait_user" for evaluation in evaluations):
+            waiting = next(
+                (
+                    results_by_id[evaluation.task_id]
+                    for evaluation in evaluations
+                    if evaluation.outcome == "wait_user"
+                    and results_by_id[evaluation.task_id].status == "waiting_approval"
+                    and results_by_id[evaluation.task_id].pending_approval is not None
+                ),
+                None,
+            )
+            if waiting is not None:
+                pending_approval = waiting.pending_approval
+                if pending_approval is not None:
+                    update["pending_approval"] = pending_approval
+                    update["next_action"] = "pause_approval"
+                else:
+                    update["next_action"] = "synthesize"
             else:
                 update["next_action"] = "synthesize"
         else:
@@ -646,7 +791,12 @@ def build_main_agent_graph(
             for raw in state.get("child_results", [])
         )
         answer = await answer_synthesizer.synthesize(context, child_results)
-        return {"final_answer": answer.text[:20_000]}
+        degradation_codes = degradation_codes_for_results(child_results)
+        return {
+            "final_answer": answer.text[:20_000],
+            "degraded": bool(degradation_codes),
+            "degradation_codes": degradation_codes,
+        }
 
     async def update_workspace_summary(
         state: MainAgentGraphState,
@@ -679,11 +829,15 @@ def build_main_agent_graph(
         workspace = ConversationWorkspace.model_validate(state["workspace_draft"])
         pending = state.get("pending_approval")
         termination = str(state.get("termination_reason", ""))
-        status: Literal["paused", "cancelled", "waiting_approval", "completed"]
+        status: Literal[
+            "paused", "cancelled", "waiting_approval", "completed", "failed"
+        ]
         if termination == "paused":
             status = "paused"
         elif termination == "cancelled":
             status = "cancelled"
+        elif termination == "parallel_hybrid_disabled":
+            status = "failed"
         elif pending is not None:
             status = "waiting_approval"
         else:
@@ -693,6 +847,8 @@ def build_main_agent_graph(
             turn_status = "pending"
         elif status == "cancelled":
             turn_status = "cancelled"
+        elif status == "failed":
+            turn_status = "failed"
         else:
             turn_status = "completed"
         answer = str(state.get("final_answer", ""))
@@ -713,6 +869,8 @@ def build_main_agent_graph(
             child_results=child_results,
             pending_approval=pending,
             workspace_version=workspace.version + 1,
+            degraded=bool(state.get("degraded", False)),
+            degradation_codes=tuple(state.get("degradation_codes", ())),
         )
         resolution = ConversationResolution(
             original_question=request.message,
@@ -974,6 +1132,7 @@ class MainAgentApprovalResumer:
             resumed if item.task_id == task.task_id else item
             for item in claim.result.child_results
         )
+        degradation_codes = degradation_codes_for_results(child_results)
         pending = resumed.pending_approval if resumed.status == "waiting_approval" else None
         if pending is None:
             context = AgentContextEnvelope(
@@ -1010,6 +1169,8 @@ class MainAgentApprovalResumer:
             child_results=child_results,
             pending_approval=pending,
             workspace_version=workspace.version + 1,
+            degraded=bool(degradation_codes),
+            degradation_codes=degradation_codes,
         )
         resolution = ConversationResolution(
             original_question=task.objective,
@@ -1100,6 +1261,9 @@ def _resume_child_request(
         conversation_summary=workspace.summary,
         constraints=goal.constraints,
         rag_mode="preferred",
+        parallel_group_id=task.parallel_group_id,
+        allowed_tool_risks=task.allowed_tool_risks,
+        allowed_tool_names=task.allowed_tool_names,
     )
 
 
@@ -1191,7 +1355,12 @@ def _cancel_open_tasks(workspace: ConversationWorkspace) -> ConversationWorkspac
     )
 
 
-def _child_request(state: MainAgentGraphState) -> ChildTaskRequest:
+def _child_request_for(
+    state: MainAgentGraphState,
+    *,
+    task_id: str,
+    route: Capability,
+) -> ChildTaskRequest:
     request = MainAgentRequest.model_validate(state["request"])
     workspace = ConversationWorkspace.model_validate(state["workspace_draft"])
     envelope = AgentContextEnvelope.model_validate(state["context"])
@@ -1201,7 +1370,9 @@ def _child_request(state: MainAgentGraphState) -> ChildTaskRequest:
         if raw_interpretation is not None
         else None
     )
-    task = _task_by_id(workspace, str(state["active_task_id"]))
+    task = _task_by_id(workspace, task_id)
+    if route not in CAPABILITIES:
+        raise ValueError(f"unsupported main-agent route: {route}")
     goal_constraints = (
         workspace.active_goal.constraints if workspace.active_goal is not None else ()
     )
@@ -1220,7 +1391,7 @@ def _child_request(state: MainAgentGraphState) -> ChildTaskRequest:
         attempt_count=task.attempt_count,
         objective=task.objective,
         success_criteria=task.success_criteria,
-        capability=_routed_capability(state),
+        capability=route,
         current_message=request.message,
         conversation_summary=workspace.summary,
         constraints=task.constraints
@@ -1230,6 +1401,9 @@ def _child_request(state: MainAgentGraphState) -> ChildTaskRequest:
         selected_context=_selected_recalled_context(envelope, interpretation),
         rag_mode=request.rag_mode,
         attachment_ids=request.attachment_ids,
+        parallel_group_id=task.parallel_group_id,
+        allowed_tool_risks=task.allowed_tool_risks,
+        allowed_tool_names=task.allowed_tool_names,
     )
 
 
@@ -1243,13 +1417,6 @@ def _selected_recalled_context(
     return tuple(
         item for item in envelope.recalled_context if item.source_id in selected
     )
-
-
-def _routed_capability(state: MainAgentGraphState) -> Capability:
-    route = str(state.get("route", ""))
-    if route not in CAPABILITIES:
-        raise ValueError(f"unsupported main-agent route: {route}")
-    return cast(Capability, route)
 
 
 def _build_summary(workspace: ConversationWorkspace) -> str:

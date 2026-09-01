@@ -292,6 +292,11 @@ async def create_research_agent_runtime(
             event_sink=tapped_event_sink,
             extended_tools=(extended_handle.toolkit if extended_handle else None),
             dynamic_tools=dynamic_runtime,
+            external_scholarly_readiness=(
+                extended_handle.scholarly_readiness
+                if extended_handle is not None
+                else None
+            ),
         )
     except BaseException:
         if extended_handle is not None:
@@ -320,6 +325,7 @@ async def create_main_agent_runtime(
     close: Any = None,
     clear: Any = None,
     event_sink: AgentEventSink | None = None,
+    parallel_hybrid_research_enabled: bool = False,
 ) -> Any:
     """Assemble the cross-turn main Agent runtime from ready components."""
     from paper_research_agent.agent.orchestrator.factory import build_main_agent_runtime
@@ -338,6 +344,7 @@ async def create_main_agent_runtime(
         close=close,
         clear=clear,
         event_sink=event_sink,
+        parallel_hybrid_research_enabled=parallel_hybrid_research_enabled,
     )
 
 
@@ -354,6 +361,7 @@ def create_main_agent_runtime_from_model(
     memory_provider: Any = None,
     run_event_publisher: Any = None,
     fast_path_enabled: bool = False,
+    parallel_hybrid_research_enabled: bool = False,
 ) -> Any:
     """Assemble all model-backed main-Agent stages from one shared client."""
     from paper_research_agent.agent.orchestrator.factory import (
@@ -372,4 +380,5 @@ def create_main_agent_runtime_from_model(
         memory_provider=memory_provider,
         run_event_publisher=run_event_publisher,
         fast_path_enabled=fast_path_enabled,
+        parallel_hybrid_research_enabled=parallel_hybrid_research_enabled,
     )

@@ -324,6 +324,7 @@ class MainAgentApiTests(unittest.TestCase):
         )
         self.assertEqual(plan.status_code, 200, plan.text)
         self.assertEqual(plan.json()["tasks"][0]["execution_reason"], "先建立证据基础")
+        self.assertIn("parallel_group_id", plan.json()["tasks"][0])
 
         paused = self.client.post(
             f"/paper-research/api/agent/runs/{REQUEST_ID}/control",

@@ -73,6 +73,33 @@ class RunEventBusTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item.event_id for item in replayed], [4, 5])
         await replay.aclose()
 
+    async def test_concurrent_publish_is_monotonic_and_idempotent(self) -> None:
+        self.begin()
+        published = await asyncio.gather(
+            self.bus.publisher.publish(
+                self.draft("reasoning_summary", summary="并发阶段 A"),
+                idempotency_key="concurrent-a",
+            ),
+            self.bus.publisher.publish(
+                self.draft("reasoning_summary", summary="并发阶段 B"),
+                idempotency_key="concurrent-b",
+            ),
+            self.bus.publisher.publish(
+                self.draft("reasoning_summary", summary="重复阶段"),
+                idempotency_key="concurrent-same",
+            ),
+            self.bus.publisher.publish(
+                self.draft("reasoning_summary", summary="重复阶段"),
+                idempotency_key="concurrent-same",
+            ),
+        )
+
+        persisted = self.store.run_events(self.request_id)
+        self.assertEqual([item.event_id for item in persisted], [1, 2, 3])
+        self.assertEqual(len({item.event_id for item in published}), 3)
+        duplicate_ids = [item.event_id for item in published[2:]]
+        self.assertEqual(duplicate_ids[0], duplicate_ids[1])
+
     async def test_segment_boundary_closes_subscription_but_run_can_resume(self) -> None:
         self.begin()
         subscription = await self.bus.subscribe(self.request_id)

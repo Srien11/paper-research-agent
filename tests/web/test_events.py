@@ -13,6 +13,7 @@ from paper_research_agent.agent.orchestrator.models import ChildTaskResult, Main
 from paper_research_agent.web.events import (
     AgentEventProjector,
     AgentStreamEvent,
+    AgentStreamEventDraft,
     SafeRunEventDetail,
 )
 from paper_research_agent.web.models import AgentRunRequest, SafeEvidenceSource
@@ -87,6 +88,53 @@ class AgentEventContractTests(unittest.TestCase):
             AgentStreamEvent(type="reasoning_summary", delta="隐藏推理", **common)
         with self.assertRaises(ValidationError):
             AgentStreamEvent(type="answer_delta", **common)
+
+    def test_parallel_group_events_require_only_safe_group_metadata(self) -> None:
+        common = {
+            "occurred_at": datetime.now(UTC),
+            "request_id": "req_1234567890123456",
+            "run_id": "run-1",
+            "turn_id": "a" * 32,
+            "node_id": "parallel:hybrid-research",
+        }
+        started = AgentStreamEventDraft(
+            type="parallel_group_started",
+            status="running",
+            detail=SafeRunEventDetail(
+                parallel_group_id="hybrid-research",
+                requested_count=2,
+            ),
+            **common,
+        )
+        completed = AgentStreamEventDraft(
+            type="parallel_group_completed",
+            status="completed",
+            duration_ms=205,
+            detail=SafeRunEventDetail(
+                parallel_group_id="hybrid-research",
+                requested_count=2,
+                returned_count=2,
+                degraded=False,
+            ),
+            **common,
+        )
+
+        self.assertEqual(started.detail.requested_count, 2)
+        self.assertEqual(completed.detail.returned_count, 2)
+        serialized = completed.model_dump_json()
+        self.assertNotIn("question", serialized)
+        self.assertNotIn("provider", serialized)
+        self.assertNotIn("local_path", serialized)
+        with self.assertRaises(ValidationError):
+            AgentStreamEventDraft(
+                type="parallel_group_started",
+                status="running",
+                detail=SafeRunEventDetail(
+                    parallel_group_id="hybrid-research",
+                    requested_count=1,
+                ),
+                **common,
+            )
 
     def test_pause_and_approval_are_nonterminal_stream_boundaries(self) -> None:
         common = {

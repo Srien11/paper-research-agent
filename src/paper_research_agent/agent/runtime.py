@@ -35,7 +35,9 @@ from paper_research_agent.agent.policy import (
     ResearchRuntimePolicy,
     evidence_cutoff_after_assessments,
 )
+from paper_research_agent.agent.tooling.catalog import ToolRisk
 from paper_research_agent.agent.tooling.contracts import ToolExecutionResult
+from paper_research_agent.agent.tooling.scholarly_providers import CapabilityReadiness
 from paper_research_agent.chunking.models import EvidenceChunk
 from paper_research_agent.context.models import ContextEvidence
 
@@ -65,7 +67,16 @@ class ExtendedToolExecutor(Protocol):
 
 
 class DynamicToolExecutor(Protocol):
-    async def run(self, question: str, *, thread_id: str) -> DynamicResearchResult: ...
+    async def run(
+        self,
+        question: str,
+        *,
+        thread_id: str,
+        memory_context: tuple[dict[str, object], ...] | None = None,
+        child_context: dict[str, object] | None = None,
+        allowed_tool_risks: tuple[ToolRisk, ...] | None = None,
+        allowed_tool_names: tuple[str, ...] | None = None,
+    ) -> DynamicResearchResult: ...
 
     async def resume(
         self,
@@ -111,6 +122,7 @@ class ResearchAgentRuntime:
         event_sink: AgentEventSink | None = None,
         extended_tools: ExtendedToolExecutor | None = None,
         dynamic_tools: DynamicToolExecutor | None = None,
+        external_scholarly_readiness: CapabilityReadiness | None = None,
     ) -> None:
         if not chunks:
             raise ValueError("research runtime requires at least one evidence chunk")
@@ -138,6 +150,14 @@ class ResearchAgentRuntime:
         self._event_sink = event_sink
         self._extended_tools = extended_tools
         self._dynamic_tools = dynamic_tools
+        self._external_scholarly_readiness = (
+            external_scholarly_readiness
+            or CapabilityReadiness(
+                capability="external_scholarly",
+                ready=False,
+                reason_code="dynamic_tools_unavailable",
+            )
+        )
         self._closed = False
 
     @property
@@ -151,6 +171,10 @@ class ResearchAgentRuntime:
     @property
     def dynamic_tools_enabled(self) -> bool:
         return self._dynamic_tools is not None
+
+    @property
+    def external_scholarly_readiness(self) -> CapabilityReadiness:
+        return self._external_scholarly_readiness
 
     @contextmanager
     def capture_agent_events(
@@ -169,12 +193,23 @@ class ResearchAgentRuntime:
         question: str,
         *,
         thread_id: str,
+        memory_context: tuple[dict[str, object], ...] | None = None,
+        child_context: dict[str, object] | None = None,
+        allowed_tool_risks: tuple[ToolRisk, ...] | None = None,
+        allowed_tool_names: tuple[str, ...] | None = None,
     ) -> DynamicResearchResult:
         if self._closed:
             raise RuntimeError("research runtime is closed")
         if self._dynamic_tools is None:
             raise RuntimeError("dynamic research tools are unavailable")
-        return await self._dynamic_tools.run(question, thread_id=thread_id)
+        return await self._dynamic_tools.run(
+            question,
+            thread_id=thread_id,
+            memory_context=memory_context,
+            child_context=child_context,
+            allowed_tool_risks=allowed_tool_risks,
+            allowed_tool_names=allowed_tool_names,
+        )
 
     async def resume_dynamic_tools(
         self,

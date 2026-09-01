@@ -576,6 +576,7 @@ def _safe_agent_plan(
                 result_ref=task.result_ref,
                 blocked_reason=task.blocked_reason,
                 execution_reason=task.execution_reason,
+                parallel_group_id=task.parallel_group_id,
                 max_seconds=task.budget.max_seconds,
                 max_calls=task.budget.max_calls,
                 max_cost_usd=task.budget.max_cost_usd,

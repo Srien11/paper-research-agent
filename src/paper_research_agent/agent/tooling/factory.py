@@ -21,6 +21,7 @@ from paper_research_agent.agent.tooling.scholarly import (
     SemanticScholarCrossrefProvider,
 )
 from paper_research_agent.agent.tooling.scholarly_providers import (
+    CapabilityReadiness,
     OfflineScholarlyProvider,
     ScholarlyProvider,
     ScholarlyProviderRegistry,
@@ -40,6 +41,7 @@ class AsyncClosable(Protocol):
 class ExtendedToolkitHandle:
     toolkit: ExtendedResearchToolkit
     client: httpx.AsyncClient | None
+    scholarly_readiness: CapabilityReadiness
     mcp_manager: AsyncClosable | None = None
 
     async def aclose(self) -> None:
@@ -113,7 +115,18 @@ def create_extended_research_toolkit(
         event_sink=event_sink,
         approvals=approvals,
     )
-    return ExtendedToolkitHandle(toolkit=toolkit, client=client)
+    provider_ids = scholarly.provider_ids
+    offline = isinstance(provider, OfflineScholarlyProvider)
+    return ExtendedToolkitHandle(
+        toolkit=toolkit,
+        client=client,
+        scholarly_readiness=CapabilityReadiness(
+            capability="external_scholarly",
+            ready=not offline,
+            reason_code="provider_offline" if offline else None,
+            provider_ids=provider_ids,
+        ),
+    )
 
 
 ScholarlyMode = Literal["offline", "live"]

@@ -77,17 +77,24 @@ class FakeRewriter:
 
 
 class QueryAwareRewriter(FakeRewriter):
-    def __init__(self, *, delay=0.0, error=None):
+    def __init__(self, *, delay=0.0, error=None, barrier_count=0):
         super().__init__(delay=delay, error=error)
         self.active = 0
         self.max_active = 0
+        self.barrier_count = barrier_count
+        self.barrier = asyncio.Event()
 
     async def rewrite(self, query):
         self.calls.append(query)
         self.active += 1
         self.max_active = max(self.max_active, self.active)
         try:
-            await asyncio.sleep(self.delay)
+            if self.barrier_count:
+                if self.active >= self.barrier_count:
+                    self.barrier.set()
+                await asyncio.wait_for(self.barrier.wait(), timeout=2)
+            else:
+                await asyncio.sleep(self.delay)
             if self.error is not None:
                 raise self.error
             return QueryRewriteResult(
@@ -399,7 +406,7 @@ class BilingualRetrievalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(forbidden.calls, [])
 
         uncached = tuple(f"uncached-{index}" for index in range(6))
-        concurrent_rewriter = QueryAwareRewriter(delay=0.02)
+        concurrent_rewriter = QueryAwareRewriter(barrier_count=6)
         concurrent_service = self.service(concurrent_rewriter)
         rewritten = await asyncio.gather(
             *(concurrent_service.resolve_query(query) for query in uncached)

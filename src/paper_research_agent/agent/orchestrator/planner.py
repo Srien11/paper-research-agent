@@ -23,12 +23,16 @@ from paper_research_agent.agent.orchestrator.models import (
     TaskPlanDecision,
     TurnInterpretationV2,
 )
+from paper_research_agent.agent.orchestrator.planning_route import (
+    infer_source_requirements,
+)
 from paper_research_agent.agent.orchestrator.prompts import (
     GOAL_RECONCILER_PROMPT_VERSION,
     GOAL_RECONCILER_SYSTEM,
     TASK_PLANNER_PROMPT_VERSION,
     TASK_PLANNER_SYSTEM,
 )
+from paper_research_agent.agent.tooling.catalog import SCHOLARLY_NETWORK_TOOL_NAMES
 
 
 class _GoalDraft(FrozenModel):
@@ -308,7 +312,7 @@ class TaskPlanner:
             return self._fallback_decision(goal_decision, current, envelope, interpretation)
         try:
             return self._build_decision(
-                goal_decision, current, envelope, draft
+                goal_decision, current, envelope, interpretation, draft
             )
         except ValidationError:
             return self._fallback_decision(goal_decision, current, envelope, interpretation)
@@ -318,11 +322,16 @@ class TaskPlanner:
         goal_decision: GoalDecision,
         current: TaskPlan | None,
         envelope: AgentContextEnvelope,
+        interpretation: TurnInterpretationV2,
         draft: _TaskPlanDraft,
     ) -> TaskPlanDecision:
         goal_id = _goal_id(goal_decision, current, envelope)
         completed = (
-            tuple(task for task in current.tasks if task.status == "completed")
+            tuple(
+                task.model_copy(update={"parallel_group_id": None})
+                for task in current.tasks
+                if task.status == "completed"
+            )
             if current is not None and goal_decision.action == "revise"
             else ()
         )
@@ -342,7 +351,12 @@ class TaskPlanner:
             for item in draft.tasks
             if item.task_id not in kept_ids
         )
-        tasks = (*completed, *new_tasks)
+        tasks = enforce_capability_plan(
+            (*completed, *new_tasks),
+            envelope=envelope,
+            resolved_request=interpretation.resolved_request,
+            goal_id=goal_id,
+        )
         revision = (
             1
             if goal_decision.action == "create" or current is None
@@ -391,6 +405,14 @@ class TaskPlanner:
             execution_reason="直接完成当前请求并据此判断目标是否达成",
             revision=revision,
         )
+        tasks = enforce_capability_plan(
+            plan.tasks,
+            envelope=envelope,
+            resolved_request=interpretation.resolved_request,
+            goal_id=goal_id,
+        )
+        if tasks != plan.tasks:
+            plan = plan.model_copy(update={"tasks": tasks})
         action: Literal["create", "revise"] = (
             "create" if current is None else "revise"
         )
@@ -399,6 +421,161 @@ class TaskPlanner:
             plan=plan,
             rationale="模型规划不可用，使用单任务降级",
         )
+
+
+def enforce_capability_plan(
+    tasks: tuple[AgentTask, ...],
+    *,
+    envelope: AgentContextEnvelope,
+    resolved_request: str,
+    goal_id: str,
+) -> tuple[AgentTask, ...]:
+    """Deterministically enforce local/external evidence policy after model planning."""
+    goal = envelope.workspace.active_goal
+    source_text = "\n".join(
+        part
+        for part in (
+            envelope.current_message,
+            resolved_request,
+            goal.objective if goal is not None else "",
+        )
+        if part
+    )
+    requirements = infer_source_requirements(source_text)
+    if not requirements.external_required:
+        return tasks
+
+    active = tuple(task for task in tasks if task.status != "completed")
+    completed = tuple(task for task in tasks if task.status == "completed")
+    if envelope.rag_mode == "required":
+        local = next((task for task in active if task.capability == "local_rag"), None)
+        if local is None:
+            local = _evidence_task(
+                tasks,
+                goal_id=goal_id,
+                capability="local_rag",
+                objective=resolved_request,
+            )
+        return (*completed, local.model_copy(update={"parallel_group_id": None}))
+
+    if envelope.rag_mode == "disabled":
+        dynamic = next((task for task in active if task.capability == "dynamic_tools"), None)
+        if dynamic is None:
+            dynamic = _evidence_task(
+                tasks,
+                goal_id=goal_id,
+                capability="dynamic_tools",
+                objective=resolved_request,
+            )
+        return (
+            *completed,
+            dynamic.model_copy(
+                update={
+                    "parallel_group_id": None,
+                    "allowed_tool_risks": ("network_read",),
+                    "allowed_tool_names": SCHOLARLY_NETWORK_TOOL_NAMES,
+                }
+            ),
+        )
+
+    local = next((task for task in active if task.capability == "local_rag"), None)
+    dynamic = next((task for task in active if task.capability == "dynamic_tools"), None)
+    if local is None:
+        local = _evidence_task(
+            tasks,
+            goal_id=goal_id,
+            capability="local_rag",
+            objective=resolved_request,
+        )
+    if dynamic is None:
+        dynamic = _evidence_task(
+            (*tasks, local),
+            goal_id=goal_id,
+            capability="dynamic_tools",
+            objective=resolved_request,
+        )
+    member_ids = {local.task_id, dynamic.task_id}
+    common_dependencies = tuple(
+        dict.fromkeys(
+            dependency
+            for task in (local, dynamic)
+            for dependency in task.depends_on
+            if dependency not in member_ids
+        )
+    )
+    group_id = _parallel_group_id(completed)
+    local = local.model_copy(
+        update={
+            "parallel_group_id": group_id,
+            "depends_on": common_dependencies,
+            "allowed_tool_risks": (),
+            "allowed_tool_names": (),
+        }
+    )
+    dynamic = dynamic.model_copy(
+        update={
+            "parallel_group_id": group_id,
+            "depends_on": common_dependencies,
+            "allowed_tool_risks": ("network_read",),
+            "allowed_tool_names": SCHOLARLY_NETWORK_TOOL_NAMES,
+        }
+    )
+    selected = {local.task_id, dynamic.task_id}
+    other_active = tuple(
+        task
+        for task in active
+        if task.task_id not in selected and task.capability not in {"direct_chat", "local_rag", "dynamic_tools"}
+    )
+    return (*completed, local, dynamic, *other_active)
+
+
+def _evidence_task(
+    existing: tuple[AgentTask, ...],
+    *,
+    goal_id: str,
+    capability: Literal["local_rag", "dynamic_tools"],
+    objective: str,
+) -> AgentTask:
+    base_id = "local-research" if capability == "local_rag" else "external-research"
+    task_id = _unique_task_id(base_id, existing)
+    if capability == "local_rag":
+        title = "检索本地论文证据"
+        success = ("获得可追溯的本地论文证据或明确证据不足",)
+        reason = "为最终回答提供本地论文证据"
+    else:
+        title = "检索外部学术信息"
+        success = ("通过学术 Provider 获得外部信息或明确不可用原因",)
+        reason = "为最终回答提供最新外部学术核验"
+    return AgentTask(
+        task_id=task_id,
+        goal_id=goal_id,
+        title=title,
+        objective=objective,
+        success_criteria=success,
+        capability=capability,
+        status="pending",
+        execution_reason=reason,
+    )
+
+
+def _unique_task_id(base: str, tasks: tuple[AgentTask, ...]) -> str:
+    used = {task.task_id for task in tasks}
+    if base not in used:
+        return base
+    index = 2
+    while f"{base}-{index}" in used:
+        index += 1
+    return f"{base}-{index}"
+
+
+def _parallel_group_id(completed: tuple[AgentTask, ...]) -> str:
+    used = {task.parallel_group_id for task in completed if task.parallel_group_id is not None}
+    if "hybrid-research" not in used:
+        return "hybrid-research"
+    index = 2
+    while f"hybrid-research-{index}" in used:
+        index += 1
+    return f"hybrid-research-{index}"
 
 
 def _goal_id(

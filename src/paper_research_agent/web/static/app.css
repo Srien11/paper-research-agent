@@ -291,7 +291,9 @@ input:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 4px
 .message { margin-bottom: var(--space-4); }
 .message-user { width: min(88%, 38rem); margin-left: auto; padding: .75rem 1rem; background: var(--user-bubble); color: var(--user-bubble-ink); border-radius: var(--radius-lg) var(--radius-lg) .3rem var(--radius-lg); line-height: 1.5; white-space: pre-wrap; }
 .message-assistant { padding: 1rem 1.125rem; color: var(--ink); background: var(--surface-strong); border: 1px solid var(--line); border-radius: var(--radius-md); box-shadow: 0 4px 14px rgb(50 43 32 / 4%); }
+.message-assistant.is-degraded { border-color: color-mix(in srgb, var(--warning) 55%, var(--line)); }
 .message-meta { display: flex; align-items: center; gap: var(--space-2); margin-bottom: var(--space-3); color: var(--ink); font-size: .8rem; }
+.source-note-warning { color: var(--warning); font-weight: 700; }
 .assistant-mark { width: 1.8rem; height: 1.8rem; border-radius: .5rem; font-size: .75rem; }
 .claim-list { display: grid; gap: .65rem; margin: 0; padding: 0; list-style: none; }
 .claim { padding-left: .7rem; border-left: 2px solid var(--accent); }
@@ -380,6 +382,8 @@ kbd { padding: .1rem .3rem; background: #ebe6dc; border: 1px solid var(--line); 
 .plan-task-list { display: grid; gap: .65rem; margin-top: 1rem; }
 .plan-task { padding: .75rem; background: var(--surface-strong); border: 1px solid var(--line); border-radius: var(--radius-sm); }
 .plan-task header { display: flex; align-items: flex-start; justify-content: space-between; gap: .6rem; }
+.plan-task-badges { display: inline-flex; flex: 0 0 auto; align-items: center; gap: .35rem; }
+.plan-parallel-badge { padding: .12rem .32rem; color: var(--accent-dark); background: var(--accent-soft); border-radius: 99px; font-size: .62rem; font-weight: 800; }
 .plan-task strong { font-size: .78rem; line-height: 1.4; }
 .plan-task small, .plan-task p { color: var(--muted); font-size: .7rem; line-height: 1.45; }
 .plan-task p { margin: .45rem 0; }

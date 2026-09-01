@@ -8,6 +8,10 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from paper_research_agent.agent.orchestrator.artifacts import ChildArtifact
+from paper_research_agent.agent.tooling.catalog import (
+    SCHOLARLY_NETWORK_TOOL_NAMES,
+    ToolRisk,
+)
 
 GoalStatus = Literal["active", "satisfied", "blocked", "abandoned"]
 TaskStatus = Literal[
@@ -46,6 +50,13 @@ RunStatus = Literal[
     "failed",
     "cancelled",
     "conflict",
+]
+DegradationCode = Literal[
+    "local_evidence_insufficient",
+    "external_research_unavailable",
+    "external_research_timeout",
+    "parallel_write_not_allowed",
+    "model_background_only",
 ]
 
 
@@ -127,6 +138,12 @@ class AgentTask(FrozenModel):
     execution_reason: str = Field(default="完成目标所需的计划步骤", min_length=1, max_length=500)
     budget: TaskBudget = Field(default_factory=TaskBudget)
     usage: TaskUsage = Field(default_factory=TaskUsage)
+    parallel_group_id: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9_-]{1,64}$",
+    )
+    allowed_tool_risks: tuple[ToolRisk, ...] = Field(default=(), max_length=4)
+    allowed_tool_names: tuple[str, ...] = Field(default=(), max_length=20)
 
     @field_validator("title", "objective")
     @classmethod
@@ -154,6 +171,23 @@ class AgentTask(FrozenModel):
             raise ValueError("task dependency IDs must not be blank")
         if len(normalized) != len(set(normalized)):
             raise ValueError("task dependency IDs must be unique")
+        return normalized
+
+    @field_validator("allowed_tool_risks")
+    @classmethod
+    def validate_allowed_tool_risks(cls, values: tuple[ToolRisk, ...]) -> tuple[ToolRisk, ...]:
+        if len(values) != len(set(values)):
+            raise ValueError("allowed tool risks must be unique")
+        return values
+
+    @field_validator("allowed_tool_names")
+    @classmethod
+    def validate_allowed_tool_names(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(value.strip() for value in values)
+        if any(not value for value in normalized):
+            raise ValueError("allowed tool names must not be blank")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("allowed tool names must be unique")
         return normalized
 
 
@@ -195,6 +229,29 @@ class TaskPlan(FrozenModel):
                     ready.append(child)
         if visited != len(task_ids):
             raise ValueError("task plan dependencies must not contain a cycle")
+        parallel_groups: dict[str, list[AgentTask]] = {}
+        for task in self.tasks:
+            if task.parallel_group_id is not None:
+                parallel_groups.setdefault(task.parallel_group_id, []).append(task)
+        for members in parallel_groups.values():
+            if len(members) != 2:
+                raise ValueError("parallel group must contain exactly two tasks")
+            if {task.capability for task in members} != {"local_rag", "dynamic_tools"}:
+                raise ValueError("parallel group must contain local_rag and dynamic_tools")
+            member_ids = {task.task_id for task in members}
+            if any(member_ids.intersection(task.depends_on) for task in members):
+                raise ValueError("parallel group members must not depend on each other")
+            dependency_sets = {frozenset(task.depends_on) for task in members}
+            if len(dependency_sets) != 1:
+                raise ValueError("parallel group members must have identical dependencies")
+            local = next(task for task in members if task.capability == "local_rag")
+            dynamic = next(task for task in members if task.capability == "dynamic_tools")
+            if local.allowed_tool_risks or local.allowed_tool_names:
+                raise ValueError("parallel local task must not declare tool permissions")
+            if dynamic.allowed_tool_risks != ("network_read",):
+                raise ValueError("parallel dynamic task must allow network_read only")
+            if dynamic.allowed_tool_names != SCHOLARLY_NETWORK_TOOL_NAMES:
+                raise ValueError("parallel dynamic task must use scholarly tool allowlist")
         return self
 
 
@@ -347,6 +404,12 @@ class ChildTaskRequest(FrozenModel):
     selected_context: tuple[RecalledContext, ...] = Field(default=(), max_length=10)
     rag_mode: Literal["disabled", "preferred", "required"]
     attachment_ids: tuple[str, ...] = Field(default=(), max_length=20)
+    parallel_group_id: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9_-]{1,64}$",
+    )
+    allowed_tool_risks: tuple[ToolRisk, ...] = Field(default=(), max_length=4)
+    allowed_tool_names: tuple[str, ...] = Field(default=(), max_length=20)
 
 
 class ChildTaskResult(FrozenModel):
@@ -409,6 +472,8 @@ class MainAgentResult(FrozenModel):
     child_results: tuple[ChildTaskResult, ...] = Field(default=(), max_length=12)
     pending_approval: dict[str, object] | None = None
     workspace_version: int = Field(default=0, ge=0)
+    degraded: bool = False
+    degradation_codes: tuple[DegradationCode, ...] = Field(default=(), max_length=8)
 
     @field_validator("route_trace")
     @classmethod
@@ -417,6 +482,23 @@ class MainAgentResult(FrozenModel):
         if any(not value for value in normalized):
             raise ValueError("route trace entries must not be blank")
         return normalized
+
+    @field_validator("degradation_codes")
+    @classmethod
+    def validate_degradation_codes(
+        cls, values: tuple[DegradationCode, ...]
+    ) -> tuple[DegradationCode, ...]:
+        if len(values) != len(set(values)):
+            raise ValueError("degradation codes must be unique")
+        return values
+
+    @model_validator(mode="after")
+    def validate_degradation_state(self) -> MainAgentResult:
+        if self.degraded != bool(self.degradation_codes):
+            raise ValueError(
+                "degraded must be true exactly when degradation codes are present"
+            )
+        return self
 
 
 class AgentRunStart(FrozenModel):

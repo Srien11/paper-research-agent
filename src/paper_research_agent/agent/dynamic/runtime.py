@@ -18,6 +18,7 @@ from paper_research_agent.agent.dynamic.models import (
 from paper_research_agent.agent.orchestrator.identifiers import (
     dynamic_checkpoint_thread_id,
 )
+from paper_research_agent.agent.tooling.catalog import ToolRisk
 
 
 class AsyncDynamicGraph(Protocol):
@@ -52,9 +53,13 @@ class DynamicResearchRuntime:
         thread_id: str,
         memory_context: tuple[dict[str, object], ...] | None = None,
         child_context: dict[str, object] | None = None,
+        allowed_tool_risks: tuple[ToolRisk, ...] | None = None,
+        allowed_tool_names: tuple[str, ...] | None = None,
     ) -> DynamicResearchResult:
         normalized_question = _question(question)
         normalized_thread = _thread(thread_id)
+        normalized_risks = _allowed_tool_risks(allowed_tool_risks)
+        normalized_names = _allowed_tool_names(allowed_tool_names)
         run_id = uuid.uuid4().hex
         initial = {
             "run_id": run_id,
@@ -70,6 +75,12 @@ class DynamicResearchRuntime:
             ),
             "memory_supplied": memory_context is not None,
             "child_context": dict(child_context) if child_context else {},
+            "allowed_tool_risks": (
+                list(normalized_risks) if normalized_risks is not None else None
+            ),
+            "allowed_tool_names": (
+                list(normalized_names) if normalized_names is not None else None
+            ),
             "memory_proposal_completed": False,
             "resume_after_execute": None,
             "next_action": "route",
@@ -142,6 +153,9 @@ class DynamicResearchRuntime:
                     "repeated_tool_call",
                     "approval_denied",
                     "approval_expired",
+                    "parallel_tool_risk_denied",
+                    "parallel_tool_name_denied",
+                    "parallel_write_not_allowed",
                 ],
                 reason,
             ),
@@ -159,4 +173,25 @@ def _question(value: str) -> str:
     normalized = value.strip()
     if not normalized or len(normalized) > 10_000:
         raise ValueError("dynamic research question must contain between 1 and 10000 characters")
+    return normalized
+
+
+def _allowed_tool_risks(
+    values: tuple[ToolRisk, ...] | None,
+) -> tuple[ToolRisk, ...] | None:
+    if values is None:
+        return None
+    if len(values) != len(set(values)):
+        raise ValueError("allowed tool risks must be unique")
+    return values
+
+
+def _allowed_tool_names(values: tuple[str, ...] | None) -> tuple[str, ...] | None:
+    if values is None:
+        return None
+    normalized = tuple(value.strip() for value in values)
+    if any(not value for value in normalized):
+        raise ValueError("allowed tool names must not be blank")
+    if len(normalized) != len(set(normalized)):
+        raise ValueError("allowed tool names must be unique")
     return normalized

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 import unittest
 from datetime import UTC, datetime
 from typing import cast
@@ -20,22 +21,30 @@ from paper_research_agent.agent.orchestrator.artifacts import (
     LocalRAGArtifact,
     LocalRAGTrace,
 )
-from paper_research_agent.agent.orchestrator.graph import _selected_recalled_context
+from paper_research_agent.agent.orchestrator.graph import (
+    _selected_recalled_context,
+    build_main_agent_graph,
+)
 from paper_research_agent.agent.orchestrator.hydrator import ContextHydrator
 from paper_research_agent.agent.orchestrator.interpreter import TurnInterpreter
 from paper_research_agent.agent.orchestrator.models import (
     Capability,
+    ChildTaskRequest,
     ChildTaskResult,
     ConversationWorkspace,
     MainAgentRequest,
     MainAgentResult,
     RunStatus,
 )
+from paper_research_agent.agent.orchestrator.planner import GoalReconciler, TaskPlanner
+from paper_research_agent.agent.orchestrator.runtime import MainAgentRuntime
+from paper_research_agent.agent.orchestrator.synthesizer import AnswerSynthesizer
 from paper_research_agent.answering.models import AnswerCitation, AnswerClaim, RAGAnswer
 from paper_research_agent.conversation.store import InMemoryConversationStore
 from paper_research_agent.web.app import create_app
 from paper_research_agent.web.chat_runtime import ConversationRuntime, DirectResponseRequest
 from paper_research_agent.web.config import OwnerCredentials, WebConfig
+from paper_research_agent.web.run_event_bus import RunEventBus
 
 ORIGIN = "https://main-agent-e2e.test"
 
@@ -63,6 +72,50 @@ class _InterpreterModel:
     async def ainvoke(self, messages: object) -> object:
         self.messages.append(messages)
         return self.response
+
+
+class _ParallelEvidenceDispatcher:
+    def __init__(self) -> None:
+        self.calls: list[ChildTaskRequest] = []
+        self.started_at: dict[str, float] = {}
+        self._both_started = asyncio.Event()
+
+    async def dispatch(self, request: ChildTaskRequest) -> ChildTaskResult:
+        self.calls.append(request)
+        self.started_at[request.task_id] = time.perf_counter()
+        if len(self.started_at) == 2:
+            self._both_started.set()
+        await asyncio.wait_for(self._both_started.wait(), timeout=1)
+        await asyncio.sleep(0.2)
+        if request.capability == "local_rag":
+            artifact = _local_rag_artifact()
+            return ChildTaskResult(
+                child_run_id=f"{request.run_id}:local",
+                task_id=request.task_id,
+                capability="local_rag",
+                status="completed",
+                summary=artifact.text,
+                source_ids=artifact.source_ids,
+                citation_kind="local_paper",
+                artifact=artifact,
+            )
+        if request.capability == "dynamic_tools":
+            artifact = DynamicToolArtifact(
+                text="外部学术元数据已核验。",
+                source_ids=("semantic-scholar:paper-1",),
+                tool_names=("search_scholarly_sources",),
+            )
+            return ChildTaskResult(
+                child_run_id=f"{request.run_id}:external",
+                task_id=request.task_id,
+                capability="dynamic_tools",
+                status="completed",
+                summary=artifact.text,
+                source_ids=artifact.source_ids,
+                citation_kind="external",
+                artifact=artifact,
+            )
+        raise AssertionError(f"unexpected child capability: {request.capability}")
 
 
 def _empty_workspace() -> ConversationWorkspace:
@@ -354,6 +407,114 @@ def _local_rag_artifact() -> LocalRAGArtifact:
 
 def _events(response: Response) -> list[dict[str, object]]:
     return [json.loads(line) for line in str(response.text).splitlines() if line]
+
+
+class RealHybridMainGraphEndToEndTests(unittest.IsolatedAsyncioTestCase):
+    async def test_real_planner_graph_dispatch_and_synthesis_are_parallel(self) -> None:
+        store = InMemoryConversationStore()
+        bus = RunEventBus(store)
+        interpreter_model = _InterpreterModel(
+            {
+                "relation": "new_goal",
+                "resolved_request": "结合本地论文 C001 和联网搜索核验最新状态",
+                "confidence": 0.95,
+            }
+        )
+        planner_model = _InterpreterModel(
+            {
+                "tasks": (
+                    {
+                        "task_id": "local-evidence",
+                        "title": "检索本地论文",
+                        "objective": "核验 C001 的论文结论",
+                        "success_criteria": ("获得本地论文证据",),
+                        "capability": "local_rag",
+                        "execution_reason": "先建立本地证据",
+                    },
+                )
+            }
+        )
+        synthesis_model = _InterpreterModel(
+            {
+                "conclusion": "模型背景补充：RAG 的结论应区分语料内证据与外部时效核验。",
+                "evidence_sections": (
+                    {
+                        "task_id": "local-evidence",
+                        "text": "本地论文支持该结论。",
+                        "source_ids": ("chunk-1",),
+                    },
+                    {
+                        "task_id": "external-research",
+                        "text": "外部学术元数据确认了当前状态。",
+                        "source_ids": ("semantic-scholar:paper-1",),
+                    },
+                ),
+            }
+        )
+        dispatcher = _ParallelEvidenceDispatcher()
+        graph = build_main_agent_graph(
+            repository=store,
+            hydrator=ContextHydrator(store),
+            interpreter=TurnInterpreter(interpreter_model),  # type: ignore[arg-type]
+            goal_reconciler=GoalReconciler(),
+            task_planner=TaskPlanner(planner_model),  # type: ignore[arg-type]
+            dispatcher=dispatcher,  # type: ignore[arg-type]
+            synthesizer=AnswerSynthesizer(synthesis_model),  # type: ignore[arg-type]
+            run_event_publisher=bus.publisher,
+            parallel_hybrid_research_enabled=True,
+        )
+        runtime = MainAgentRuntime(
+            graph=graph,
+            repository=store,
+            run_event_publisher=bus.publisher,
+        )
+        request = MainAgentRequest(
+            request_id="req_real_hybrid_e2e_1234",
+            conversation_id="conversation-real-hybrid-e2e",
+            message="结合本地论文 C001 和联网搜索核验最新状态",
+            rag_mode="preferred",
+        )
+
+        started = time.perf_counter()
+        result = await runtime.run(request)
+        elapsed = time.perf_counter() - started
+
+        self.assertEqual(result.status, "completed")
+        self.assertLess(elapsed, 1.5)
+        self.assertEqual(
+            tuple(call.capability for call in dispatcher.calls),
+            ("local_rag", "dynamic_tools"),
+        )
+        self.assertNotIn("direct_chat", tuple(call.capability for call in dispatcher.calls))
+        start_times = tuple(dispatcher.started_at.values())
+        self.assertLess(max(start_times) - min(start_times), 0.05)
+        self.assertEqual(result.route_trace, ("local_rag", "dynamic_tools"))
+        self.assertEqual(len(synthesis_model.messages), 1)
+        self.assertIn("模型背景补充", result.answer)
+        self.assertEqual(result.child_results[0].source_ids, ("chunk-1",))
+        self.assertEqual(
+            result.child_results[1].source_ids,
+            ("semantic-scholar:paper-1",),
+        )
+        self.assertEqual(result.workspace_version, 1)
+        self.assertEqual(store.load_workspace(request.conversation_id).version, 1)
+        events = [
+            item.to_stream_event()
+            for item in store.run_events(request.request_id)
+        ]
+        self.assertEqual(
+            [event.event_id for event in events],
+            list(range(1, len(events) + 1)),
+        )
+        self.assertEqual(sum(event.type == "run_completed" for event in events), 1)
+        self.assertIn("parallel_group_started", [event.type for event in events])
+        self.assertIn("parallel_group_completed", [event.type for event in events])
+        parallel_completed = next(
+            event for event in events if event.type == "parallel_group_completed"
+        )
+        self.assertLess(parallel_completed.duration_ms or 10_000, 320)
+        await runtime.aclose()
+        await bus.aclose()
 
 
 class MainAgentEndToEndTests(unittest.TestCase):

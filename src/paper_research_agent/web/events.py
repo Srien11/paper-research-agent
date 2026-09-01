@@ -52,6 +52,8 @@ AgentStreamEventType = Literal[
     "reasoning_completed",
     "goal_updated",
     "plan_updated",
+    "parallel_group_started",
+    "parallel_group_completed",
     "task_started",
     "task_completed",
     "task_failed",
@@ -111,6 +113,11 @@ class SafeRunEventDetail(WebModel):
     returned_count: int | None = Field(default=None, ge=0, le=100_000)
     attachment_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
     output_attachment_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+    parallel_group_id: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9_-]{1,64}$",
+    )
+    requested_count: int | None = Field(default=None, ge=1, le=2)
     degraded: bool | None = None
     call_count: int | None = Field(default=None, ge=0, le=100_000)
     input_tokens: int | None = Field(default=None, ge=0)
@@ -147,6 +154,8 @@ class AgentStreamEventDraft(WebModel):
         if self.type != "answer_delta" and self.delta is not None:
             raise ValueError("only answer_delta events may contain delta")
         required_status = {
+            "parallel_group_started": "running",
+            "parallel_group_completed": "completed",
             "run_paused": "paused",
             "run_waiting_user": "waiting_user",
             "run_waiting_approval": "waiting_approval",
@@ -157,6 +166,33 @@ class AgentStreamEventDraft(WebModel):
         }.get(self.type)
         if required_status is not None and self.status != required_status:
             raise ValueError(f"{self.type} requires status={required_status}")
+        parallel_event = self.type in {
+            "parallel_group_started",
+            "parallel_group_completed",
+        }
+        has_parallel_detail = (
+            self.detail.parallel_group_id is not None
+            or self.detail.requested_count is not None
+        )
+        if parallel_event:
+            if self.task_id is not None:
+                raise ValueError("parallel group events must not identify one task")
+            if (
+                self.detail.parallel_group_id is None
+                or self.detail.requested_count != 2
+            ):
+                raise ValueError(
+                    "parallel group events require an ID and requested_count=2"
+                )
+            if self.type == "parallel_group_completed" and (
+                self.detail.returned_count is None
+                or self.detail.degraded is None
+            ):
+                raise ValueError(
+                    "parallel_group_completed requires returned_count and degraded"
+                )
+        elif has_parallel_detail:
+            raise ValueError("parallel group detail is reserved for parallel events")
         return self
 
     @property

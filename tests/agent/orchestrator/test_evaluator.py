@@ -5,8 +5,10 @@ from datetime import UTC, datetime
 
 from paper_research_agent.agent.orchestrator.evaluator import (
     TaskEvaluation,
+    degradation_codes_for_results,
     evaluate_task,
     reduce_workspace,
+    reduce_workspace_batch,
 )
 from paper_research_agent.agent.orchestrator.models import (
     AgentTask,
@@ -92,6 +94,63 @@ def _workspace(**overrides: object) -> ConversationWorkspace:
 
 
 class EvaluateTaskTests(unittest.TestCase):
+    def test_degradation_matrix_uses_latest_branch_attempts(self) -> None:
+        local_ok = _result(task_id="local", status="completed")
+        local_failed = _result(task_id="local", status="failed")
+        external_ok = _result(
+            task_id="external",
+            capability="dynamic_tools",
+            status="completed",
+            citation_kind="external",
+        )
+        external_failed = _result(
+            task_id="external",
+            capability="dynamic_tools",
+            status="failed",
+            error_code="provider_offline",
+        )
+
+        self.assertEqual(
+            degradation_codes_for_results((local_ok, external_failed)),
+            ("external_research_unavailable",),
+        )
+        self.assertEqual(
+            degradation_codes_for_results((local_failed, external_ok)),
+            ("local_evidence_insufficient",),
+        )
+        self.assertEqual(
+            degradation_codes_for_results((local_failed, external_failed)),
+            (
+                "local_evidence_insufficient",
+                "external_research_unavailable",
+                "model_background_only",
+            ),
+        )
+        self.assertEqual(
+            degradation_codes_for_results(
+                (local_failed, external_failed, local_ok, external_ok)
+            ),
+            (),
+        )
+
+    def test_external_timeout_and_write_denial_have_stable_codes(self) -> None:
+        timeout = _result(
+            task_id="external",
+            capability="dynamic_tools",
+            status="failed",
+            error_code="parallel_child_timeout",
+        )
+        write = timeout.model_copy(update={"error_code": "parallel_write_not_allowed"})
+
+        self.assertEqual(
+            degradation_codes_for_results((timeout,)),
+            ("external_research_timeout",),
+        )
+        self.assertEqual(
+            degradation_codes_for_results((write,)),
+            ("parallel_write_not_allowed",),
+        )
+
     def _evaluate(
         self,
         task: AgentTask,
@@ -256,6 +315,60 @@ class ReduceWorkspaceTests(unittest.TestCase):
         decision = TaskPlanDecision(action="revise", plan=new_plan, rationale="修订")
         reduced = reduce_workspace(workspace, plan_decision=decision)
         self.assertEqual(reduced.task_plan.tasks[0].task_id, "other-task")
+
+    def test_batch_reducer_updates_both_tasks_atomically(self) -> None:
+        local = _task(
+            task_id="local-research",
+            capability="local_rag",
+            status="running",
+            parallel_group_id="hybrid-research",
+        )
+        dynamic = _task(
+            task_id="external-research",
+            capability="dynamic_tools",
+            status="running",
+            parallel_group_id="hybrid-research",
+            allowed_tool_risks=("network_read",),
+            allowed_tool_names=(
+                "search_scholarly_sources",
+                "resolve_paper_identifier",
+                "get_citation_graph",
+                "check_paper_status",
+            ),
+        )
+        workspace = _workspace(task_plan=_plan((local, dynamic)))
+        evaluations = (
+            TaskEvaluation(task_id=local.task_id, outcome="complete", reason="成功"),
+            TaskEvaluation(task_id=dynamic.task_id, outcome="complete", reason="成功"),
+        )
+        results = (
+            _result(task_id=local.task_id),
+            _result(
+                task_id=dynamic.task_id,
+                capability="dynamic_tools",
+                citation_kind="external",
+            ),
+        )
+
+        reduced = reduce_workspace_batch(workspace, evaluations=evaluations, results=results)
+
+        self.assertEqual(
+            tuple(task.status for task in reduced.task_plan.tasks),
+            ("completed", "completed"),
+        )
+        self.assertEqual(tuple(task.status for task in workspace.task_plan.tasks), ("running", "running"))
+
+    def test_batch_reducer_rejects_unknown_task_without_partial_update(self) -> None:
+        workspace = _workspace()
+        evaluations = (
+            TaskEvaluation(task_id="task-1", outcome="complete", reason="成功"),
+            TaskEvaluation(task_id="missing", outcome="complete", reason="成功"),
+        )
+        results = (_result(), _result(task_id="missing"))
+
+        with self.assertRaisesRegex(ValueError, "unknown task"):
+            reduce_workspace_batch(workspace, evaluations=evaluations, results=results)
+        self.assertEqual(workspace.task_plan.tasks[0].status, "running")
 
 
 if __name__ == "__main__":

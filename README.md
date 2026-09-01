@@ -14,9 +14,9 @@
 - **自适应三图编排**：跨轮次主 Agent 先恢复上下文，再以保守分类器选择无模型快路或完整规划；清晰的单一论文任务可直接物化，复杂或模糊任务继续走完整规划。固定证据图与动态工具图只执行受控任务，不修改主目标与计划。
 - **受控 Agent Runtime**：LangGraph ReAct 工作流覆盖规划、工具执行、证据充分性反思、提前终止和有限重规划；18 项扩展研究工具全部受严格 Schema、总时长、调用次数、重复调用和信任等级约束，不注册任意 Shell、Python 或文件系统能力。
 - **状态、安全与审批**：SQLite Checkpoint 恢复 thread；笔记、报告和长期记忆写入使用与工具名、参数哈希绑定的一次性审批令牌，避免旧确认复用到新参数。
-- **后端智能路由**：前端提交问题、附件和明确的 `rag_mode`（`disabled` / `preferred` / `required`）；关闭时禁止本地检索，优先模式允许本地 RAG、普通聊天和联网研究动态分流，仅本地模式则强制使用论文库。策略层继续校验路由合法性，高风险覆盖、删除和外发仍要求确认。
+- **并行混合研究**：前端提交问题、附件和明确的 `rag_mode`（`disabled` / `preferred` / `required`）；`preferred` 遇到“本地论文 + 外部核验”意图时，确定性建立同组 `local_rag` 与 `dynamic_tools` 两个只读证据任务并同时启动。两支汇合后由大模型使用自身知识、推理和两类证据综合回答，不创建第三个 `direct_chat` 分支，也不会因启用 RAG 或外部检索而关闭模型原有知识。
 - **隐私可观测性**：可恢复产品事件流按游标持久化阶段、任务、工具、路由和安全原因码，支持刷新续传、历史回放、暂停、继续与取消；事件账本和安全遥测均不记录问题、证据正文或 Provider 原始载荷。
-- **本机资源调度**：面向 16 逻辑线程的单用户工作站采用单进程共享索引、六路比较检索和有界本地模型线程池；远端模型 I/O 与本地检索分层限流，避免用多 worker 重复加载模型。最近一次全量工程门禁为 956 项测试、162 个子测试全部通过。
+- **本机资源调度**：面向 16 逻辑线程的单用户工作站采用单进程共享索引、六路比较检索和有界本地模型线程池；远端模型 I/O 与本地检索分层限流，避免用多 worker 重复加载模型。最近一次全量工程门禁为 999 项测试、171 个子测试全部通过。
 
 ## 当前里程碑
 
@@ -46,6 +46,8 @@
 - [x] 六路并发比较检索、事实级 Compiler 与确定性答案渲染
 - [x] 可刷新续传、历史回放和运行控制的持久化事件流
 - [x] 可选、默认关闭且受静态准入控制的 MCP 只读工具接入
+- [x] 本地 RAG 与外部学术检索的计划级分组、真实并行执行和原子汇合
+- [x] 外部学术 Provider 就绪状态、只读双白名单和部分失败降级
 
 详细安排见[RAG 检索基线实施计划](docs/plans/2026-07-26-RAG检索基线实施计划.md)。
 
@@ -71,6 +73,12 @@
 步骤后，才按能力把受控任务派发给普通聊天、本地论文、动态工具、附件问答或
 文件编辑执行器。本地论文研究图与动态工具图都是 child executor（子执行器），
 不能自行修改主目标、任务计划或会话版本。
+
+当用户同时要求本地论文依据与最新外部核验时，主图将两个任务标记为同一个
+`parallel_group_id`，通过结构化并发同时派发并在批次边界汇合。并行分支只负责获取证据；
+大模型仍负责问题理解、规划、概念背景、推论和最终综合。模型自身背景知识不会被伪装成引用，
+本地引用只来自本轮通过白名单校验的论文 chunk，时效性结论只有在外部学术分支成功时才标记为
+已核验。
 
 浏览器只使用以下统一接口：
 
@@ -232,7 +240,7 @@ python scripts/rag.py "它和 MTEB 有什么区别？" `
 回答、模型请求或原始响应。默认 24 小时过期、每个 session 最多 20 轮，每次最多选 6 轮
 且不超过 1200 个保守估算 Token。配置见 `configs/memory/short-term-v1.json`。
 
-Web 研究台另由编排层维护统一的 Conversation Store：普通聊天、本地 RAG、附件、网页研究
+Web 研究台另由编排层维护统一的 Conversation Store：普通聊天、本地 RAG、附件、外部学术研究
 和动态工具共享同一 conversation ID。每轮无条件准备最近窗口、主题 Episode 与远距用户问题
 候选，再由一次结构化 Turn Interpreter 同时判断历史依赖、生成独立问题并规划研究能力；规则
 只校验真实 turn ID、会话隔离、能力开关和低置信度澄清。只有独立问题进入中英文论文查询改写。
@@ -518,6 +526,15 @@ python scripts/serve_web.py --host 127.0.0.1 --port 8092
 切换兼容模式不会删除主 Agent checkpoint、Conversation Store（会话存储）或事件库，也不要
 手工修改本机 SQLite 状态。问题修复后复用原数据验证，再显式切回 `primary`。
 
+混合并行研究还有独立的严格回滚开关。它默认关闭且只接受大小写不敏感的 `true` / `false`；
+`1`、`yes`、空白值或其他字符串都会令启动失败。关闭时，混合请求会在两个子执行器启动前以
+`parallel_hybrid_disabled` 关闭失败，不会退回顺序执行或静默二选一；纯单任务不受影响。
+
+```powershell
+$env:PRA_PARALLEL_HYBRID_RESEARCH_ENABLED = 'false'
+python scripts/serve_web.py --host 127.0.0.1 --port 8092
+```
+
 本机登录使用 `.env` 中的 `PRA_WEB_USER`、`PRA_WEB_PASSWORD`，并单独设置至少 32 字节的
 `PRA_WEB_SESSION_SECRET`。这些变量、DashScope Key、论文派生数据、模型缓存与运行数据库
 均不得进入 Git。
@@ -527,7 +544,7 @@ python scripts/serve_web.py --host 127.0.0.1 --port 8092
 路径、完整 figure JSON、系统提示词、Provider 原始响应或未选中证据全文。部署模板见
 `deploy/`，推荐问题见 `configs/web/recommended-questions-v1.json`。
 
-## 学术元数据 Provider 底座
+## 外部学术检索 Provider
 
 `search_scholarly_sources`、`resolve_paper_identifier`、`get_citation_graph` 和
 `check_paper_status` 保持稳定的公开工具契约，内部通过有序 Provider（提供方）注册表执行。
@@ -541,12 +558,26 @@ python scripts/serve_web.py
 
 单元测试通过依赖注入使用确定性 Fixture Provider（测试假提供方），可覆盖成功、无结果、
 限流、超时和多提供方降级；该实现只存在于测试代码，不能进入生产 Registry（注册表）。
-未来真实接入经审查后，必须显式设置 `PRA_SCHOLARLY_MODE=live`。现有
-Semantic Scholar/Crossref 适配器会继续从 `SEMANTIC_SCHOLAR_API_KEY` 读取可选凭据，后续
+真实接入必须显式设置 `PRA_SCHOLARLY_MODE=live`。现有 Semantic Scholar/Crossref 适配器
+会从 `SEMANTIC_SCHOLAR_API_KEY` 读取可选凭据，后续
 OpenAlex 等提供方可加入同一有序注册表，而无需改变 Agent 路由、工具参数或结果信任等级。
+
+```powershell
+$env:PRA_SCHOLARLY_MODE = 'live'
+$env:PRA_PARALLEL_HYBRID_RESEARCH_ENABLED = 'true'
+$env:SEMANTIC_SCHOLAR_API_KEY = '<本机可选 Key>'
+python scripts/serve_web.py --host 127.0.0.1 --port 8092
+```
+
+这里的“外部”是受控学术元数据与引用关系检索，不是通用网页搜索。并行学术分支同时受
+`network_read` 风险白名单和四个固定工具名白名单约束，不能调用写工具、本地文件工具、计算
+工具或任意 MCP 网络工具；越权请求在 Provider 调用前拒绝，也不会创建审批。
 
 所有学术网络结果仍是低信任 `research_context`，不能直接成为论文引用；外部论文必须经过
 许可核验、受控导入、冻结、解析和本地索引后，才能进入 `citation_evidence` 证据链。
+Provider 离线、超时或请求失败时，本地分支和大模型综合仍可继续，结果会标记为降级并明确说明
+“外部学术核验未完成”；两类证据都失败时仅返回无引用的模型背景说明，并标记
+`model_background_only`，不会把时效性事实表述为已核验。
 
 ## 可选 MCP 只读工具
 

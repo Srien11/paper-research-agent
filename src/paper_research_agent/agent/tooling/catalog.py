@@ -127,6 +127,11 @@ EXTENDED_TOOL_SPECS: tuple[ToolSpec, ...] = (
 
 EXTENDED_TOOL_NAMES = frozenset(spec.name for spec in EXTENDED_TOOL_SPECS)
 TOOL_SPEC_BY_NAME = {spec.name: spec for spec in EXTENDED_TOOL_SPECS}
+SCHOLARLY_NETWORK_TOOL_NAMES = tuple(
+    spec.name for spec in EXTENDED_TOOL_SPECS if spec.risk == "network_read"
+)
 
 if len(EXTENDED_TOOL_SPECS) != 18 or len(EXTENDED_TOOL_NAMES) != 18:
     raise RuntimeError("extended research tool catalog must contain exactly 18 unique tools")
+if len(SCHOLARLY_NETWORK_TOOL_NAMES) != 4:
+    raise RuntimeError("scholarly network tool catalog must contain exactly four tools")

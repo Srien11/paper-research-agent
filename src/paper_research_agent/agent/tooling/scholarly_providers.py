@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal, Protocol, TypeAlias
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from paper_research_agent.agent.tooling.contracts import (
     CitationGraphInput,
@@ -18,6 +18,28 @@ SCHOLARLY_OPERATIONS: frozenset[ScholarlyOperation] = frozenset(
     {"search", "resolve", "citations", "status"}
 )
 ScholarlyProviderRequest: TypeAlias = ScholarlySearchInput | IdentifierInput | CitationGraphInput
+
+
+class CapabilityReadiness(BaseModel):
+    """Frozen startup snapshot; it never claims a live request already succeeded."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    capability: Literal["local_rag", "external_scholarly"]
+    ready: bool
+    reason_code: str | None = Field(
+        default=None,
+        pattern=r"^[a-z][a-z0-9_]{1,63}$",
+    )
+    provider_ids: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_reason(self) -> CapabilityReadiness:
+        if self.ready and self.reason_code is not None:
+            raise ValueError("ready capability must not include an unavailable reason")
+        if not self.ready and self.reason_code is None:
+            raise ValueError("unready capability requires a reason code")
+        return self
 
 
 class ScholarlyProviderResult(BaseModel):

@@ -41,6 +41,22 @@ class MainAgentFactoryTests(unittest.TestCase):
 
         self.assertTrue(build.call_args.kwargs["fast_path_enabled"])
 
+    def test_model_factory_passes_parallel_hybrid_flag_to_graph_factory(self) -> None:
+        with patch(
+            "paper_research_agent.agent.orchestrator.factory.build_main_agent_runtime",
+            return_value=Mock(),
+        ) as build:
+            build_main_agent_runtime_from_model(
+                store=Mock(),
+                model=Mock(),
+                dispatcher=Mock(),
+                parallel_hybrid_research_enabled=True,
+            )
+
+        self.assertTrue(
+            build.call_args.kwargs["parallel_hybrid_research_enabled"]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

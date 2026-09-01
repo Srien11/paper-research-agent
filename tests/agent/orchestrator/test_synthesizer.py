@@ -15,7 +15,10 @@ from paper_research_agent.agent.orchestrator.models import (
     ConversationWorkspace,
     GoalState,
 )
-from paper_research_agent.agent.orchestrator.synthesizer import AnswerSynthesizer
+from paper_research_agent.agent.orchestrator.synthesizer import (
+    AnswerSynthesizer,
+    SynthesisUnavailableError,
+)
 from paper_research_agent.answering.models import (
     AnswerCitation,
     AnswerClaim,
@@ -114,6 +117,17 @@ def _dynamic_child() -> ChildTaskResult:
     )
 
 
+def _failed_child(capability: str) -> ChildTaskResult:
+    return ChildTaskResult(
+        child_run_id=f"run-{capability}",
+        task_id="local" if capability == "local_rag" else "dynamic",
+        capability=capability,  # type: ignore[arg-type]
+        status="failed",
+        summary="分支未返回证据",
+        error_code="provider_unavailable",
+    )
+
+
 class AnswerSynthesizerTests(unittest.IsolatedAsyncioTestCase):
     async def test_empty_child_results_cannot_be_reported_as_completed(self) -> None:
         with self.assertRaisesRegex(ValueError, "no child results"):
@@ -132,7 +146,8 @@ class AnswerSynthesizerTests(unittest.IsolatedAsyncioTestCase):
     async def test_mixed_answer_keeps_provenance_separate(self) -> None:
         structured = AsyncMock()
         structured.ainvoke.return_value = {
-            "sections": [
+            "conclusion": "RAG 通过检索上下文约束生成过程。",
+            "evidence_sections": [
                 {
                     "task_id": "local",
                     "text": "本地研究部分。",
@@ -156,11 +171,13 @@ class AnswerSynthesizerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(answer.sections[0].source_kind, "local_paper")
         self.assertEqual(answer.sections[1].source_kind, "external")
         self.assertEqual(answer.source_ids, ("chunk-1", "external-1"))
+        self.assertIn("RAG 通过检索上下文", answer.text)
 
     async def test_synthesizer_cannot_create_new_source_ids(self) -> None:
         structured = AsyncMock()
         structured.ainvoke.return_value = {
-            "sections": [
+            "conclusion": "综合结论。",
+            "evidence_sections": [
                 {
                     "task_id": "local",
                     "text": "本地研究部分。",
@@ -205,6 +222,60 @@ class AnswerSynthesizerTests(unittest.IsolatedAsyncioTestCase):
             tuple(section.task_id for section in answer.sections),
             ("local", "dynamic"),
         )
+
+    async def test_external_failure_gets_deterministic_unverified_notice(self) -> None:
+        structured = AsyncMock()
+        structured.ainvoke.return_value = {
+            "conclusion": "RAG 的一般原理仍可解释，但项目维护状态不能确认。",
+            "evidence_sections": [
+                {"task_id": "local", "text": "本地依据", "source_ids": ["chunk-1"]},
+                {"task_id": "dynamic", "text": "不能核验", "source_ids": []},
+            ],
+        }
+        model = Mock()
+        model.with_structured_output.return_value = structured
+
+        answer = await AnswerSynthesizer(model).synthesize(
+            _context(), (_local_child(), _failed_child("dynamic_tools"))
+        )
+
+        self.assertIn("外部学术核验未完成", answer.text)
+        self.assertIn("仍未核验", answer.text)
+        self.assertEqual(answer.source_ids, ("chunk-1",))
+
+    async def test_both_evidence_branches_failed_keeps_source_free_model_background(self) -> None:
+        structured = AsyncMock()
+        structured.ainvoke.return_value = {
+            "conclusion": "一般而言，RAG 会把检索到的上下文加入生成提示。",
+            "evidence_sections": [
+                {"task_id": "local", "text": "无本地证据", "source_ids": []},
+                {"task_id": "dynamic", "text": "无外部证据", "source_ids": []},
+            ],
+        }
+        model = Mock()
+        model.with_structured_output.return_value = structured
+
+        answer = await AnswerSynthesizer(model).synthesize(
+            _context(),
+            (_failed_child("local_rag"), _failed_child("dynamic_tools")),
+        )
+
+        self.assertIn("一般而言，RAG", answer.text)
+        self.assertIn("未经本地或外部证据核验", answer.text)
+        self.assertEqual(answer.source_ids, ())
+        self.assertTrue(all(not section.source_ids for section in answer.sections))
+
+    async def test_both_evidence_branches_and_model_failure_is_unavailable(self) -> None:
+        structured = AsyncMock()
+        structured.ainvoke.side_effect = RuntimeError("provider unavailable")
+        model = Mock()
+        model.with_structured_output.return_value = structured
+
+        with self.assertRaises(SynthesisUnavailableError):
+            await AnswerSynthesizer(model).synthesize(
+                _context(),
+                (_failed_child("local_rag"), _failed_child("dynamic_tools")),
+            )
 
 
 if __name__ == "__main__":

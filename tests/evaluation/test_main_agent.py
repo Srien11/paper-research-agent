@@ -48,6 +48,23 @@ class MainAgentEvaluationTests(unittest.TestCase):
                 "commit_rejected",
             },
         )
+        hybrid = tuple(case for case in cases if case.scenario == "hybrid_research")
+        self.assertEqual(
+            tuple(case.message for case in hybrid),
+            (
+                "结合本地论文 C001 和联网搜索核验最新状态",
+                "比较 C001 与 C002，并用外部资料确认项目是否仍维护",
+                "参考知识库，同时网上查一下最新版本",
+            ),
+        )
+        for case in hybrid:
+            self.assertEqual(case.expected_execution_mode, "parallel")
+            self.assertEqual(
+                case.expected_parallel_groups,
+                (("local_rag", "dynamic_tools"),),
+            )
+            self.assertTrue(case.expected_model_synthesis)
+            self.assertIn("direct_chat", case.forbidden_capabilities)
 
     def test_interface_ideal_record_scores_every_release_axis(self) -> None:
         case = next(
@@ -71,6 +88,7 @@ class MainAgentEvaluationTests(unittest.TestCase):
             event_types=("run_started", "rag_result", "done"),
             event_ids=(1, 2, 3),
             done_count=1,
+            model_synthesis_count=1,
         )
 
         result = score_main_agent_interface_case(case, record)
@@ -89,6 +107,8 @@ class MainAgentEvaluationTests(unittest.TestCase):
                     result.duplicate_side_effect,
                     result.commit_rejection,
                     result.event_contract_validity,
+                    result.parallel_contract,
+                    result.model_synthesis,
                 )
             )
         )
@@ -149,6 +169,7 @@ class MainAgentEvaluationTests(unittest.TestCase):
                 status="completed",
                 memory_recalled_before_route=True,
                 side_effect_count=1,
+                model_synthesis_count=1,
             ),
             MainAgentTurnRecord(
                 turn_index=2,
@@ -159,6 +180,7 @@ class MainAgentEvaluationTests(unittest.TestCase):
                 status="completed",
                 memory_recalled_before_route=True,
                 side_effect_count=1,
+                model_synthesis_count=1,
             ),
         )
         result = score_main_agent_case(case, records)
