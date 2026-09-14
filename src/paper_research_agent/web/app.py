@@ -2030,7 +2030,7 @@ def create_app(
             queued = cast(
                 KnowledgeItem,
                 await asyncio.to_thread(
-                    app.state.knowledge_store.set_status, item_id, "queued"
+                    app.state.knowledge_store.queue_for_publish, item_id
                 ),
             )
         except KeyError as error:

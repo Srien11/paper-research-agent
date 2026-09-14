@@ -173,6 +173,54 @@ class KnowledgeBaseStore:
             connection.commit()
         return updated
 
+    def queue_for_publish(self, item_id: str) -> KnowledgeItem:
+        return self._transition(
+            item_id,
+            allowed_from={"ready", "failed"},
+            status="queued",
+            error=None,
+        )
+
+    def claim_queued_publish(self, item_id: str) -> KnowledgeItem:
+        return self._transition(
+            item_id,
+            allowed_from={"queued"},
+            status="running",
+            error=None,
+        )
+
+    def _transition(
+        self,
+        item_id: str,
+        *,
+        allowed_from: set[KnowledgeItemStatus],
+        status: KnowledgeItemStatus,
+        error: str | None,
+    ) -> KnowledgeItem:
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM knowledge_items WHERE item_id = ?", (item_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError("知识库资料不存在")
+            current = _item(row)
+            if current.status not in allowed_from:
+                raise ValueError(f"状态 {current.status} 的资料不能进入发布队列")
+            updated = current.model_copy(
+                update={
+                    "status": status,
+                    "error": error,
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+            connection.execute(
+                "UPDATE knowledge_items SET status=?, error=?, updated_at=? WHERE item_id=?",
+                (updated.status, updated.error, updated.updated_at.isoformat(), item_id),
+            )
+            connection.commit()
+        return updated
+
     def staged_path(self, item_id: str) -> Path:
         path = self.staging_dir / f"{item_id}.pdf"
         if not path.is_file():
@@ -237,11 +285,10 @@ def publish_item(
     from paper_research_agent.retrieval.indexer import build_index
     from paper_research_agent.retrieval.model_adapters import FastEmbedEncoder
 
-    item = store.get(item_id)
-    if item.status not in {"ready", "failed"} or not item.ready_for_publish:
-        raise ValueError("资料尚未补齐或不可发布")
-    store.set_status(item_id, "running")
     try:
+        item = store.claim_queued_publish(item_id)
+        if not item.ready_for_publish:
+            raise ValueError("资料尚未补齐或不可发布")
         _freeze_source(store, item, corpus_dir)
         update = update_current_ingestion_build(corpus_dir, output_root)
         pointer = output_root / "current_knowledge_base.json"
@@ -270,7 +317,13 @@ def publish_item(
         published = store.set_status(item_id, "published", build_id=update.result.manifest.build_id)
         return KnowledgePublishResult(item=published, changed=update.changed)
     except Exception as error:
-        store.set_status(item_id, "failed", error=str(error)[:1_000])
+        try:
+            current = store.get(item_id)
+        except KeyError:
+            pass
+        else:
+            if current.status in {"queued", "running"}:
+                store.set_status(item_id, "failed", error=str(error)[:1_000])
         raise
 
 

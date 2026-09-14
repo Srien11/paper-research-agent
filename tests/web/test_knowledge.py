@@ -4,12 +4,34 @@ import hashlib
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from paper_research_agent.web.interventions import InterventionStore
-from paper_research_agent.web.knowledge import KnowledgeBaseStore, KnowledgeItemPatch
+from paper_research_agent.web.knowledge import (
+    KnowledgeBaseStore,
+    KnowledgeItemPatch,
+    publish_item,
+)
 
 
 class KnowledgeBaseStoreTests(unittest.TestCase):
+    @staticmethod
+    def _ready_item(
+        store: KnowledgeBaseStore,
+        corpus: Path,
+    ):
+        item = store.stage(filename="new.pdf", chunks=(b"%PDF-1.4",))
+        return store.update(
+            item.item_id,
+            KnowledgeItemPatch(
+                title="A paper",
+                authors=("A",),
+                year=2026,
+                official_url="https://example.test/paper",
+            ),
+            corpus_id=store.next_corpus_id(corpus),
+        )
+
     def test_staging_requires_review_before_publish_and_keeps_stable_id(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -33,6 +55,55 @@ class KnowledgeBaseStoreTests(unittest.TestCase):
             self.assertEqual(reviewed.status, "ready")
             self.assertEqual(reviewed.corpus_id, "C002")
             self.assertEqual(store.get(item.item_id).corpus_id, "C002")
+
+    def test_queued_item_failure_reaches_failed_and_can_be_requeued(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus = root / "corpus"
+            corpus.mkdir()
+            (corpus / "core_frozen.jsonl").write_text(
+                '{"corpus_id":"C001","corpus_version":"v1"}\n',
+                encoding="utf-8",
+            )
+            store = KnowledgeBaseStore(root / "runtime")
+            item = self._ready_item(store, corpus)
+
+            queued = store.queue_for_publish(item.item_id)
+            self.assertEqual(queued.status, "queued")
+            with (
+                patch(
+                    "paper_research_agent.web.knowledge._freeze_source",
+                    side_effect=RuntimeError("forced publish failure"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "forced publish failure"),
+            ):
+                publish_item(
+                    store,
+                    item.item_id,
+                    corpus_dir=corpus,
+                    output_root=root / "processed",
+                    chunking_config=root / "chunking.json",
+                    retrieval_config=root / "retrieval.json",
+                )
+
+            self.assertEqual(store.get(item.item_id).status, "failed")
+            self.assertEqual(store.queue_for_publish(item.item_id).status, "queued")
+
+    def test_only_ready_or_failed_item_can_be_queued(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus = root / "corpus"
+            corpus.mkdir()
+            store = KnowledgeBaseStore(root / "runtime")
+            item = store.stage(filename="new.pdf", chunks=(b"%PDF-1.4",))
+
+            with self.assertRaisesRegex(ValueError, "不能进入发布队列"):
+                store.queue_for_publish(item.item_id)
+
+            ready = self._ready_item(store, corpus)
+            store.queue_for_publish(ready.item_id)
+            with self.assertRaisesRegex(ValueError, "不能进入发布队列"):
+                store.queue_for_publish(ready.item_id)
 
     def test_interventions_are_durable_and_conversation_scoped(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
