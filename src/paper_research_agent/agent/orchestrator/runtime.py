@@ -50,6 +50,10 @@ Closer = Callable[[], Awaitable[None]]
 ConversationClearer = Callable[[str], Awaitable[None]]
 
 
+class MainAgentCapacityError(RuntimeError):
+    """A new request was rejected before durable run creation."""
+
+
 class RunEventPublisherLike(Protocol):
     async def publish(
         self,
@@ -83,9 +87,12 @@ class MainAgentRuntime:
         clear: ConversationClearer | None = None,
         event_sink: AgentEventSink | None = None,
         run_event_publisher: RunEventPublisherLike | None = None,
+        max_inflight_runs: int = 2,
     ) -> None:
         if timeout_seconds <= 0 or timeout_seconds > 3600:
             raise ValueError("main agent timeout must be between 0 and 3600 seconds")
+        if not 1 <= max_inflight_runs <= 16:
+            raise ValueError("main agent max inflight runs must be between 1 and 16")
         self._graph = graph
         self._repository = repository
         self._approval_resumer = approval_resumer
@@ -94,6 +101,7 @@ class MainAgentRuntime:
         self._clear = clear
         self._event_sink = event_sink
         self._run_event_publisher = run_event_publisher
+        self._max_inflight_runs = max_inflight_runs
         self._locks: dict[str, asyncio.Lock] = {}
         self._inflight: dict[str, asyncio.Task[MainAgentResult]] = {}
         self._inflight_conversations: dict[str, str] = {}
@@ -131,6 +139,8 @@ class MainAgentRuntime:
                 ):
                     raise ValueError("request_id belongs to another conversation")
             else:
+                if len(self._inflight) >= self._max_inflight_runs:
+                    raise MainAgentCapacityError("main agent capacity is exhausted")
                 task = asyncio.create_task(
                     self._run_serialized(request),
                     name=f"main-agent::{request.request_id}",

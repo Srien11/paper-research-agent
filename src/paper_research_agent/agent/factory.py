@@ -326,6 +326,7 @@ async def create_main_agent_runtime(
     clear: Any = None,
     event_sink: AgentEventSink | None = None,
     parallel_hybrid_research_enabled: bool = False,
+    max_inflight_runs: int = 2,
 ) -> Any:
     """Assemble the cross-turn main Agent runtime from ready components."""
     from paper_research_agent.agent.orchestrator.factory import build_main_agent_runtime
@@ -345,6 +346,7 @@ async def create_main_agent_runtime(
         clear=clear,
         event_sink=event_sink,
         parallel_hybrid_research_enabled=parallel_hybrid_research_enabled,
+        max_inflight_runs=max_inflight_runs,
     )
 
 
@@ -362,6 +364,7 @@ def create_main_agent_runtime_from_model(
     run_event_publisher: Any = None,
     fast_path_enabled: bool = False,
     parallel_hybrid_research_enabled: bool = False,
+    max_inflight_runs: int = 2,
 ) -> Any:
     """Assemble all model-backed main-Agent stages from one shared client."""
     from paper_research_agent.agent.orchestrator.factory import (
@@ -381,4 +384,5 @@ def create_main_agent_runtime_from_model(
         run_event_publisher=run_event_publisher,
         fast_path_enabled=fast_path_enabled,
         parallel_hybrid_research_enabled=parallel_hybrid_research_enabled,
+        max_inflight_runs=max_inflight_runs,
     )

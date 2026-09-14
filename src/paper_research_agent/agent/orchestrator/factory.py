@@ -54,6 +54,7 @@ def build_main_agent_runtime(
     run_event_publisher: RunEventPublisherLike | None = None,
     fast_path_enabled: bool = False,
     parallel_hybrid_research_enabled: bool = False,
+    max_inflight_runs: int = 2,
 ) -> MainAgentRuntime:
     """Assemble one closable main Agent runtime with a strict Pydantic graph."""
     resolved_synthesizer = synthesizer or AnswerSynthesizer()
@@ -87,6 +88,7 @@ def build_main_agent_runtime(
         clear=clear,
         event_sink=event_sink,
         run_event_publisher=run_event_publisher,
+        max_inflight_runs=max_inflight_runs,
     )
 
 
@@ -106,6 +108,7 @@ def build_main_agent_runtime_from_model(
     run_event_publisher: RunEventPublisherLike | None = None,
     fast_path_enabled: bool = False,
     parallel_hybrid_research_enabled: bool = False,
+    max_inflight_runs: int = 2,
 ) -> MainAgentRuntime:
     """Build production stages while sharing one lifecycle-managed model client."""
     return build_main_agent_runtime(
@@ -130,6 +133,7 @@ def build_main_agent_runtime_from_model(
         run_event_publisher=run_event_publisher,
         fast_path_enabled=fast_path_enabled,
         parallel_hybrid_research_enabled=parallel_hybrid_research_enabled,
+        max_inflight_runs=max_inflight_runs,
     )
 
 

@@ -22,7 +22,10 @@ from paper_research_agent.agent.orchestrator.models import (
     MainAgentResult,
     TaskPlan,
 )
-from paper_research_agent.agent.orchestrator.runtime import MainAgentRuntime
+from paper_research_agent.agent.orchestrator.runtime import (
+    MainAgentCapacityError,
+    MainAgentRuntime,
+)
 from paper_research_agent.conversation.models import ConversationResolution
 from paper_research_agent.conversation.store import InMemoryConversationStore
 from paper_research_agent.web.app import create_app
@@ -616,6 +619,19 @@ class MainAgentApiTests(unittest.TestCase):
             json=payload,
         )
         self.assertEqual(anonymous.status_code, 401)
+
+    def test_capacity_error_returns_retryable_429_without_internal_detail(self) -> None:
+        self.main.error = MainAgentCapacityError("private capacity detail")
+
+        response = self.client.post(
+            "/paper-research/api/agent/runs",
+            headers={"Origin": ORIGIN},
+            json={"request_id": REQUEST_ID, "message": "hello"},
+        )
+
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(response.headers["Retry-After"], "5")
+        self.assertNotIn("private capacity detail", response.text)
 
     def test_internal_value_error_is_not_reported_as_invalid_user_request(self) -> None:
         self.main.error = ValueError("session_id contains unsafe private detail")

@@ -57,6 +57,20 @@ class MainAgentFactoryTests(unittest.TestCase):
             build.call_args.kwargs["parallel_hybrid_research_enabled"]
         )
 
+    def test_model_factory_passes_global_capacity_to_runtime_factory(self) -> None:
+        with patch(
+            "paper_research_agent.agent.orchestrator.factory.build_main_agent_runtime",
+            return_value=Mock(),
+        ) as build:
+            build_main_agent_runtime_from_model(
+                store=Mock(),
+                model=Mock(),
+                dispatcher=Mock(),
+                max_inflight_runs=3,
+            )
+
+        self.assertEqual(build.call_args.kwargs["max_inflight_runs"], 3)
+
 
 if __name__ == "__main__":
     unittest.main()

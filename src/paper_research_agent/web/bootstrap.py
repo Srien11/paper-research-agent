@@ -88,6 +88,7 @@ class ApplicationEnvironment:
     timeout_seconds: float = 180
     main_agent_fast_path_enabled: bool = True
     parallel_hybrid_research_enabled: bool = False
+    max_inflight_runs: int = 2
 
     @classmethod
     def from_environment(
@@ -150,6 +151,13 @@ class ApplicationEnvironment:
                 source,
                 "PRA_PARALLEL_HYBRID_RESEARCH_ENABLED",
                 default=False,
+            ),
+            max_inflight_runs=_bounded_integer_from_environment(
+                source,
+                "PRA_MAIN_AGENT_MAX_INFLIGHT_RUNS",
+                default=2,
+                minimum=1,
+                maximum=16,
             ),
         )
 
@@ -553,6 +561,7 @@ async def create_application_services(
                 parallel_hybrid_research_enabled=(
                     environment.parallel_hybrid_research_enabled
                 ),
+                max_inflight_runs=environment.max_inflight_runs,
             )
             own(main)
         return ApplicationServices(
@@ -647,6 +656,24 @@ def _timeout_from_environment(source: Mapping[str, str]) -> float:
     if timeout <= 0 or timeout > 3600:
         raise ValueError("PRA_MAIN_AGENT_TIMEOUT_SECONDS must be between 0 and 3600")
     return timeout
+
+
+def _bounded_integer_from_environment(
+    source: Mapping[str, str],
+    name: str,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    raw = source.get(name, str(default)).strip()
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise ValueError(f"{name} must be an integer") from error
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be between {minimum} and {maximum}")
+    return value
 
 
 def _strict_boolean_from_environment(

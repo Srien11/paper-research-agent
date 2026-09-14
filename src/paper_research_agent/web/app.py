@@ -34,7 +34,10 @@ from paper_research_agent.agent.orchestrator.models import (
     MainAgentResult,
     MainAgentResumeRequest,
 )
-from paper_research_agent.agent.orchestrator.runtime import MainAgentRuntime
+from paper_research_agent.agent.orchestrator.runtime import (
+    MainAgentCapacityError,
+    MainAgentRuntime,
+)
 from paper_research_agent.conversation.models import (
     ConversationResolution,
     ConversationStatus,
@@ -604,6 +607,12 @@ def _validated_request_id(value: str) -> str:
 
 
 def _main_agent_runtime_error(error: Exception, *, approval: bool = False) -> HTTPException:
+    if isinstance(error, MainAgentCapacityError):
+        return HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="主 Agent 当前任务较多，请稍后重试",
+            headers={"Retry-After": "5"},
+        )
     if isinstance(error, TimeoutError):
         return HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,

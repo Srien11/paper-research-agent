@@ -183,6 +183,31 @@ def _environment(root: Path, *, mode: str, api_key: str = "test-key") -> Applica
 
 
 class ApplicationBootstrapTests(unittest.IsolatedAsyncioTestCase):
+    def test_main_agent_capacity_environment_is_bounded(self) -> None:
+        default = ApplicationEnvironment.from_environment(
+            {"PRA_PROJECT_ROOT": str(Path.cwd())}
+        )
+        configured = ApplicationEnvironment.from_environment(
+            {
+                "PRA_PROJECT_ROOT": str(Path.cwd()),
+                "PRA_MAIN_AGENT_MAX_INFLIGHT_RUNS": "3",
+            }
+        )
+
+        self.assertEqual(default.max_inflight_runs, 2)
+        self.assertEqual(configured.max_inflight_runs, 3)
+        for invalid in ("0", "17", "many"):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                ValueError,
+                "PRA_MAIN_AGENT_MAX_INFLIGHT_RUNS",
+            ):
+                ApplicationEnvironment.from_environment(
+                    {
+                        "PRA_PROJECT_ROOT": str(Path.cwd()),
+                        "PRA_MAIN_AGENT_MAX_INFLIGHT_RUNS": invalid,
+                    }
+                )
+
     def test_environment_resolves_all_mutable_paths_outside_release(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             shared = Path(directory) / "shared"

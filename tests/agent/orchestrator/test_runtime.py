@@ -16,7 +16,10 @@ from paper_research_agent.agent.orchestrator.models import (
     MainAgentResult,
     TaskPlan,
 )
-from paper_research_agent.agent.orchestrator.runtime import MainAgentRuntime
+from paper_research_agent.agent.orchestrator.runtime import (
+    MainAgentCapacityError,
+    MainAgentRuntime,
+)
 from paper_research_agent.conversation.store import InMemoryConversationStore
 from paper_research_agent.web.run_event_bus import RunEventBus
 
@@ -80,6 +83,53 @@ class _RecordingSink:
 
 
 class MainAgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_global_capacity_rejects_new_run_but_reuses_same_request(
+        self,
+    ) -> None:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        class GatedGraph(_FakeGraph):
+            async def ainvoke(self, value: object, config: object = None) -> dict[str, object]:
+                entered.set()
+                await release.wait()
+                return await super().ainvoke(value, config)
+
+        runtime = MainAgentRuntime(
+            graph=GatedGraph(),
+            repository=InMemoryConversationStore(),
+            max_inflight_runs=1,
+        )
+        first_request = _request(
+            conversation_id="conversation-capacity-a",
+            request_id="request-capacity-a",
+        )
+        first = asyncio.create_task(runtime.run(first_request))
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        duplicate = asyncio.create_task(runtime.run(first_request))
+
+        with self.assertRaises(MainAgentCapacityError):
+            await runtime.run(
+                _request(
+                    conversation_id="conversation-capacity-b",
+                    request_id="request-capacity-b",
+                )
+            )
+
+        release.set()
+        self.assertEqual(await first, await duplicate)
+        for _ in range(10):
+            if not runtime._inflight:
+                break
+            await asyncio.sleep(0)
+        second = await runtime.run(
+            _request(
+                conversation_id="conversation-capacity-b",
+                request_id="request-capacity-b",
+            )
+        )
+        self.assertEqual(second.status, "completed")
+
     async def test_product_stream_starts_before_graph_completes_and_closes_once(self) -> None:
         entered = asyncio.Event()
         release = asyncio.Event()
