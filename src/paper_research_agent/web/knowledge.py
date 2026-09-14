@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import shutil
+import os
 import sqlite3
+import tempfile
 import threading
 import uuid
-from collections.abc import Iterable
-from contextlib import closing
+from collections.abc import Iterable, Iterator
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -72,6 +73,7 @@ class KnowledgeBaseStore:
         self.path = root / "knowledge-base-v1.sqlite3"
         self.staging_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        self._publish_lock = threading.Lock()
         self._initialize()
 
     def stage(self, *, filename: str, chunks: Iterable[bytes]) -> KnowledgeItem:
@@ -127,26 +129,30 @@ class KnowledgeBaseStore:
 
     def get(self, item_id: str) -> KnowledgeItem:
         with self._lock, closing(self._connect()) as connection:
-            row = connection.execute(
-                "SELECT * FROM knowledge_items WHERE item_id = ?", (item_id,)
-            ).fetchone()
-        if row is None:
-            raise KeyError("知识库资料不存在")
-        return _item(row)
+            return self._get_with_connection(connection, item_id)
 
-    def update(self, item_id: str, patch: KnowledgeItemPatch, *, corpus_id: str) -> KnowledgeItem:
-        current = self.get(item_id)
-        if current.status not in {"staged", "ready", "failed"}:
-            raise ValueError("正在处理或已发布的资料不能修改")
-        values = current.model_dump()
-        for field, value in patch.model_dump(exclude_none=True).items():
-            values[field] = value
-        values["corpus_id"] = current.corpus_id or corpus_id
-        values["updated_at"] = datetime.now(UTC)
-        candidate = KnowledgeItem.model_validate(values)
-        status: KnowledgeItemStatus = "ready" if candidate.ready_for_publish else "staged"
-        candidate = candidate.model_copy(update={"status": status, "error": None})
+    def update(
+        self,
+        item_id: str,
+        patch: KnowledgeItemPatch,
+        *,
+        corpus_dir: Path,
+    ) -> KnowledgeItem:
         with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = self._get_with_connection(connection, item_id)
+            if current.status not in {"staged", "ready", "failed"}:
+                raise ValueError("正在处理或已发布的资料不能修改")
+            values = current.model_dump()
+            for field, value in patch.model_dump(exclude_none=True).items():
+                values[field] = value
+            values["corpus_id"] = current.corpus_id or self._next_corpus_id_with_connection(
+                connection, corpus_dir
+            )
+            values["updated_at"] = datetime.now(UTC)
+            candidate = KnowledgeItem.model_validate(values)
+            status: KnowledgeItemStatus = "ready" if candidate.ready_for_publish else "staged"
+            candidate = candidate.model_copy(update={"status": status, "error": None})
             connection.execute(
                 """UPDATE knowledge_items SET corpus_id=?, title=?, authors_json=?, year=?,
                     official_url=?, storage_class=?, status=?, error=NULL, updated_at=?
@@ -229,7 +235,37 @@ class KnowledgeBaseStore:
         return path
 
     def next_corpus_id(self, corpus_dir: Path) -> str:
-        used = {item.corpus_id for item in self.list() if item.corpus_id}
+        with self._lock, closing(self._connect()) as connection:
+            return self._next_corpus_id_with_connection(connection, corpus_dir)
+
+    @contextmanager
+    def serialize_publish(self) -> Iterator[None]:
+        with self._publish_lock:
+            yield
+
+    def _get_with_connection(
+        self,
+        connection: sqlite3.Connection,
+        item_id: str,
+    ) -> KnowledgeItem:
+        row = connection.execute(
+            "SELECT * FROM knowledge_items WHERE item_id = ?", (item_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError("知识库资料不存在")
+        return _item(row)
+
+    def _next_corpus_id_with_connection(
+        self,
+        connection: sqlite3.Connection,
+        corpus_dir: Path,
+    ) -> str:
+        used = {
+            row["corpus_id"]
+            for row in connection.execute(
+                "SELECT corpus_id FROM knowledge_items WHERE corpus_id IS NOT NULL"
+            ).fetchall()
+        }
         for name in ("core_frozen.jsonl", "challenge_frozen.jsonl"):
             path = corpus_dir / name
             if not path.is_file():
@@ -257,6 +293,10 @@ class KnowledgeBaseStore:
                     storage_class TEXT NOT NULL, error TEXT, build_id TEXT,
                     created_at TEXT NOT NULL, updated_at TEXT NOT NULL
                 )"""
+            )
+            connection.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS knowledge_items_corpus_id_uq
+                ON knowledge_items(corpus_id) WHERE corpus_id IS NOT NULL"""
             )
             connection.commit()
 
@@ -286,46 +326,49 @@ def publish_item(
     from paper_research_agent.retrieval.indexer import build_index
     from paper_research_agent.retrieval.model_adapters import FastEmbedEncoder
 
-    try:
-        item = store.claim_queued_publish(item_id)
-        if not item.ready_for_publish:
-            raise ValueError("资料尚未补齐或不可发布")
-        _freeze_source(store, item, corpus_dir)
-        update = update_current_ingestion_build(corpus_dir, output_root)
-        pointer = output_root / "current_knowledge_base.json"
-        if update.changed or _pointer_build_id(pointer) != update.result.manifest.build_id:
-            chunks_path, _ = run_chunking(
-                update.result.output_dir / "elements.jsonl",
-                update.result.output_dir / "sections.jsonl",
-                chunking_config,
-                output_dir=update.result.output_dir / "chunks",
-            )
-            config = load_retrieval_config(retrieval_config)
-            chunks = [
-                EvidenceChunk.model_validate_json(line)
-                for line in chunks_path.read_text(encoding="utf-8").splitlines()
-                if line.strip()
-            ]
-            build_index(
-                chunks,
-                FastEmbedEncoder(config.embedding_model, revision=config.embedding_revision),
-                update.result.output_dir / "index",
-                embedding_model=config.embedding_model,
-                embedding_revision=config.embedding_revision,
-                chunk_build_sha256=hashlib.sha256(chunks_path.read_bytes()).hexdigest(),
-            )
-            activate_current_knowledge_base(output_root, update.result)
-        published = store.set_status(item_id, "published", build_id=update.result.manifest.build_id)
-        return KnowledgePublishResult(item=published, changed=update.changed)
-    except Exception as error:
+    with store.serialize_publish():
         try:
-            current = store.get(item_id)
-        except KeyError:
-            pass
-        else:
-            if current.status in {"queued", "running"}:
-                store.set_status(item_id, "failed", error=str(error)[:1_000])
-        raise
+            item = store.claim_queued_publish(item_id)
+            if not item.ready_for_publish:
+                raise ValueError("资料尚未补齐或不可发布")
+            _freeze_source(store, item, corpus_dir)
+            update = update_current_ingestion_build(corpus_dir, output_root)
+            pointer = output_root / "current_knowledge_base.json"
+            if update.changed or _pointer_build_id(pointer) != update.result.manifest.build_id:
+                chunks_path, _ = run_chunking(
+                    update.result.output_dir / "elements.jsonl",
+                    update.result.output_dir / "sections.jsonl",
+                    chunking_config,
+                    output_dir=update.result.output_dir / "chunks",
+                )
+                config = load_retrieval_config(retrieval_config)
+                chunks = [
+                    EvidenceChunk.model_validate_json(line)
+                    for line in chunks_path.read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+                build_index(
+                    chunks,
+                    FastEmbedEncoder(config.embedding_model, revision=config.embedding_revision),
+                    update.result.output_dir / "index",
+                    embedding_model=config.embedding_model,
+                    embedding_revision=config.embedding_revision,
+                    chunk_build_sha256=hashlib.sha256(chunks_path.read_bytes()).hexdigest(),
+                )
+                activate_current_knowledge_base(output_root, update.result)
+            published = store.set_status(
+                item_id, "published", build_id=update.result.manifest.build_id
+            )
+            return KnowledgePublishResult(item=published, changed=update.changed)
+        except Exception as error:
+            try:
+                current = store.get(item_id)
+            except KeyError:
+                pass
+            else:
+                if current.status in {"queued", "running"}:
+                    store.set_status(item_id, "failed", error=str(error)[:1_000])
+            raise
 
 
 def _freeze_source(store: KnowledgeBaseStore, item: KnowledgeItem, corpus_dir: Path) -> None:
@@ -334,7 +377,7 @@ def _freeze_source(store: KnowledgeBaseStore, item: KnowledgeItem, corpus_dir: P
     source_dir.mkdir(exist_ok=True)
     target = source_dir / f"{item.corpus_id}.pdf"
     if not target.exists():
-        shutil.copyfile(store.staged_path(item.item_id), target)
+        _copy_verified(store.staged_path(item.item_id), target, item.sha256)
     if hashlib.sha256(target.read_bytes()).hexdigest() != item.sha256:
         raise ValueError("暂存文件哈希与冻结目标不一致")
     record = {
@@ -360,8 +403,52 @@ def _freeze_source(store: KnowledgeBaseStore, item: KnowledgeItem, corpus_dir: P
     existing = manifest.read_text(encoding="utf-8").splitlines() if manifest.is_file() else []
     if any(json.loads(line).get("corpus_id") == item.corpus_id for line in existing if line.strip()):
         return
-    manifest.write_text("\n".join([*existing, json.dumps(record, ensure_ascii=False)]) + "\n", encoding="utf-8")
+    _atomic_write_text(
+        manifest,
+        "\n".join([*existing, json.dumps(record, ensure_ascii=False)]) + "\n",
+    )
     (corpus_dir / "challenge_frozen.jsonl").touch(exist_ok=True)
+
+
+def _copy_verified(source: Path, target: Path, expected_sha256: str) -> None:
+    temporary_path: Path | None = None
+    digest = hashlib.sha256()
+    try:
+        with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as temporary:
+            temporary_path = Path(temporary.name)
+            with source.open("rb") as source_stream:
+                while chunk := source_stream.read(1024 * 1024):
+                    digest.update(chunk)
+                    temporary.write(chunk)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        if digest.hexdigest() != expected_sha256:
+            raise ValueError("暂存文件哈希与冻结目标不一致")
+        os.replace(temporary_path, target)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def _atomic_write_text(target: Path, content: str) -> None:
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=target.parent,
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(content)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, target)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def _corpus_version(corpus_dir: Path) -> str:

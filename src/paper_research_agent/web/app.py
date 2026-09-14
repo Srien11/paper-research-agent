@@ -2061,15 +2061,11 @@ def create_app(
         _session: OwnerSession = Depends(current_session),  # noqa: B008
     ) -> KnowledgeItem:
         try:
-            corpus_id = await asyncio.to_thread(
-                app.state.knowledge_store.next_corpus_id,
-                app.state.knowledge_corpus_dir,
-            )
             return await asyncio.to_thread(
                 app.state.knowledge_store.update,
                 item_id,
                 payload,
-                corpus_id=corpus_id,
+                corpus_dir=app.state.knowledge_corpus_dir,
             )
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from None
