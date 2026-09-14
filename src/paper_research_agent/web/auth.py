@@ -7,10 +7,13 @@ import hashlib
 import hmac
 import json
 import secrets
+import sqlite3
 import threading
 import time
 from collections.abc import Callable
+from contextlib import closing
 from dataclasses import dataclass
+from pathlib import Path
 
 from paper_research_agent.web.config import OwnerCredentials
 
@@ -61,6 +64,48 @@ class OwnerSession:
     expires_at: int
 
 
+class SQLiteSessionRevocationStore:
+    """Persist only revoked session identifiers until their signed expiry."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        with closing(self._connect()) as connection:
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS revoked_web_sessions (
+                    session_id TEXT PRIMARY KEY,
+                    expires_at INTEGER NOT NULL
+                )"""
+            )
+            connection.commit()
+
+    def contains(self, session_id: str, *, now: int) -> bool:
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute(
+                "DELETE FROM revoked_web_sessions WHERE expires_at <= ?", (now,)
+            )
+            row = connection.execute(
+                "SELECT 1 FROM revoked_web_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            connection.commit()
+        return row is not None
+
+    def revoke(self, session_id: str, *, expires_at: int) -> None:
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO revoked_web_sessions(session_id, expires_at) VALUES (?, ?)",
+                (session_id, expires_at),
+            )
+            connection.commit()
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.path)
+        connection.execute("PRAGMA busy_timeout = 5000")
+        return connection
+
+
 class SessionManager:
     """Keep revocable owner sessions in-process and authenticate cookies with HMAC-SHA256."""
 
@@ -70,6 +115,7 @@ class SessionManager:
         ttl_seconds: int,
         *,
         clock: Callable[[], float] = time.time,
+        revocation_store: SQLiteSessionRevocationStore | None = None,
     ):
         if len(secret) < 32:
             raise ValueError("session secret must contain at least 32 bytes")
@@ -78,6 +124,7 @@ class SessionManager:
         self._secret = secret
         self._ttl_seconds = ttl_seconds
         self._clock = clock
+        self._revocation_store = revocation_store
         self._sessions: dict[str, OwnerSession] = {}
         self._revoked: set[str] = set()
         self._lock = threading.Lock()
@@ -121,7 +168,10 @@ class SessionManager:
             self.revoke(token)
             return None
         with self._lock:
-            if session_id in self._revoked:
+            if session_id in self._revoked or (
+                self._revocation_store is not None
+                and self._revocation_store.contains(session_id, now=now)
+            ):
                 return None
             session = self._sessions.get(session_id)
             if session is None:
@@ -177,12 +227,18 @@ class SessionManager:
         try:
             payload = json.loads(_b64decode(token.split(".", 1)[0]))
             session_id = payload.get("sid")
+            expires_at = payload.get("exp")
         except (ValueError, TypeError, json.JSONDecodeError):
             return
-        if isinstance(session_id, str):
+        if isinstance(session_id, str) and isinstance(expires_at, int):
             with self._lock:
                 self._sessions.pop(session_id, None)
                 self._revoked.add(session_id)
+                if self._revocation_store is not None and expires_at > int(self._clock()):
+                    self._revocation_store.revoke(
+                        session_id,
+                        expires_at=expires_at,
+                    )
 
     def _encode(self, session: OwnerSession) -> str:
         payload = json.dumps(

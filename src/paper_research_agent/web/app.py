@@ -47,7 +47,12 @@ from paper_research_agent.conversation.resolver import (
 )
 from paper_research_agent.conversation.service import ConversationCoordinator
 from paper_research_agent.conversation.store import ConversationStore, SQLiteConversationStore
-from paper_research_agent.web.auth import CredentialVerifier, OwnerSession, SessionManager
+from paper_research_agent.web.auth import (
+    CredentialVerifier,
+    OwnerSession,
+    SessionManager,
+    SQLiteSessionRevocationStore,
+)
 from paper_research_agent.web.bootstrap import (
     ApplicationEnvironment,
     ApplicationServices,
@@ -664,7 +669,16 @@ def create_app(
     """Create an isolated app; runtime injection keeps API tests free of local ML loading."""
     settings = config or WebConfig.from_env()
     environment = ApplicationEnvironment.from_environment()
-    sessions = SessionManager(settings.session_secret, settings.session_ttl_seconds)
+    revocation_store = (
+        SQLiteSessionRevocationStore(settings.session_revocation_path)
+        if settings.session_revocation_path is not None
+        else None
+    )
+    sessions = SessionManager(
+        settings.session_secret,
+        settings.session_ttl_seconds,
+        revocation_store=revocation_store,
+    )
     credentials = CredentialVerifier(settings.credentials)
     safe_questions = (
         _load_recommended_questions() if recommended_questions is None else recommended_questions

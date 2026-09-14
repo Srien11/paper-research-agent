@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -435,6 +437,54 @@ class AppTests(unittest.TestCase):
             self.client.get("/paper-research/api/session").json(),
             {"authenticated": False},
         )
+
+    def test_logout_revocation_survives_app_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = WebConfig(
+                credentials=OwnerCredentials(
+                    username="owner",
+                    password="correct-password",
+                ),
+                session_secret=b"r" * 32,
+                allowed_origins=frozenset({ORIGIN}),
+                session_revocation_path=Path(directory) / "revocations.sqlite3",
+            )
+            first_app = create_app(
+                config=config,
+                runtime=FakeRuntime(),
+                serve_static=False,
+                conversation_store=InMemoryConversationStore(),
+            )
+            with TestClient(first_app, base_url=ORIGIN) as first:
+                login = first.post(
+                    "/paper-research/api/login",
+                    headers={"Origin": ORIGIN},
+                    json={
+                        "username": "owner",
+                        "password": "correct-password",
+                    },
+                )
+                self.assertEqual(login.status_code, 200)
+                token = first.cookies.get(config.cookie_name)
+                self.assertIsNotNone(token)
+                logout = first.post(
+                    "/paper-research/api/logout",
+                    headers={"Origin": ORIGIN},
+                )
+                self.assertEqual(logout.status_code, 200)
+
+            second_app = create_app(
+                config=config,
+                runtime=FakeRuntime(),
+                serve_static=False,
+                conversation_store=InMemoryConversationStore(),
+            )
+            with TestClient(second_app, base_url=ORIGIN) as restarted:
+                restarted.cookies.set(config.cookie_name, token)
+                self.assertEqual(
+                    restarted.get("/paper-research/api/session").json(),
+                    {"authenticated": False},
+                )
 
     def test_primary_mode_runs_main_agent_but_rejects_legacy_ask_projection(self) -> None:
         class FakeMainAgent:

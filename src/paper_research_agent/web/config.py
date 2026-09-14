@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import urlsplit
 
 DEFAULT_ALLOWED_ORIGINS = frozenset(
@@ -98,6 +99,7 @@ class WebConfig:
     cookie_name: str = "paper_research_owner"
     cookie_path: str = "/paper-research"
     cookie_secure: bool = True
+    session_revocation_path: Path | None = None
 
     def __post_init__(self) -> None:
         if len(self.session_secret) < 32:
@@ -137,6 +139,16 @@ class WebConfig:
     def from_env(cls, environ: Mapping[str, str] | None = None) -> WebConfig:
         """Load credentials without reading dotenv files or logging secret values."""
         source = os.environ if environ is None else environ
+        project_root = Path(
+            source.get("PRA_PROJECT_ROOT", str(Path(__file__).resolve().parents[3]))
+        ).resolve()
+        revocation_value = source.get(
+            "PRA_WEB_SESSION_REVOCATION_PATH",
+            "data/runtime/web-session-revocations-v1.sqlite3",
+        ).strip()
+        revocation_path = Path(
+            revocation_value or "data/runtime/web-session-revocations-v1.sqlite3"
+        )
         direct_password = source.get("PRA_WEB_PASSWORD")
         username = (
             (source.get("PRA_WEB_USER") or "").strip()
@@ -184,4 +196,9 @@ class WebConfig:
                 maximum=10_000,
             ),
             cookie_secure=cookie_secure,
+            session_revocation_path=(
+                revocation_path
+                if revocation_path.is_absolute()
+                else project_root / revocation_path
+            ).resolve(),
         )

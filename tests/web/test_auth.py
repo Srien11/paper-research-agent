@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import tempfile
 import unittest
+from pathlib import Path
 
-from paper_research_agent.web.auth import CredentialVerifier, SessionManager
+from paper_research_agent.web.auth import (
+    CredentialVerifier,
+    SessionManager,
+    SQLiteSessionRevocationStore,
+)
 from paper_research_agent.web.config import OwnerCredentials, WebConfig
 
 
@@ -18,6 +24,10 @@ class WebConfigTests(unittest.TestCase):
         )
         self.assertEqual(config.credentials.username, "owner")
         self.assertEqual(config.credentials.password, "test-password")
+        self.assertEqual(
+            config.session_revocation_path.name,
+            "web-session-revocations-v1.sqlite3",
+        )
 
     def test_existing_zhimo_pbkdf2_environment(self) -> None:
         config = WebConfig.from_env(
@@ -129,6 +139,37 @@ class SessionManagerTests(unittest.TestCase):
         restarted = SessionManager(b"s" * 32, 300, clock=lambda: self.now)
 
         self.assertEqual(restarted.resolve(token), created)
+
+    def test_revoked_session_stays_revoked_after_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "revocations.sqlite3"
+            first = SessionManager(
+                b"s" * 32,
+                300,
+                clock=lambda: self.now,
+                revocation_store=SQLiteSessionRevocationStore(path),
+            )
+            token, _created = first.create()
+            first.revoke(token)
+
+            restarted = SessionManager(
+                b"s" * 32,
+                300,
+                clock=lambda: self.now,
+                revocation_store=SQLiteSessionRevocationStore(path),
+            )
+
+            self.assertIsNone(restarted.resolve(token))
+
+    def test_expired_persistent_revocation_is_purged(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteSessionRevocationStore(
+                Path(directory) / "revocations.sqlite3"
+            )
+            store.revoke("session-a", expires_at=1_100)
+
+            self.assertTrue(store.contains("session-a", now=1_000))
+            self.assertFalse(store.contains("session-a", now=1_101))
 
     def test_tampered_and_malformed_tokens_are_rejected(self) -> None:
         token, _created = self.manager.create()
