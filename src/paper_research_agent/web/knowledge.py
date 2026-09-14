@@ -18,6 +18,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 KnowledgeItemStatus = Literal["staged", "ready", "queued", "running", "published", "failed"]
+MAX_KNOWLEDGE_PDF_BYTES = 100 * 1024 * 1024
 
 
 class KnowledgeItem(BaseModel):
@@ -27,7 +28,7 @@ class KnowledgeItem(BaseModel):
 
     item_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     filename: str = Field(min_length=1, max_length=180)
-    size_bytes: int = Field(gt=0, le=100 * 1024 * 1024)
+    size_bytes: int = Field(gt=0, le=MAX_KNOWLEDGE_PDF_BYTES)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     status: KnowledgeItemStatus
     corpus_id: str | None = Field(default=None, pattern=r"^[CT]\d{3}$")
@@ -84,7 +85,7 @@ class KnowledgeBaseStore:
                 if not chunk:
                     continue
                 size += len(chunk)
-                if size > 100 * 1024 * 1024:
+                if size > MAX_KNOWLEDGE_PDF_BYTES:
                     target.unlink(missing_ok=True)
                     raise ValueError("知识库 PDF 超过 100 MiB 限制")
                 digest.update(chunk)

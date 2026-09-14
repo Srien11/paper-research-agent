@@ -306,7 +306,7 @@ class DeploymentAssetContractTests(unittest.TestCase):
             "ProtectHome=true",
             "UMask=0077",
             "FASTEMBED_CACHE_PATH=/srv/paper-research-agent/model-cache",
-            "ReadWritePaths=/srv/paper-research-agent/shared/runtime /srv/paper-research-agent/model-cache",
+            "ReadWritePaths=/srv/paper-research-agent/shared/runtime /srv/paper-research-agent/shared/corpus /srv/paper-research-agent/shared/knowledge /srv/paper-research-agent/model-cache",
         ):
             self.assertIn(directive, service)
 
@@ -322,6 +322,12 @@ class DeploymentAssetContractTests(unittest.TestCase):
         self.assertIn("127.0.0.1:8092", locations)
         self.assertIn("client_max_body_size 16k", locations)
         self.assertIn("client_max_body_size 10m", locations)
+        self.assertIn(
+            "location = /paper-research/api/knowledge-base/items",
+            locations,
+        )
+        self.assertIn("client_max_body_size 100m", locations)
+        self.assertIn("proxy_request_buffering off", locations)
         self.assertIn("location = /paper-research/api/files", locations)
         self.assertIn("limit_req zone=paper_research_ask", locations)
         self.assertNotIn("limit_req_zone", locations)

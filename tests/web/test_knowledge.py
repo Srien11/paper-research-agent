@@ -6,12 +6,25 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from paper_research_agent.web.app import _spool_bounded_request
 from paper_research_agent.web.interventions import InterventionStore
 from paper_research_agent.web.knowledge import (
     KnowledgeBaseStore,
     KnowledgeItemPatch,
     publish_item,
 )
+
+
+class _ChunkedRequest:
+    def __init__(self, *, headers: dict[str, str], chunks: tuple[bytes, ...]):
+        self.headers = headers
+        self.chunks = chunks
+        self.stream_started = False
+
+    async def stream(self):
+        self.stream_started = True
+        for chunk in self.chunks:
+            yield chunk
 
 
 class KnowledgeBaseStoreTests(unittest.TestCase):
@@ -112,6 +125,37 @@ class KnowledgeBaseStoreTests(unittest.TestCase):
             self.assertEqual(store.list(request_id="r" * 16, conversation_id="c2"), ())
             paused = store.transition(queued.intervention_id, "awaiting_confirmation")
             self.assertEqual(paused.status, "awaiting_confirmation")
+
+
+class KnowledgeUploadBoundaryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_spool_rejects_chunked_overflow_and_closes_temporary_file(
+        self,
+    ) -> None:
+        request = _ChunkedRequest(headers={}, chunks=(b"123", b"456"))
+
+        with self.assertRaisesRegex(ValueError, "100 MiB"):
+            async with _spool_bounded_request(request, max_bytes=5):
+                pass
+
+        self.assertTrue(request.stream_started)
+
+    async def test_declared_overflow_is_rejected_before_streaming(self) -> None:
+        request = _ChunkedRequest(
+            headers={"content-length": "6"},
+            chunks=(b"123456",),
+        )
+
+        with self.assertRaisesRegex(ValueError, "100 MiB"):
+            async with _spool_bounded_request(request, max_bytes=5):
+                pass
+
+        self.assertFalse(request.stream_started)
+
+    async def test_small_request_is_spooled_and_rewound(self) -> None:
+        request = _ChunkedRequest(headers={}, chunks=(b"123", b"456"))
+
+        async with _spool_bounded_request(request, max_bytes=6) as spool:
+            self.assertEqual(spool.read(), b"123456")
 
 
 if __name__ == "__main__":

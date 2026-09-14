@@ -53,7 +53,7 @@ RestrictSUIDSGID=true
 LockPersonality=true
 RemoveIPC=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-ReadWritePaths=/srv/paper-research-agent/shared/runtime /srv/paper-research-agent/model-cache
+ReadWritePaths=/srv/paper-research-agent/shared/runtime /srv/paper-research-agent/shared/corpus /srv/paper-research-agent/shared/knowledge /srv/paper-research-agent/model-cache
 
 [Install]
 WantedBy=multi-user.target

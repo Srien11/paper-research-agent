@@ -7,10 +7,11 @@ import inspect
 import json
 import os
 import re
+import tempfile
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import IO, Any, Protocol, cast
 from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
@@ -62,6 +63,7 @@ from paper_research_agent.web.events import AgentEventProjector
 from paper_research_agent.web.files import AttachmentStore
 from paper_research_agent.web.interventions import InterventionStore, RunIntervention
 from paper_research_agent.web.knowledge import (
+    MAX_KNOWLEDGE_PDF_BYTES,
     KnowledgeBaseStore,
     KnowledgeItem,
     publish_item,
@@ -616,6 +618,34 @@ def _main_agent_runtime_error(error: Exception, *, approval: bool = False) -> HT
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         detail="主 Agent 服务暂时不可用",
     )
+
+
+@asynccontextmanager
+async def _spool_bounded_request(
+    request: Request,
+    *,
+    max_bytes: int,
+) -> AsyncIterator[IO[bytes]]:
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            declared_size = int(declared)
+        except ValueError as error:
+            raise ValueError("Content-Length 无效") from error
+        if declared_size < 0:
+            raise ValueError("Content-Length 无效")
+        if declared_size > max_bytes:
+            raise ValueError("知识库 PDF 超过 100 MiB 限制")
+    size = 0
+    with tempfile.SpooledTemporaryFile(max_size=1024 * 1024, mode="w+b") as spool:
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > max_bytes:
+                raise ValueError("知识库 PDF 超过 100 MiB 限制")
+            if chunk:
+                spool.write(chunk)
+        spool.seek(0)
+        yield spool
 
 
 def create_app(
@@ -1988,12 +2018,15 @@ def create_app(
         _session: OwnerSession = Depends(current_session),  # noqa: B008
     ) -> KnowledgeItem:
         try:
-            chunks = [chunk async for chunk in request.stream()]
-            return await asyncio.to_thread(
-                app.state.knowledge_store.stage,
-                filename=filename,
-                chunks=chunks,
-            )
+            async with _spool_bounded_request(
+                request,
+                max_bytes=MAX_KNOWLEDGE_PDF_BYTES,
+            ) as spool:
+                return await asyncio.to_thread(
+                    app.state.knowledge_store.stage,
+                    filename=filename,
+                    chunks=iter(lambda: spool.read(1024 * 1024), b""),
+                )
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from None
 
