@@ -12,6 +12,7 @@ from paper_research_agent.agent.orchestrator.models import (
 )
 
 PlanningRoute = Literal["fast_path", "full_planner"]
+RAGMode = Literal["disabled", "preferred", "required"]
 PlanningRouteReason = Literal[
     "clear_single_local_rag",
     "feature_disabled",
@@ -31,7 +32,18 @@ class PlanningRouteDecision(FrozenModel):
 class SourceRequirements(FrozenModel):
     local_required: bool
     external_required: bool
+    local_forbidden: bool = False
+    external_forbidden: bool = False
     reason_codes: tuple[str, ...] = ()
+
+
+class SourcePolicyConflictError(ValueError):
+    """An explicit RAG mode contradicts an explicit source request."""
+
+    def __init__(self, reason_code: str, public_message: str) -> None:
+        super().__init__(public_message)
+        self.reason_code = reason_code
+        self.public_message = public_message
 
 
 _LOCAL_CORPUS_ID = re.compile(r"(?<![A-Za-z0-9])[CT]\d{3}(?!\d)", re.IGNORECASE)
@@ -58,13 +70,35 @@ _EXTERNAL_OR_DYNAMIC = re.compile(
     re.IGNORECASE,
 )
 _EXPLICIT_EXTERNAL_SOURCE = re.compile(
-    r"(?:联网|网络|网上|外部资料|外部来源|官网|实时|最新|"
-    r"\bweb\b|\bonline\b)",
+    r"(?:联网|网上|在线)(?:搜索|查询|查找|检索|研究|核验|确认)?|"
+    r"外部(?:学术)?(?:搜索|查询|检索|研究|核验|资料|来源)|"
+    r"(?:搜索|查询|查找|检索|核验|确认|参考|使用).{0,8}(?:网络|外部资料|外部来源|官网)|"
+    r"(?:外部资料|外部来源|网络资料|网络来源|官网).{0,8}"
+    r"(?:搜索|查询|查找|检索|核验|确认|资料|信息)|"
+    r"\b(?:web|online)\s+(?:search|research|sources?)\b",
     re.IGNORECASE,
 )
 _EXPLICIT_LOCAL_SOURCE = re.compile(
-    r"(?:本地论文|本地语料|知识库|论文库|私有论文|"
-    r"(?<![A-Za-z0-9])[CT]\d{3}(?!\d))",
+    r"(?<![A-Za-z0-9])[CT]\d{3}(?!\d)|"
+    r"(?:使用|用|参考|查询|检索|搜索|根据|基于|结合|调用|来自|从).{0,8}"
+    r"(?:本地论文|本地语料|知识库|论文库|私有论文)|"
+    r"(?:本地论文|本地语料|知识库|论文库|私有论文).{0,8}"
+    r"(?:回答|查找|查询|检索|搜索|证据|资料|内容|论文|中)",
+    re.IGNORECASE,
+)
+_LOCAL_SOURCE_FORBIDDEN = re.compile(
+    r"(?:(?:不要|别)(?:再)?(?:使用|检索|参考|查询)?|不使用|不用|无需(?:使用)?|"
+    r"禁止(?:使用)?|避免(?:使用)?)\s*(?:本地论文|本地语料|知识库|论文库|私有论文|"
+    r"(?<![A-Za-z0-9])[CT]\d{3}(?!\d))|"
+    r"(?:do\s+not|don't|without|avoid)\s+(?:using\s+)?(?:the\s+)?"
+    r"(?:local\s+(?:papers?|corpus)|knowledge\s+base)",
+    re.IGNORECASE,
+)
+_EXTERNAL_SOURCE_FORBIDDEN = re.compile(
+    r"(?:(?:不要|别)(?:再)?(?:使用|搜索|查询|检索)?|不使用|不用|无需(?:使用)?|"
+    r"禁止(?:使用)?|避免(?:使用)?)\s*(?:联网|网络|网上|外部资料|外部来源|官网)|"
+    r"(?:do\s+not|don't|without|avoid)\s+(?:using\s+)?(?:the\s+)?"
+    r"(?:web|internet|online|external\s+sources?)",
     re.IGNORECASE,
 )
 _MULTI_TASK = re.compile(
@@ -100,7 +134,8 @@ def classify_planning_route(
         return _full("complex_or_ambiguous")
     if len(message) > 1000:
         return _full("contract_bounds_exceeded")
-    if infer_source_requirements(message).external_required:
+    requirements = infer_source_requirements(message)
+    if requirements.external_required or requirements.local_forbidden:
         return _full("complex_or_ambiguous")
     if (
         _FILE_OR_CONTROL.search(message)
@@ -139,18 +174,51 @@ def classify_planning_route(
 def infer_source_requirements(message: str) -> SourceRequirements:
     """Identify explicit local and external evidence requirements without planning tasks."""
     normalized = " ".join(message.split())
-    local_required = _EXPLICIT_LOCAL_SOURCE.search(normalized) is not None
-    external_required = _EXPLICIT_EXTERNAL_SOURCE.search(normalized) is not None
+    local_forbidden = _LOCAL_SOURCE_FORBIDDEN.search(normalized) is not None
+    external_forbidden = _EXTERNAL_SOURCE_FORBIDDEN.search(normalized) is not None
+    local_required = (
+        _EXPLICIT_LOCAL_SOURCE.search(normalized) is not None and not local_forbidden
+    )
+    external_required = (
+        _EXPLICIT_EXTERNAL_SOURCE.search(normalized) is not None and not external_forbidden
+    )
     reasons: list[str] = []
     if local_required:
         reasons.append("explicit_local_source")
     if external_required:
         reasons.append("explicit_external_source")
+    if local_forbidden:
+        reasons.append("explicit_local_source_forbidden")
+    if external_forbidden:
+        reasons.append("explicit_external_source_forbidden")
     return SourceRequirements(
         local_required=local_required,
         external_required=external_required,
+        local_forbidden=local_forbidden,
+        external_forbidden=external_forbidden,
         reason_codes=tuple(reasons),
     )
+
+
+def validate_source_policy(message: str, rag_mode: RAGMode) -> SourceRequirements:
+    """Reject language that contradicts an explicit hard RAG mode."""
+    requirements = infer_source_requirements(message)
+    if rag_mode == "disabled" and requirements.local_required:
+        raise SourcePolicyConflictError(
+            "rag_disabled_local_requested",
+            "当前已关闭本地论文库，但问题明确要求使用知识库；请开启“使用本地论文知识库”后重试。",
+        )
+    if rag_mode == "required" and requirements.local_forbidden:
+        raise SourcePolicyConflictError(
+            "rag_required_local_forbidden",
+            "当前为“仅依据本地论文回答”，但问题明确要求不使用知识库；请关闭该选项后重试。",
+        )
+    if rag_mode == "required" and requirements.external_required:
+        raise SourcePolicyConflictError(
+            "rag_required_external_requested",
+            "当前为“仅依据本地论文回答”，但问题明确要求联网或外部资料；请关闭该选项后重试。",
+        )
+    return requirements
 
 
 def _full(reason_code: PlanningRouteReason) -> PlanningRouteDecision:

@@ -8,6 +8,9 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from paper_research_agent.agent.intent import requires_research_planning
+from paper_research_agent.agent.orchestrator.planning_route import (
+    validate_source_policy,
+)
 
 RouteKind = Literal[
     "normal_chat",
@@ -55,6 +58,7 @@ class CapabilityPlan(BaseModel):
     reason: str = Field(min_length=1, max_length=160)
 
     def enforce(self, context: RouteContext) -> CapabilityPlan:
+        requirements = validate_source_policy(context.question, context.rag_mode)
         route = self.route
         local = self.use_local_papers
         web = self.use_web_research
@@ -96,13 +100,24 @@ class CapabilityPlan(BaseModel):
                 dynamic = False
                 research_mode = "single"
                 reason = "纯寒暄无需调用研究能力"
-            else:
-                # Preferred is a hybrid evidence policy: local retrieval is mandatory,
-                # but its evidence does not become the exclusive answer boundary.
-                local = True
+            elif requirements.local_forbidden:
+                local = False
                 if route == "local_rag":
+                    route = "web_research" if web or dynamic else "normal_chat"
+                reason = "用户明确要求不使用本地论文库"
+            else:
+                if requirements.local_required or requirements.external_required:
+                    local = True
+                if route == "local_rag" and local:
                     route = "normal_chat"
                     reason = "参考本地论文并结合通用能力回答"
+
+        if requirements.external_forbidden:
+            web = False
+            dynamic = False
+            if route == "web_research":
+                route = "normal_chat"
+            reason = "用户明确要求不使用联网或外部来源"
 
         # The current Web research lane is implemented by the bounded dynamic-tool graph.
         if web:
@@ -159,6 +174,7 @@ ROUTE_LABELS: dict[RouteKind, str] = {
 
 def enforce_route_policy(decision: RouteDecision, context: RouteContext) -> RouteDecision:
     """Constrain model output to capabilities and explicit user restrictions."""
+    requirements = validate_source_policy(context.question, context.rag_mode)
     route = decision.route
     reason = decision.reason
     research_mode = decision.research_mode
@@ -180,6 +196,29 @@ def enforce_route_policy(decision: RouteDecision, context: RouteContext) -> Rout
     if context.rag_mode == "disabled" and route == "local_rag":
         route = "normal_chat"
         reason = "用户已关闭本地论文库，策略层禁止本地检索"
+
+    if context.rag_mode == "preferred" and requirements.local_forbidden and route == "local_rag":
+        route = "normal_chat"
+        reason = "用户明确要求不使用本地论文库"
+
+    if requirements.external_forbidden and route == "web_research":
+        route = (
+            "local_rag"
+            if context.rag_mode != "disabled"
+            and context.rag_available
+            and requirements.local_required
+            else "normal_chat"
+        )
+        reason = "用户明确要求不使用联网或外部来源"
+
+    if (
+        context.rag_mode == "preferred"
+        and requirements.local_required
+        and context.rag_available
+        and route == "normal_chat"
+    ):
+        route = "local_rag"
+        reason = "用户明确要求使用本地论文库"
 
     if (
         context.rag_mode == "preferred"

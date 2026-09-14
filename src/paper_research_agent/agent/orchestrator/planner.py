@@ -24,7 +24,7 @@ from paper_research_agent.agent.orchestrator.models import (
     TurnInterpretationV2,
 )
 from paper_research_agent.agent.orchestrator.planning_route import (
-    infer_source_requirements,
+    validate_source_policy,
 )
 from paper_research_agent.agent.orchestrator.prompts import (
     GOAL_RECONCILER_PROMPT_VERSION,
@@ -441,8 +441,10 @@ def enforce_capability_plan(
         )
         if part
     )
-    requirements = infer_source_requirements(source_text)
+    requirements = validate_source_policy(source_text, envelope.rag_mode)
     if not requirements.external_required:
+        return tasks
+    if envelope.rag_mode == "preferred" and requirements.local_forbidden:
         return tasks
 
     active = tuple(task for task in tasks if task.status != "completed")

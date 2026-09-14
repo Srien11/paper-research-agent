@@ -15,6 +15,7 @@ from paper_research_agent.agent.orchestrator.models import (
     ConversationWorkspace,
     FrozenModel,
 )
+from paper_research_agent.agent.orchestrator.planning_route import validate_source_policy
 
 
 class TaskSelection(FrozenModel):
@@ -75,6 +76,18 @@ def route_task(
     """Enforce RAG-mode and attachment policy on a single task; pure function."""
     capability = task.capability
     rag_mode = envelope.rag_mode
+    goal = envelope.workspace.active_goal
+    requirements = validate_source_policy(
+        "\n".join(
+            part
+            for part in (
+                envelope.current_message,
+                goal.objective if goal is not None else "",
+            )
+            if part
+        ),
+        rag_mode,
+    )
     if capability == "attachment_qa":
         if not envelope.attachment_ids:
             return RouteDecision(capability="direct_chat", reason="没有附件可供分析")
@@ -84,13 +97,40 @@ def route_task(
             return RouteDecision(capability="direct_chat", reason="没有附件可供修改")
         return RouteDecision(capability="file_edit", reason="任务需要修改附件并产出文件")
     if capability == "local_rag":
+        if requirements.local_forbidden:
+            alternative: Capability = (
+                "dynamic_tools" if requirements.external_required else "direct_chat"
+            )
+            return RouteDecision(
+                capability=alternative,
+                reason="用户明确要求不使用本地论文库",
+            )
         if rag_mode == "disabled":
             return RouteDecision(capability="direct_chat", reason="本地检索已禁用")
         return RouteDecision(capability="local_rag", reason="任务需要本地论文证据")
     if capability == "dynamic_tools":
+        if requirements.external_forbidden:
+            alternative = (
+                "local_rag"
+                if rag_mode != "disabled" and not requirements.local_forbidden
+                else "direct_chat"
+            )
+            return RouteDecision(
+                capability=alternative,
+                reason="用户明确要求不使用联网或外部来源",
+            )
         if rag_mode == "required":
             return RouteDecision(capability="local_rag", reason="required 模式禁止外部动态研究")
         corpus_ids = {item.upper() for item in _LOCAL_CORPUS_ID.findall(task.objective)}
+        if (
+            rag_mode != "disabled"
+            and requirements.local_required
+            and not requirements.external_required
+        ):
+            return RouteDecision(
+                capability="local_rag",
+                reason="用户明确要求使用本地论文库",
+            )
         if (
             rag_mode != "disabled"
             and len(corpus_ids) >= 2
@@ -105,5 +145,14 @@ def route_task(
         return RouteDecision(
             capability="local_rag",
             reason="required 模式必须使用本地论文证据",
+        )
+    if (
+        capability == "direct_chat"
+        and rag_mode == "preferred"
+        and requirements.local_required
+    ):
+        return RouteDecision(
+            capability="local_rag",
+            reason="用户明确要求使用本地论文库",
         )
     return RouteDecision(capability="direct_chat", reason="任务不需要外部事实")

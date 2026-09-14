@@ -12,8 +12,10 @@ from paper_research_agent.agent.orchestrator.models import (
 )
 from paper_research_agent.agent.orchestrator.planning_route import (
     PlanningRouteDecision,
+    SourcePolicyConflictError,
     classify_planning_route,
     infer_source_requirements,
+    validate_source_policy,
 )
 
 
@@ -153,6 +155,64 @@ class PlanningRouteTests(unittest.TestCase):
                 decision = classify_planning_route(_envelope(message), enabled=True)
                 self.assertTrue(requirements.external_required)
                 self.assertEqual(decision.route, "full_planner")
+
+    def test_source_negation_is_not_treated_as_positive_requirement(self) -> None:
+        requirements = infer_source_requirements("不要使用知识库，只联网查询最新资料")
+
+        self.assertTrue(requirements.local_forbidden)
+        self.assertFalse(requirements.local_required)
+        self.assertTrue(requirements.external_required)
+
+    def test_hard_rag_modes_reject_conflicting_language(self) -> None:
+        cases = (
+            ("disabled", "请使用本地知识库回答", "rag_disabled_local_requested"),
+            ("required", "请联网查询最新资料", "rag_required_external_requested"),
+            ("required", "不要使用知识库", "rag_required_local_forbidden"),
+        )
+
+        for rag_mode, message, reason_code in cases:
+            with self.subTest(rag_mode=rag_mode, message=message):
+                with self.assertRaises(SourcePolicyConflictError) as captured:
+                    validate_source_policy(message, rag_mode)  # type: ignore[arg-type]
+                self.assertEqual(captured.exception.reason_code, reason_code)
+
+    def test_preferred_mode_accepts_language_level_local_opt_out(self) -> None:
+        validate_source_policy("不要使用知识库，只联网查询", "preferred")
+
+        decision = classify_planning_route(
+            _envelope("不要使用知识库，只联网查询", rag_mode="preferred"),
+            enabled=True,
+        )
+
+        self.assertEqual(decision.route, "full_planner")
+
+    def test_latest_local_paper_does_not_imply_external_source(self) -> None:
+        requirements = validate_source_policy(
+            "总结知识库中最新上传的论文",
+            "required",
+        )
+
+        self.assertTrue(requirements.local_required)
+        self.assertFalse(requirements.external_required)
+
+    def test_source_terms_used_as_topics_do_not_trigger_source_policy(self) -> None:
+        local_topic = validate_source_policy(
+            "知识库和向量数据库有什么区别",
+            "disabled",
+        )
+        network_topic = validate_source_policy(
+            "解释神经网络架构",
+            "required",
+        )
+
+        self.assertFalse(local_topic.local_required)
+        self.assertFalse(network_topic.external_required)
+
+    def test_explicit_external_scholarly_retrieval_is_detected(self) -> None:
+        requirements = infer_source_requirements("结合本地论文和外部学术检索回答")
+
+        self.assertTrue(requirements.local_required)
+        self.assertTrue(requirements.external_required)
 
 
 if __name__ == "__main__":

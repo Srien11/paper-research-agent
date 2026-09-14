@@ -595,6 +595,19 @@ class MainAgentEndToEndTests(unittest.TestCase):
         self.assertEqual(self.runtime.requests[-2].rag_mode, "required")
         self.assertEqual(self.runtime.requests[-1].rag_mode, "disabled")
 
+    def test_conflicting_rag_mode_returns_actionable_422_before_runtime(self) -> None:
+        previous_calls = len(self.runtime.requests)
+
+        response = self._run(
+            "req_e2e_policy_conflict1",
+            "请使用本地知识库回答",
+            rag_mode="disabled",
+        )
+
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("请开启", response.json()["detail"])
+        self.assertEqual(len(self.runtime.requests), previous_calls)
+
     def test_failed_commit_has_error_done_and_unchanged_workspace_version(self) -> None:
         response = self._run("req_e2e_rejected0000001", "commit-rejected")
         events = _events(response)

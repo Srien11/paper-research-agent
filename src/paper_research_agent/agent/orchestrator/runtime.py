@@ -36,6 +36,7 @@ from paper_research_agent.agent.orchestrator.models import (
     MainAgentResumeRequest,
     RunStatus,
 )
+from paper_research_agent.agent.orchestrator.planning_route import validate_source_policy
 from paper_research_agent.conversation.store import ConversationStore
 from paper_research_agent.web.events import (
     AgentStreamEvent,
@@ -128,6 +129,7 @@ class MainAgentRuntime:
         return self._run_event_publisher
 
     async def run(self, request: MainAgentRequest) -> MainAgentResult:
+        validate_source_policy(request.message, request.rag_mode)
         async with self._guard:
             if self._closed:
                 raise RuntimeError("main agent runtime is closed")

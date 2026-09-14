@@ -62,7 +62,7 @@ class RoutePolicyTests(unittest.TestCase):
         self.assertFalse(resolved.use_web_research)
         self.assertFalse(resolved.use_dynamic_tools)
 
-    def test_preferred_mode_keeps_chat_route_but_requires_local_reference(self) -> None:
+    def test_preferred_mode_keeps_simple_chat_without_forcing_local_reference(self) -> None:
         resolved = CapabilityPlan(
             route="normal_chat",
             reason="模型判断为普通交流",
@@ -75,7 +75,7 @@ class RoutePolicyTests(unittest.TestCase):
             )
         )
 
-        self.assertTrue(resolved.use_local_papers)
+        self.assertFalse(resolved.use_local_papers)
         self.assertEqual(resolved.route, "normal_chat")
 
     def test_preferred_mode_rejects_retrieval_for_pure_greeting_even_if_model_selects_it(
@@ -117,7 +117,7 @@ class RoutePolicyTests(unittest.TestCase):
         self.assertTrue(resolved.use_local_papers)
         self.assertEqual(resolved.route, "normal_chat")
 
-    def test_web_research_uses_dynamic_graph_and_local_papers_when_enabled(self) -> None:
+    def test_preferred_web_research_does_not_force_unselected_local_papers(self) -> None:
         resolved = CapabilityPlan(
             route="web_research",
             use_web_research=True,
@@ -132,9 +132,30 @@ class RoutePolicyTests(unittest.TestCase):
             )
         )
 
-        self.assertTrue(resolved.use_local_papers)
+        self.assertFalse(resolved.use_local_papers)
         self.assertTrue(resolved.use_web_research)
         self.assertTrue(resolved.use_dynamic_tools)
+
+    def test_preferred_local_opt_out_keeps_external_research_only(self) -> None:
+        resolved = CapabilityPlan(
+            route="web_research",
+            use_local_papers=True,
+            use_web_research=True,
+            use_dynamic_tools=True,
+            reason="模型建议组合研究",
+        ).enforce(
+            RouteContext(
+                has_attachments=False,
+                rag_mode="preferred",
+                rag_available=True,
+                web_available=True,
+                question="不要使用知识库，只联网查询最新资料",
+            )
+        )
+
+        self.assertFalse(resolved.use_local_papers)
+        self.assertTrue(resolved.use_dynamic_tools)
+        self.assertEqual(resolved.route, "web_research")
 
     def test_attachment_cannot_be_routed_to_web_or_chat(self) -> None:
         decision = enforce_route_policy(

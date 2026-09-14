@@ -34,6 +34,10 @@ from paper_research_agent.agent.orchestrator.models import (
     MainAgentResult,
     MainAgentResumeRequest,
 )
+from paper_research_agent.agent.orchestrator.planning_route import (
+    SourcePolicyConflictError,
+    validate_source_policy,
+)
 from paper_research_agent.agent.orchestrator.runtime import (
     MainAgentCapacityError,
     MainAgentRuntime,
@@ -232,6 +236,11 @@ async def _maybe_await(value: Any) -> Any:
 
 def _runtime_error_response(error: Exception) -> HTTPException:
     """Map runtime boundaries without returning provider or filesystem details."""
+    if isinstance(error, SourcePolicyConflictError):
+        return HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=error.public_message,
+        )
     name = type(error).__name__
     if name == "RuntimeBusyError":
         return HTTPException(status_code=status.HTTP_409_CONFLICT, detail="系统正在处理上一条问题")
@@ -311,6 +320,7 @@ async def _prepare_turn(
     has_attachments: bool,
     rag_mode: str,
 ) -> tuple[ConversationTurn, ConversationResolution, CapabilityPlan]:
+    validate_source_policy(question, cast(Any, rag_mode))
     context = RouteContext(
         has_attachments=has_attachments,
         rag_mode=cast(Any, rag_mode),
@@ -607,6 +617,11 @@ def _validated_request_id(value: str) -> str:
 
 
 def _main_agent_runtime_error(error: Exception, *, approval: bool = False) -> HTTPException:
+    if isinstance(error, SourcePolicyConflictError):
+        return HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=error.public_message,
+        )
     if isinstance(error, MainAgentCapacityError):
         return HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -632,6 +647,16 @@ def _main_agent_runtime_error(error: Exception, *, approval: bool = False) -> HT
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         detail="主 Agent 服务暂时不可用",
     )
+
+
+def _validate_source_policy_request(message: str, rag_mode: str) -> None:
+    try:
+        validate_source_policy(message, cast(Any, rag_mode))
+    except SourcePolicyConflictError as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=error.public_message,
+        ) from None
 
 
 @asynccontextmanager
@@ -940,6 +965,7 @@ def create_app(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="问题长度超过限制",
             )
+        _validate_source_policy_request(payload.message, payload.rag_mode)
         try:
             request.app.state.attachments.validate_ownership(
                 session.conversation_id, payload.attachment_ids
@@ -1549,6 +1575,10 @@ def create_app(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="问题长度超过限制",
             )
+        _validate_source_policy_request(
+            payload.question,
+            payload.rag_mode if app.state.main_agent_mode == "primary" else "required",
+        )
         if app.state.main_agent_mode == "primary":
             await run_compat_main_agent(payload, session, endpoint="ask")
             try:
@@ -1622,6 +1652,10 @@ def create_app(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="问题长度超过限制",
             )
+        _validate_source_policy_request(
+            payload.question,
+            payload.rag_mode if app.state.main_agent_mode == "primary" else "disabled",
+        )
         if app.state.main_agent_mode == "primary":
             result = await run_compat_main_agent(
                 payload, session, endpoint="tools_run"
@@ -1695,6 +1729,7 @@ def create_app(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="问题长度超过限制",
             )
+        _validate_source_policy_request(payload.question, payload.rag_mode)
         if app.state.main_agent_mode == "primary":
             result = await run_compat_main_agent(
                 payload, session, endpoint="chat_stream"

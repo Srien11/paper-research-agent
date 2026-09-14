@@ -10,6 +10,7 @@ from paper_research_agent.agent.orchestrator.models import (
     GoalState,
     TaskPlan,
 )
+from paper_research_agent.agent.orchestrator.planning_route import SourcePolicyConflictError
 from paper_research_agent.agent.orchestrator.router import (
     CAPABILITIES,
     RouteDecision,
@@ -244,6 +245,39 @@ class RouteTaskTests(unittest.TestCase):
 
         self.assertEqual(decision.capability, "local_rag")
         self.assertIn("required", decision.reason)
+
+    def test_preferred_local_opt_out_blocks_planned_local_rag(self) -> None:
+        decision = route_task(
+            _task(capability="local_rag"),
+            _envelope(current_message="不要使用知识库，只联网查询最新资料"),
+        )
+
+        self.assertEqual(decision.capability, "dynamic_tools")
+
+    def test_preferred_external_opt_out_blocks_planned_dynamic_tools(self) -> None:
+        decision = route_task(
+            _task(capability="dynamic_tools"),
+            _envelope(current_message="不要联网，只参考知识库 C001"),
+        )
+
+        self.assertEqual(decision.capability, "local_rag")
+
+    def test_resumed_task_rechecks_source_conflict_from_active_goal(self) -> None:
+        workspace = _workspace(
+            active_goal=_goal().model_copy(
+                update={"objective": "联网查询最新论文状态"}
+            )
+        )
+
+        with self.assertRaises(SourcePolicyConflictError):
+            route_task(
+                _task(capability="dynamic_tools"),
+                _envelope(
+                    current_message="继续",
+                    rag_mode="required",
+                    workspace=workspace,
+                ),
+            )
 
     def test_single_task_single_capability(self) -> None:
         task = _task(task_id="one", capability="direct_chat")

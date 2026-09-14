@@ -16,6 +16,7 @@ from paper_research_agent.agent.orchestrator.models import (
     MainAgentResult,
     TaskPlan,
 )
+from paper_research_agent.agent.orchestrator.planning_route import SourcePolicyConflictError
 from paper_research_agent.agent.orchestrator.runtime import (
     MainAgentCapacityError,
     MainAgentRuntime,
@@ -83,6 +84,23 @@ class _RecordingSink:
 
 
 class MainAgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_conflicting_source_policy_is_rejected_before_run_creation(self) -> None:
+        graph = _FakeGraph()
+        store = InMemoryConversationStore()
+        runtime = MainAgentRuntime(graph=graph, repository=store)
+        request = MainAgentRequest(
+            request_id="request-policy-conflict",
+            conversation_id="conversation-policy-conflict",
+            message="请使用本地知识库回答",
+            rag_mode="disabled",
+        )
+
+        with self.assertRaises(SourcePolicyConflictError):
+            await runtime.run(request)
+
+        self.assertEqual(graph.calls, 0)
+        self.assertIsNone(store.load_agent_run(request.request_id))
+
     async def test_global_capacity_rejects_new_run_but_reuses_same_request(
         self,
     ) -> None:

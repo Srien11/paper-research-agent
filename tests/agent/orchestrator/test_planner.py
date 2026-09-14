@@ -378,6 +378,33 @@ class TaskPlannerTests(unittest.TestCase):
             ("local_rag", "dynamic_tools"),
         )
 
+    def test_preferred_local_opt_out_keeps_external_task_only(self) -> None:
+        fake = _FakeModel(
+            [
+                {
+                    "tasks": (
+                        {
+                            "task_id": "external",
+                            "title": "外部学术核验",
+                            "objective": "查最新论文状态",
+                            "success_criteria": ("得到外部结果",),
+                            "capability": "dynamic_tools",
+                        },
+                    )
+                }
+            ]
+        )
+        decision = self._plan_via(
+            TaskPlanner(model=fake),
+            _envelope(current_message="不要使用知识库，只联网核验最新论文状态"),
+            _goal_decision(),
+        )
+
+        self.assertEqual(
+            tuple(task.capability for task in decision.plan.tasks),
+            ("dynamic_tools",),
+        )
+
     def test_mixed_research_model_failure_uses_parallel_fallback(self) -> None:
         decision = self._plan_via(
             TaskPlanner(model=_FakeModel([RuntimeError("down")])),
