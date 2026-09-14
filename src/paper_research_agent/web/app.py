@@ -48,9 +48,9 @@ from paper_research_agent.conversation.service import ConversationCoordinator
 from paper_research_agent.conversation.store import ConversationStore, SQLiteConversationStore
 from paper_research_agent.web.auth import CredentialVerifier, OwnerSession, SessionManager
 from paper_research_agent.web.bootstrap import (
+    ApplicationEnvironment,
     ApplicationServices,
-    create_application_services_from_environment,
-    main_agent_mode_from_environment,
+    create_application_services,
 )
 from paper_research_agent.web.chat_runtime import RouteOutputError
 from paper_research_agent.web.compat import (
@@ -633,6 +633,7 @@ def create_app(
 ) -> FastAPI:
     """Create an isolated app; runtime injection keeps API tests free of local ML loading."""
     settings = config or WebConfig.from_env()
+    environment = ApplicationEnvironment.from_environment()
     sessions = SessionManager(settings.session_secret, settings.session_ttl_seconds)
     credentials = CredentialVerifier(settings.credentials)
     safe_questions = (
@@ -642,18 +643,14 @@ def create_app(
     owns_chat_runtime = chat_runtime is None
     owns_run_event_bus = run_event_bus is None
     shared_store = conversation_store or SQLiteConversationStore(
-        Path(__file__).resolve().parents[3] / "data/runtime/conversation-v1.sqlite3"
+        environment.conversation_path
     )
-    shared_attachments = AttachmentStore(
-        Path(__file__).resolve().parents[3] / "data/runtime/uploads"
-    )
-    project_root = Path(__file__).resolve().parents[3]
-    knowledge_store = KnowledgeBaseStore(
-        Path(os.environ.get("PRA_KNOWLEDGE_STAGING_PATH", project_root / "data/runtime/knowledge-base"))
-    )
-    intervention_store = InterventionStore(project_root / "data/runtime/run-interventions-v1.sqlite3")
+    shared_attachments = AttachmentStore(environment.attachment_path)
+    project_root = environment.project_root
+    knowledge_store = KnowledgeBaseStore(environment.knowledge_staging_path)
+    intervention_store = InterventionStore(environment.intervention_path)
     knowledge_corpus_dir = Path(os.environ.get("PRA_CORPUS_DIR", project_root / "data/corpus"))
-    knowledge_output_root = project_root / "data/processed"
+    knowledge_output_root = environment.knowledge_output_root
     conversation = ConversationCoordinator(shared_store)
     use_services = services_factory is not None or (
         runtime is None
@@ -672,7 +669,8 @@ def create_app(
             services_builder = services_factory
             if services_builder is None:
                 async def services_builder() -> ApplicationServices:
-                    return await create_application_services_from_environment(
+                    return await create_application_services(
+                        environment,
                         conversation_store=shared_store,
                         attachment_store=shared_attachments,
                     )
@@ -742,7 +740,7 @@ def create_app(
         runtime if runtime is not None and hasattr(runtime, "stream_chat") else None
     )
     app.state.main_agent_runtime = main_agent_runtime
-    app.state.main_agent_mode = main_agent_mode_from_environment()
+    app.state.main_agent_mode = environment.mode
     app.state.services = None
     app.state.compatibility = CompatibilityAdapter(
         event_sink=getattr(main_agent_runtime, "event_sink", None)

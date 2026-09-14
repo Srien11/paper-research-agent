@@ -80,6 +80,25 @@ class SmokeTraceTests(unittest.TestCase):
 
             self.assertEqual(_active_knowledge_base_build(root), build.resolve())
 
+    def test_active_knowledge_base_pointer_can_live_outside_release(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_root = root / "shared" / "knowledge"
+            build = output_root / "corpus-v1" / "build-1"
+            (build / "chunks").mkdir(parents=True)
+            (build / "index").mkdir()
+            (build / "chunks" / "chunks.jsonl").write_text("", encoding="utf-8")
+            (build / "index" / "manifest.json").write_text("{}", encoding="utf-8")
+            (output_root / "current_knowledge_base.json").write_text(
+                '{"build_path":"corpus-v1/build-1"}',
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                _active_knowledge_base_build(root, output_root=output_root),
+                build.resolve(),
+            )
+
     def test_comparison_trace_uses_only_events_after_the_run_cursor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "events.sqlite3"
@@ -744,6 +763,7 @@ class RAGRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "PRA_ANSWER_AUDIT_PATH": "private/answer-audit.sqlite3",
             "PRA_SECTIONS_PATH": "private/sections.jsonl",
             "PRA_ELEMENTS_PATH": "private/elements.jsonl",
+            "PRA_KNOWLEDGE_OUTPUT_ROOT": "private/knowledge",
             "PRA_LOCAL_RETRIEVAL_WORKERS": "3",
         }
         with (
@@ -759,6 +779,9 @@ class RAGRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["answer_audit_path"], Path("private/answer-audit.sqlite3"))
         self.assertEqual(kwargs["sections_path"], Path("private/sections.jsonl"))
         self.assertEqual(kwargs["elements_path"], Path("private/elements.jsonl"))
+        self.assertEqual(
+            kwargs["knowledge_output_root"], Path("private/knowledge")
+        )
         self.assertEqual(kwargs["local_retrieval_workers"], 3)
 
         with (

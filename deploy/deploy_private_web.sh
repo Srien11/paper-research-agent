@@ -2,6 +2,10 @@
 set -Eeuo pipefail
 
 APP_ROOT="/srv/paper-research-agent"
+SHARED_ROOT="${APP_ROOT}/shared"
+SHARED_RUNTIME="${SHARED_ROOT}/runtime"
+SHARED_CORPUS="${SHARED_ROOT}/corpus"
+SHARED_KNOWLEDGE="${SHARED_ROOT}/knowledge"
 CONFIG_ROOT="/etc/paper-research-agent"
 SERVICE_NAME="paper-research-agent.service"
 NGINX_ZONES_TARGET="/etc/nginx/conf.d/paper-research-agent-zones.conf"
@@ -22,6 +26,31 @@ LOCATIONS_EXISTED=0
 
 cleanup() {
     rm -f -- "${LIST_FILE}"
+}
+
+initialize_shared_tree() {
+    source_path="$1"
+    target_path="$2"
+    case "${source_path}" in
+        "${APP_ROOT}"/*) ;;
+        *) printf 'Unsafe shared data source: %s\n' "${source_path}" >&2; return 1 ;;
+    esac
+    case "${target_path}" in
+        "${SHARED_ROOT}"/*) ;;
+        *) printf 'Unsafe shared data target: %s\n' "${target_path}" >&2; return 1 ;;
+    esac
+    if [[ -e "${target_path}" ]]; then
+        if [[ -d "${source_path}" && "$(readlink -f "${source_path}")" != "$(readlink -f "${target_path}")" ]]; then
+            cp -a -- "${source_path}/." "${target_path}/"
+        fi
+        return
+    fi
+    staging_path="${target_path}.init-${RELEASE_TAG}"
+    install -d -m 0700 -o paper-rag -g paper-rag "${staging_path}"
+    if [[ -d "${source_path}" ]]; then
+        cp -a -- "${source_path}/." "${staging_path}/"
+    fi
+    mv -- "${staging_path}" "${target_path}"
 }
 
 rollback() {
@@ -96,7 +125,7 @@ fi
 if ! id paper-rag >/dev/null 2>&1; then
     useradd --system --home-dir "${APP_ROOT}" --shell /usr/sbin/nologin paper-rag
 fi
-install -d -m 0750 -o paper-rag -g paper-rag "${APP_ROOT}/releases" "${APP_ROOT}/deploy-backups"
+install -d -m 0750 -o paper-rag -g paper-rag "${APP_ROOT}/releases" "${APP_ROOT}/deploy-backups" "${SHARED_ROOT}"
 install -d -m 0750 -o paper-rag -g paper-rag "${APP_ROOT}/model-cache"
 install -d -m 0750 -o root -g paper-rag "${CONFIG_ROOT}"
 install -d -m 0750 -o paper-rag -g paper-rag "${RELEASE_DIR}"
@@ -124,11 +153,35 @@ test -f "${RELEASE_DIR}/pyproject.toml"
 test -f "${RELEASE_DIR}/scripts/serve_web.py"
 test -f "${RELEASE_DIR}/data/processed/chunks/chunks.jsonl"
 test -f "${RELEASE_DIR}/data/indexes/retrieval-v1/manifest.json"
-install -d -m 0700 -o paper-rag -g paper-rag "${RELEASE_DIR}/data/runtime"
+
+runtime_source="${RELEASE_DIR}/data/runtime"
+corpus_source="${RELEASE_DIR}/corpus"
+knowledge_source=""
+if [[ -n "${PREVIOUS_TARGET}" ]]; then
+    runtime_source="${PREVIOUS_TARGET}/data/runtime"
+    corpus_source="${PREVIOUS_TARGET}/corpus"
+    if [[ -f "${PREVIOUS_TARGET}/data/processed/current_knowledge_base.json" ]]; then
+        knowledge_source="${PREVIOUS_TARGET}/data/processed"
+    fi
+fi
+if [[ ! -e "${SHARED_RUNTIME}" || ! -e "${SHARED_CORPUS}" || ! -e "${SHARED_KNOWLEDGE}" \
+    || "$(readlink -f "${runtime_source}")" != "$(readlink -f "${SHARED_RUNTIME}")" \
+    || "$(readlink -f "${corpus_source}")" != "$(readlink -f "${SHARED_CORPUS}")" ]]; then
+    systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
+fi
+initialize_shared_tree "${runtime_source}" "${SHARED_RUNTIME}"
+initialize_shared_tree "${corpus_source}" "${SHARED_CORPUS}"
+initialize_shared_tree "${knowledge_source:-${RELEASE_DIR}/data/runtime}" "${SHARED_KNOWLEDGE}"
+
+rmdir -- "${RELEASE_DIR}/data/runtime"
+ln -s -- "${SHARED_RUNTIME}" "${RELEASE_DIR}/data/runtime"
+mv -- "${RELEASE_DIR}/corpus" "${RELEASE_DIR}/corpus.bundle"
+ln -s -- "${SHARED_CORPUS}" "${RELEASE_DIR}/corpus"
 
 "${PYTHON_BIN}" -m venv "${RELEASE_DIR}/.venv"
 "${RELEASE_DIR}/.venv/bin/python" -m pip install --disable-pip-version-check --no-input "${RELEASE_DIR}[retrieval,web,agent]"
 chown -R paper-rag:paper-rag "${RELEASE_DIR}"
+chown -R paper-rag:paper-rag "${SHARED_ROOT}"
 chmod -R o-rwx "${RELEASE_DIR}"
 
 install -m 0644 "${RELEASE_DIR}/deploy/${SERVICE_NAME}" "/etc/systemd/system/${SERVICE_NAME}"

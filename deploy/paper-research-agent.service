@@ -13,6 +13,7 @@ WorkingDirectory=/srv/paper-research-agent/current
 Environment=PYTHONPATH=/srv/paper-research-agent/current/src
 Environment=PYTHONUNBUFFERED=1
 Environment=FASTEMBED_CACHE_PATH=/srv/paper-research-agent/model-cache
+Environment=PRA_KNOWLEDGE_OUTPUT_ROOT=/srv/paper-research-agent/shared/knowledge
 # Reuse the existing owner's PBKDF2 login variables without copying credentials.
 EnvironmentFile=-/etc/zhimo-site-admin.env
 EnvironmentFile=/etc/paper-research-agent/paper-research-agent.env
@@ -52,7 +53,7 @@ RestrictSUIDSGID=true
 LockPersonality=true
 RemoveIPC=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-ReadWritePaths=/srv/paper-research-agent/current/data/runtime /srv/paper-research-agent/model-cache
+ReadWritePaths=/srv/paper-research-agent/shared/runtime /srv/paper-research-agent/model-cache
 
 [Install]
 WantedBy=multi-user.target

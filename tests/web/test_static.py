@@ -306,7 +306,7 @@ class DeploymentAssetContractTests(unittest.TestCase):
             "ProtectHome=true",
             "UMask=0077",
             "FASTEMBED_CACHE_PATH=/srv/paper-research-agent/model-cache",
-            "ReadWritePaths=/srv/paper-research-agent/current/data/runtime /srv/paper-research-agent/model-cache",
+            "ReadWritePaths=/srv/paper-research-agent/shared/runtime /srv/paper-research-agent/model-cache",
         ):
             self.assertIn(directive, service)
 
@@ -335,6 +335,10 @@ class DeploymentAssetContractTests(unittest.TestCase):
         self.assertIn("PREVIOUS_TARGET", script)
         self.assertIn("nginx -t", script)
         self.assertIn("/paper-research/readyz", script)
+        self.assertIn('SHARED_RUNTIME="${SHARED_ROOT}/runtime"', script)
+        self.assertIn('SHARED_CORPUS="${SHARED_ROOT}/corpus"', script)
+        self.assertIn('SHARED_KNOWLEDGE="${SHARED_ROOT}/knowledge"', script)
+        self.assertIn("systemctl stop", script)
         self.assertIn("Refusing to switch releases or guess-edit", script)
         self.assertIn("paper-research-agent-zones.conf", script)
         self.assertIn("paper-research-agent-locations.conf", script)

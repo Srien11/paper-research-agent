@@ -78,6 +78,9 @@ class ApplicationEnvironment:
     conversation_path: Path
     attachment_path: Path
     main_checkpoint_path: Path
+    knowledge_staging_path: Path
+    intervention_path: Path
+    knowledge_output_root: Path
     api_key: str
     base_url: str
     main_model: str
@@ -108,6 +111,24 @@ class ApplicationEnvironment:
                 root,
                 "PRA_MAIN_AGENT_CHECKPOINT_PATH",
                 "data/runtime/main-agent-state-v1.sqlite3",
+            ),
+            knowledge_staging_path=_environment_path(
+                source,
+                root,
+                "PRA_KNOWLEDGE_STAGING_PATH",
+                "data/runtime/knowledge-base",
+            ),
+            intervention_path=_environment_path(
+                source,
+                root,
+                "PRA_INTERVENTION_PATH",
+                "data/runtime/run-interventions-v1.sqlite3",
+            ),
+            knowledge_output_root=_environment_path(
+                source,
+                root,
+                "PRA_KNOWLEDGE_OUTPUT_ROOT",
+                "data/processed",
             ),
             api_key=source.get("DASHSCOPE_API_KEY", "").strip(),
             base_url=source.get(

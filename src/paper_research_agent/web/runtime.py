@@ -368,6 +368,7 @@ class RAGRuntime:
         output_reserve_tokens: int = 1200,
         excerpt_chars: int = 360,
         local_retrieval_workers: int = DEFAULT_LOCAL_RETRIEVAL_WORKERS,
+        knowledge_output_root: Path | None = None,
     ) -> RAGRuntime:
         """Construct local runtime dependencies once from project-local artifacts.
 
@@ -375,7 +376,14 @@ class RAGRuntime:
         environment variables.  This method deliberately does not load ``.env``.
         """
         root = project_root.resolve()
-        active_build = _active_knowledge_base_build(root)
+        active_build = _active_knowledge_base_build(
+            root,
+            output_root=(
+                _project_path(root, knowledge_output_root, "data/processed")
+                if knowledge_output_root is not None
+                else None
+            ),
+        )
         chunks_file = _project_path(
             root,
             chunks_path,
@@ -564,6 +572,7 @@ class RAGRuntime:
             answer_audit_path=_optional_env_path("PRA_ANSWER_AUDIT_PATH"),
             sections_path=_optional_env_path("PRA_SECTIONS_PATH"),
             elements_path=_optional_env_path("PRA_ELEMENTS_PATH"),
+            knowledge_output_root=_optional_env_path("PRA_KNOWLEDGE_OUTPUT_ROOT"),
             local_retrieval_workers=_environment_int(
                 "PRA_LOCAL_RETRIEVAL_WORKERS",
                 DEFAULT_LOCAL_RETRIEVAL_WORKERS,
@@ -1349,8 +1358,14 @@ def _project_path(root: Path, value: Path | None, default: str) -> Path:
     return candidate if candidate.is_absolute() else root / candidate
 
 
-def _active_knowledge_base_build(root: Path) -> Path | None:
-    pointer = root / "data" / "processed" / "current_knowledge_base.json"
+def _active_knowledge_base_build(
+    root: Path,
+    *,
+    output_root: Path | None = None,
+) -> Path | None:
+    pointer = (
+        output_root if output_root is not None else root / "data" / "processed"
+    ) / "current_knowledge_base.json"
     if not pointer.is_file():
         return None
     try:

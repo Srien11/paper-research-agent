@@ -170,6 +170,9 @@ def _environment(root: Path, *, mode: str, api_key: str = "test-key") -> Applica
         conversation_path=root / "conversation.sqlite3",
         attachment_path=root / "uploads",
         main_checkpoint_path=root / "main.sqlite3",
+        knowledge_staging_path=root / "knowledge-base",
+        intervention_path=root / "interventions.sqlite3",
+        knowledge_output_root=root / "knowledge-output",
         api_key=api_key,
         base_url="https://dashscope.example/v1",
         main_model="qwen-test",
@@ -180,6 +183,43 @@ def _environment(root: Path, *, mode: str, api_key: str = "test-key") -> Applica
 
 
 class ApplicationBootstrapTests(unittest.IsolatedAsyncioTestCase):
+    def test_environment_resolves_all_mutable_paths_outside_release(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            shared = Path(directory) / "shared"
+            environment = ApplicationEnvironment.from_environment(
+                {
+                    "PRA_PROJECT_ROOT": str(Path(directory) / "release"),
+                    "PRA_MAIN_AGENT_MODE": "legacy",
+                    "PRA_CONVERSATION_PATH": str(
+                        shared / "runtime/conversation.sqlite3"
+                    ),
+                    "PRA_ATTACHMENT_PATH": str(shared / "runtime/uploads"),
+                    "PRA_MAIN_AGENT_CHECKPOINT_PATH": str(
+                        shared / "runtime/checkpoint.sqlite3"
+                    ),
+                    "PRA_KNOWLEDGE_STAGING_PATH": str(
+                        shared / "runtime/knowledge-base"
+                    ),
+                    "PRA_INTERVENTION_PATH": str(
+                        shared / "runtime/interventions.sqlite3"
+                    ),
+                    "PRA_KNOWLEDGE_OUTPUT_ROOT": str(shared / "knowledge"),
+                }
+            )
+
+            self.assertEqual(
+                environment.knowledge_staging_path,
+                (shared / "runtime/knowledge-base").resolve(),
+            )
+            self.assertEqual(
+                environment.intervention_path,
+                (shared / "runtime/interventions.sqlite3").resolve(),
+            )
+            self.assertEqual(
+                environment.knowledge_output_root,
+                (shared / "knowledge").resolve(),
+            )
+
     def test_fast_path_environment_flag_is_strict_and_defaults_true(self) -> None:
         default = ApplicationEnvironment.from_environment(
             {"PRA_PROJECT_ROOT": str(Path.cwd())}
