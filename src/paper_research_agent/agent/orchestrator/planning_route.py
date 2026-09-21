@@ -15,6 +15,7 @@ PlanningRoute = Literal["fast_path", "full_planner"]
 RAGMode = Literal["disabled", "preferred", "required"]
 PlanningRouteReason = Literal[
     "clear_single_local_rag",
+    "simple_direct_chat",
     "feature_disabled",
     "existing_workspace",
     "attachments_present",
@@ -27,6 +28,7 @@ PlanningRouteReason = Literal[
 class PlanningRouteDecision(FrozenModel):
     route: PlanningRoute
     reason_code: PlanningRouteReason
+    capability: Literal["direct_chat", "local_rag"] | None = None
 
 
 class SourceRequirements(FrozenModel):
@@ -111,6 +113,12 @@ _VAGUE_RESEARCH = re.compile(
     r"^(?:请)?(?:帮我)?(?:研究|查|看看|分析)(?:一下)?[。.!！]?$",
     re.IGNORECASE,
 )
+_CONTEXTUAL_FOLLOW_UP = re.compile(
+    r"^(?:再|继续|接着|然后|进一步|补充|展开|详细说说|那|那么|为什么|怎么会)|"
+    r"(?:上面|刚才|前面|此前|之前|这个|这些|上述|它们|其)(?:的|里|中|呢|吗|如何|为什么)",
+    re.IGNORECASE,
+)
+_TERMINAL_TASK_STATUSES = frozenset({"completed", "failed", "skipped", "cancelled"})
 
 
 def classify_planning_route(
@@ -118,14 +126,9 @@ def classify_planning_route(
     *,
     enabled: bool,
 ) -> PlanningRouteDecision:
-    """Select fast path only when a single local-paper request is provable."""
+    """Select a deterministic single-task path when full planning adds no value."""
     if not enabled:
         return _full("feature_disabled")
-    if (
-        envelope.workspace.active_goal is not None
-        or envelope.workspace.task_plan is not None
-    ):
-        return _full("existing_workspace")
     if envelope.attachment_ids:
         return _full("attachments_present")
 
@@ -135,8 +138,10 @@ def classify_planning_route(
     if len(message) > 1000:
         return _full("contract_bounds_exceeded")
     requirements = infer_source_requirements(message)
-    if requirements.external_required or requirements.local_forbidden:
+    if requirements.external_required:
         return _full("complex_or_ambiguous")
+    if envelope.rag_mode == "disabled" and requirements.local_required:
+        return _full("rag_disabled")
     if (
         _FILE_OR_CONTROL.search(message)
         or _EXTERNAL_OR_DYNAMIC.search(message)
@@ -144,12 +149,11 @@ def classify_planning_route(
         or _VAGUE_RESEARCH.fullmatch(message)
     ):
         return _full("complex_or_ambiguous")
-    if envelope.rag_mode == "disabled":
-        return _full("rag_disabled")
-
     has_corpus_id = _LOCAL_CORPUS_ID.search(message) is not None
     is_comparison = requires_research_planning(message)
     has_explicit_multi_object = _EXPLICIT_MULTI_OBJECT.search(message) is not None
+    if _workspace_needs_contextual_planning(envelope, message):
+        return _full("existing_workspace")
     if is_comparison and not (has_corpus_id or has_explicit_multi_object):
         return _full("complex_or_ambiguous")
     if envelope.rag_mode == "required" and (
@@ -160,15 +164,41 @@ def classify_planning_route(
         return PlanningRouteDecision(
             route="fast_path",
             reason_code="clear_single_local_rag",
+            capability="local_rag",
         )
     if envelope.rag_mode == "preferred" and (
-        has_corpus_id or (is_comparison and has_explicit_multi_object)
+        requirements.local_required
+        or has_corpus_id
+        or (is_comparison and has_explicit_multi_object)
     ):
         return PlanningRouteDecision(
             route="fast_path",
             reason_code="clear_single_local_rag",
+            capability="local_rag",
+        )
+    if envelope.rag_mode in {"disabled", "preferred"}:
+        return PlanningRouteDecision(
+            route="fast_path",
+            reason_code="simple_direct_chat",
+            capability="direct_chat",
         )
     return _full("complex_or_ambiguous")
+
+
+def _workspace_needs_contextual_planning(
+    envelope: AgentContextEnvelope,
+    message: str,
+) -> bool:
+    """Keep active work and context-dependent follow-ups on the full planner."""
+    workspace = envelope.workspace
+    if workspace.active_goal is None and workspace.task_plan is None:
+        return False
+    plan = workspace.task_plan
+    if plan is None or any(
+        task.status not in _TERMINAL_TASK_STATUSES for task in plan.tasks
+    ):
+        return True
+    return _CONTEXTUAL_FOLLOW_UP.search(message) is not None
 
 
 def infer_source_requirements(message: str) -> SourceRequirements:

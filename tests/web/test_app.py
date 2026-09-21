@@ -23,6 +23,10 @@ class RuntimeBusyError(RuntimeError):
     pass
 
 
+class RuntimeCapacityError(RuntimeError):
+    pass
+
+
 class FakeRuntime:
     def __init__(self) -> None:
         self.is_ready = True
@@ -362,6 +366,16 @@ class AppTests(unittest.TestCase):
         )
         self.assertEqual(busy.status_code, 409)
         self.assertNotIn("must not leak", busy.text)
+
+        self.runtime.error = RuntimeCapacityError("must not leak either")
+        capacity = self.client.post(
+            "/paper-research/api/ask",
+            headers={"Origin": ORIGIN},
+            json={"question": "另一个问题"},
+        )
+        self.assertEqual(capacity.status_code, 503)
+        self.assertEqual(capacity.json()["detail"], "系统繁忙，请稍后重试")
+        self.assertNotIn("must not leak either", capacity.text)
 
     def test_dynamic_tool_approval_is_authenticated_and_redacted(self) -> None:
         unauthorized = self.client.post(

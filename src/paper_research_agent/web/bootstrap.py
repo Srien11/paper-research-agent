@@ -34,6 +34,7 @@ from paper_research_agent.web.child_executors import (
     ConversationChildExecutor,
     RAGRuntimeChildExecutor,
 )
+from paper_research_agent.web.concurrency import SessionExecutionGate
 from paper_research_agent.web.events import (
     AgentStreamEventDraft,
     AgentStreamEventType,
@@ -89,6 +90,7 @@ class ApplicationEnvironment:
     main_agent_fast_path_enabled: bool = True
     parallel_hybrid_research_enabled: bool = False
     max_inflight_runs: int = 2
+    web_max_inflight_runs: int = 2
 
     @classmethod
     def from_environment(
@@ -155,6 +157,13 @@ class ApplicationEnvironment:
             max_inflight_runs=_bounded_integer_from_environment(
                 source,
                 "PRA_MAIN_AGENT_MAX_INFLIGHT_RUNS",
+                default=2,
+                minimum=1,
+                maximum=16,
+            ),
+            web_max_inflight_runs=_bounded_integer_from_environment(
+                source,
+                "PRA_WEB_MAX_INFLIGHT_RUNS",
                 default=2,
                 minimum=1,
                 maximum=16,
@@ -471,6 +480,9 @@ async def create_application_services(
     store = conversation_store or SQLiteConversationStore(environment.conversation_path)
     attachments = attachment_store or AttachmentStore(environment.attachment_path)
     run_events = RunEventBus(store)
+    execution_gate = SessionExecutionGate(
+        max_inflight_runs=environment.web_max_inflight_runs
+    )
     closers: list[Callable[[], Awaitable[None]]] = []
     owned_ids: set[int] = set()
 
@@ -485,9 +497,9 @@ async def create_application_services(
 
     try:
         own(run_events)
-        chat = _create_chat_runtime(environment, store)
+        chat = _create_chat_runtime(environment, store, execution_gate)
         own(chat)
-        rag = await _create_rag_runtime(environment)
+        rag = await _create_rag_runtime(environment, execution_gate)
         if rag is not None:
             own(rag)
         main: MainAgentRuntime | None = None
@@ -598,24 +610,30 @@ async def create_application_services_from_environment(
 
 
 def _create_chat_runtime(
-    environment: ApplicationEnvironment, store: ConversationStore
+    environment: ApplicationEnvironment,
+    store: ConversationStore,
+    execution_gate: SessionExecutionGate,
 ) -> ConversationRuntime:
     return ConversationRuntime(
         api_key=environment.api_key,
         model=environment.main_model,
         base_url=environment.base_url,
         conversation_store=store,
+        execution_gate=execution_gate,
     )
 
 
-async def _create_rag_runtime(environment: ApplicationEnvironment) -> ClosableRuntime | None:
+async def _create_rag_runtime(
+    environment: ApplicationEnvironment,
+    execution_gate: SessionExecutionGate,
+) -> ClosableRuntime | None:
     if not environment.corpus_configured:
         return None
     from paper_research_agent.web.runtime import RAGRuntime
 
     if environment.mode == "primary" or RAGRuntime.research_agent_enabled_from_environment():
-        return await RAGRuntime.from_environment_with_agent()
-    return RAGRuntime.from_environment()
+        return await RAGRuntime.from_environment_with_agent(execution_gate=execution_gate)
+    return RAGRuntime.from_environment(execution_gate=execution_gate)
 
 
 def _create_main_model(environment: ApplicationEnvironment) -> object:

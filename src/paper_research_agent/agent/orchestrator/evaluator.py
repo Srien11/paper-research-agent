@@ -71,6 +71,7 @@ def evaluate_task(
     max_child_calls: int = MAX_CHILD_CALLS_PER_RUN,
     max_replans: int = MAX_REPLANS_PER_RUN,
     max_attempts: int = MAX_TASK_ATTEMPTS,
+    allow_replan: bool = True,
 ) -> TaskEvaluation:
     """Judge one child result against task criteria without relaxing citation safety."""
     if result.status == "waiting_approval":
@@ -90,7 +91,11 @@ def evaluate_task(
             "子图执行失败",
         )
     if result.status == "insufficient_evidence":
-        if child_calls_used < max_child_calls and replans_used < max_replans:
+        if (
+            allow_replan
+            and child_calls_used < max_child_calls
+            and replans_used < max_replans
+        ):
             return TaskEvaluation(
                 task_id=task.task_id,
                 outcome="replan",
@@ -103,7 +108,11 @@ def evaluate_task(
             outcome="fail",
             missing_criteria=task.success_criteria,
             summary=result.summary,
-            reason="证据不足且无可用重规划预算",
+            reason=(
+                "证据不足且无可用重规划预算"
+                if allow_replan
+                else "单任务快路证据不足，不重复执行相同检索"
+            ),
         )
     if result.capability == "local_rag" and result.citation_kind != "local_paper":
         return TaskEvaluation(

@@ -208,6 +208,31 @@ class ApplicationBootstrapTests(unittest.IsolatedAsyncioTestCase):
                     }
                 )
 
+    def test_web_runtime_capacity_environment_is_bounded(self) -> None:
+        default = ApplicationEnvironment.from_environment(
+            {"PRA_PROJECT_ROOT": str(Path.cwd())}
+        )
+        configured = ApplicationEnvironment.from_environment(
+            {
+                "PRA_PROJECT_ROOT": str(Path.cwd()),
+                "PRA_WEB_MAX_INFLIGHT_RUNS": "4",
+            }
+        )
+
+        self.assertEqual(default.web_max_inflight_runs, 2)
+        self.assertEqual(configured.web_max_inflight_runs, 4)
+        for invalid in ("0", "17", "many"):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                ValueError,
+                "PRA_WEB_MAX_INFLIGHT_RUNS",
+            ):
+                ApplicationEnvironment.from_environment(
+                    {
+                        "PRA_PROJECT_ROOT": str(Path.cwd()),
+                        "PRA_WEB_MAX_INFLIGHT_RUNS": invalid,
+                    }
+                )
+
     def test_environment_resolves_all_mutable_paths_outside_release(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             shared = Path(directory) / "shared"
@@ -372,11 +397,11 @@ class ApplicationBootstrapTests(unittest.IsolatedAsyncioTestCase):
                 patch(
                     "paper_research_agent.web.bootstrap._create_chat_runtime",
                     return_value=chat,
-                ),
+                ) as build_chat,
                 patch(
                     "paper_research_agent.web.bootstrap._create_rag_runtime",
                     new=AsyncMock(return_value=rag),
-                ),
+                ) as build_rag,
                 patch(
                     "paper_research_agent.web.bootstrap._create_main_model",
                     return_value=model,
@@ -395,6 +420,11 @@ class ApplicationBootstrapTests(unittest.IsolatedAsyncioTestCase):
                 )
 
             self.assertIs(services.main_agent_runtime, main)
+            self.assertIs(
+                build_chat.call_args.args[2],
+                build_rag.call_args.args[1],
+            )
+            self.assertEqual(build_chat.call_args.args[2].max_inflight_runs, 2)
             self.assertIs(services.conversation_store, services.main_agent_repository)
             self.assertIsNotNone(services.run_event_bus.publisher)
             self.assertIs(

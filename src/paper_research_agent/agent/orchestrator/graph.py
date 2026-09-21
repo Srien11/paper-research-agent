@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -56,7 +57,7 @@ from paper_research_agent.agent.orchestrator.parallel import (
 from paper_research_agent.agent.orchestrator.planner import (
     GoalReconciler,
     TaskPlanner,
-    build_single_local_rag_decisions,
+    build_single_task_decisions,
 )
 from paper_research_agent.agent.orchestrator.planning_route import (
     classify_planning_route as classify_planning_route_pure,
@@ -311,6 +312,7 @@ def build_main_agent_graph(
         return {
             "planning_route": decision.route,
             "planning_route_reason": decision.reason_code,
+            "planning_capability": decision.capability,
         }
 
     async def materialize_fast_path(
@@ -318,8 +320,11 @@ def build_main_agent_graph(
     ) -> MainAgentGraphState:
         started = time.perf_counter()
         envelope = AgentContextEnvelope.model_validate(state["context"])
+        capability = state.get("planning_capability")
+        if capability not in {"direct_chat", "local_rag"}:
+            raise ValueError("fast path requires a deterministic single-task capability")
         interpretation, goal_decision, plan_decision = (
-            build_single_local_rag_decisions(envelope)
+            build_single_task_decisions(envelope, capability=capability)
         )
         workspace = reduce_workspace(
             ConversationWorkspace.model_validate(state["workspace_draft"]),
@@ -463,6 +468,52 @@ def build_main_agent_graph(
         selected_tasks = tuple(
             _task_by_id(workspace, task_id) for task_id in batch.task_ids
         )
+        envelope = AgentContextEnvelope.model_validate(state["context"])
+        insufficient_signatures = {
+            str(item) for item in state.get("insufficient_task_signatures", [])
+        }
+        duplicate_tasks = tuple(
+            task
+            for task in selected_tasks
+            if _task_execution_signature(
+                task,
+                route_task_pure(task, envelope).capability,
+            )
+            in insufficient_signatures
+        )
+        if duplicate_tasks:
+            duplicate_results = tuple(
+                ChildTaskResult(
+                    child_run_id=f"deduplicated-{task.task_id}",
+                    task_id=task.task_id,
+                    capability=route_task_pure(task, envelope).capability,
+                    status="failed",
+                    summary="相同查询与证据条件此前已返回证据不足，本次未重复执行。",
+                    error_code="duplicate_evidence_retry_blocked",
+                )
+                for task in duplicate_tasks
+            )
+            duplicate_evaluations = tuple(
+                TaskEvaluation(
+                    task_id=task.task_id,
+                    outcome="fail",
+                    missing_criteria=task.success_criteria,
+                    summary="已跳过无信息增量的重复任务。",
+                    reason="相同查询与证据条件不重复执行",
+                )
+                for task in duplicate_tasks
+            )
+            child_results = list(state.get("child_results", []))
+            child_results.extend(duplicate_results)
+            return {
+                "workspace_draft": reduce_workspace_batch(
+                    workspace,
+                    evaluations=duplicate_evaluations,
+                    results=duplicate_results,
+                ),
+                "child_results": child_results,
+                "next_action": "select_next_task",
+            }
         if batch.execution_mode == "parallel" and not parallel_hybrid_research_enabled:
             disabled_results = tuple(
                 _budget_failure_result(
@@ -686,6 +737,7 @@ def build_main_agent_graph(
                 replans_used=used_replans,
                 max_child_calls=max_child_calls,
                 max_replans=max_replans,
+                allow_replan=state.get("planning_route") != "fast_path",
             )
             for result in results
         )
@@ -699,6 +751,18 @@ def build_main_agent_graph(
         results = tuple(
             ChildTaskResult.model_validate(item) for item in state["batch_results"]
         )
+        insufficient_signatures = list(
+            state.get("insufficient_task_signatures", [])
+        )
+        for result in results:
+            if result.status != "insufficient_evidence":
+                continue
+            signature = _task_execution_signature(
+                _task_by_id(workspace, result.task_id),
+                result.capability,
+            )
+            if signature not in insufficient_signatures:
+                insufficient_signatures.append(signature)
         workspace = reduce_workspace_batch(
             workspace,
             evaluations=evaluations,
@@ -741,7 +805,10 @@ def build_main_agent_graph(
                 duration_ms=round(elapsed_seconds * 1000),
                 idempotency_key=f"parallel:{batch.batch_id}:completed",
             )
-        update: MainAgentGraphState = {"workspace_draft": workspace}
+        update: MainAgentGraphState = {
+            "workspace_draft": workspace,
+            "insufficient_task_signatures": insufficient_signatures,
+        }
         if any(evaluation.outcome == "replan" for evaluation in evaluations):
             update["remaining_replans"] = int(
                 state.get("remaining_replans", max_replans)
@@ -1275,6 +1342,13 @@ def _task_by_id(workspace: ConversationWorkspace, task_id: str) -> AgentTask:
         if task.task_id == task_id:
             return task
     raise ValueError(f"unknown task id: {task_id}")
+
+
+def _task_execution_signature(task: AgentTask, capability: Capability) -> str:
+    """Identify one evidence attempt without depending on planner-generated task IDs."""
+    objective = re.sub(r"[\W_]+", "", task.objective.casefold())
+    tools = ",".join(sorted(task.allowed_tool_names))
+    return f"{capability}:{objective}:{tools}"
 
 
 def _replace_task(

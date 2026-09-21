@@ -184,6 +184,21 @@ class EvaluateTaskTests(unittest.TestCase):
         evaluation = self._evaluate(task, result, replans_used=1)
         self.assertEqual(evaluation.outcome, "fail")
 
+    def test_fast_path_insufficient_evidence_does_not_replan(self) -> None:
+        task = _task(attempt_count=0)
+        result = _result(status="insufficient_evidence", citation_kind="none")
+
+        evaluation = evaluate_task(
+            task,
+            result,
+            child_calls_used=0,
+            replans_used=0,
+            allow_replan=False,
+        )
+
+        self.assertEqual(evaluation.outcome, "fail")
+        self.assertIn("不重复执行", evaluation.reason)
+
     def test_waiting_approval_waits_for_user(self) -> None:
         result = _result(status="waiting_approval", citation_kind="none")
         evaluation = self._evaluate(_task(), result)

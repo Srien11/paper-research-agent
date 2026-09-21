@@ -32,6 +32,7 @@ class MainAgentGraphState(TypedDict, total=False):
     context: AgentContextEnvelope
     planning_route: Literal["fast_path", "full_planner"]
     planning_route_reason: str
+    planning_capability: Literal["direct_chat", "local_rag"] | None
     interpretation: TurnInterpretationV2
     goal_decision: GoalDecision
     plan_decision: TaskPlanDecision
@@ -53,6 +54,7 @@ class MainAgentGraphState(TypedDict, total=False):
     pending_approval: dict[str, object]
     remaining_child_calls: int
     remaining_replans: int
+    insufficient_task_signatures: list[str]
     termination_reason: str
     next_action: str
     validation_errors: tuple[str, ...]

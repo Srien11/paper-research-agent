@@ -862,6 +862,44 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(dispatcher.calls), 1)
         self.assertEqual(cached["termination_reason"], "cached")
 
+    async def test_simple_chat_skips_all_three_model_stages(self) -> None:
+        store = InMemoryConversationStore()
+        interpreter = FakeInterpreter(_interpretation())
+        reconciler = FakeReconciler(_goal_decision())
+        planner = FakePlanner()
+        dispatcher = FakeDispatcher(
+            _result(
+                task_id="direct-result",
+                capability="direct_chat",
+                citation_kind="none",
+                summary="RAG 是检索增强生成。",
+            )
+        )
+        graph = build_main_agent_graph(
+            repository=store,
+            hydrator=FakeHydrator(),
+            interpreter=interpreter,
+            goal_reconciler=reconciler,
+            task_planner=planner,
+            dispatcher=dispatcher,
+            fast_path_enabled=True,
+        )
+        request = MainAgentRequest(
+            request_id="request-fast-direct",
+            conversation_id="conversation-fast-direct",
+            message="介绍一下 RAG",
+            rag_mode="preferred",
+        )
+
+        state = await self._run(graph, request)
+
+        self.assertEqual(interpreter.calls, 0)
+        self.assertEqual(reconciler.calls, 0)
+        self.assertEqual(planner.calls, 0)
+        self.assertEqual(len(dispatcher.calls), 1)
+        self.assertEqual(dispatcher.calls[0].capability, "direct_chat")
+        self.assertEqual(state["planning_route_reason"], "simple_direct_chat")
+
     async def test_disabled_fast_path_uses_existing_full_planner_chain(self) -> None:
         plan = _plan_decision((_task(task_id="local", capability="local_rag"),))
         graph, _store, dispatcher, planner = self._build(
@@ -1147,7 +1185,13 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
         bus = RunEventBus(store)
         first_plan = _plan_decision((_task(task_id="local", capability="local_rag"),))
         second_plan = _plan_decision(
-            (_task(task_id="local", capability="local_rag"),),
+            (
+                _task(
+                    task_id="local-expanded",
+                    capability="local_rag",
+                    objective="使用扩展关键词比较 RAG 与 GraphRAG",
+                ),
+            ),
             action="revise",
         )
         graph, _store, dispatcher, planner = self._build(
@@ -1155,7 +1199,7 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
             plan_decisions=(first_plan, second_plan),
             dispatch_results=(
                 _result(status="insufficient_evidence", task_id="local"),
-                _result(task_id="local", source_id="chunk-1"),
+                _result(task_id="local-expanded", source_id="chunk-1"),
             ),
             run_event_publisher=bus.publisher,
         )
@@ -1172,9 +1216,52 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(planner.calls, 2)
         self.assertEqual(len(dispatcher.calls), 2)
+        self.assertEqual(
+            [call.task_id for call in dispatcher.calls],
+            ["local", "local-expanded"],
+        )
         self.assertNotIn("task_failed", event_types)
-        self.assertIn("[local_paper]", state["final_answer"])
+        self.assertTrue(
+            any(
+                result.status == "completed"
+                and result.citation_kind == "local_paper"
+                and result.source_ids == ("chunk-1",)
+                for result in state["child_results"]
+            )
+        )
         await bus.aclose()
+
+    async def test_replan_does_not_repeat_same_evidence_attempt(self) -> None:
+        first_plan = _plan_decision((_task(task_id="local", capability="local_rag"),))
+        duplicate_plan = _plan_decision(
+            (_task(task_id="local-retry", capability="local_rag"),),
+            action="revise",
+        )
+        graph, store, dispatcher, planner = self._build(
+            plan_decisions=(first_plan, duplicate_plan),
+            dispatch_results=(
+                _result(status="insufficient_evidence", task_id="local"),
+            ),
+        )
+        request = MainAgentRequest(
+            request_id="request-replan-deduplicated",
+            conversation_id="conversation-replan-deduplicated",
+            message="比较 RAG 与 GraphRAG",
+            rag_mode="preferred",
+        )
+
+        state = await self._run(graph, request)
+
+        self.assertEqual(planner.calls, 2)
+        self.assertEqual(len(dispatcher.calls), 1)
+        duplicate = next(
+            result
+            for result in state["child_results"]
+            if result.task_id == "local-retry"
+        )
+        self.assertEqual(duplicate.error_code, "duplicate_evidence_retry_blocked")
+        persisted = store.load_workspace(request.conversation_id)
+        self.assertEqual(persisted.task_plan.tasks[0].status, "failed")
 
     async def test_approval_pause_commits_waiting(self) -> None:
         plan = _plan_decision((_task(task_id="save", capability="dynamic_tools"),))

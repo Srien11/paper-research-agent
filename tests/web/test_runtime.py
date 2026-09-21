@@ -47,6 +47,7 @@ from paper_research_agent.retrieval.contracts import (
     QueryRewriteTrace,
     SearchHit,
 )
+from paper_research_agent.web.concurrency import RuntimeCapacityError
 from paper_research_agent.web.runtime import (
     RAGRuntime,
     RuntimeBusyError,
@@ -700,6 +701,7 @@ def _runtime(
     gate: asyncio.Event | None = None,
     research_agent: FakeResearchAgent | None = None,
     research_agent_mode: str = "always",
+    max_inflight_runs: int = 2,
 ) -> tuple[RAGRuntime, FakeRetriever, FakeGenerator]:
     chunk = _chunk()
     retriever = FakeRetriever(chunk)
@@ -724,6 +726,7 @@ def _runtime(
         ),
         excerpt_chars=48,
         research_agent_mode=research_agent_mode,
+        max_inflight_runs=max_inflight_runs,
     )
     return runtime, retriever, generator
 
@@ -1236,7 +1239,7 @@ class RAGRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(memories.items[0]["content"], "Concise answers")
         await runtime.aclose()
 
-    async def test_rejects_concurrent_question_as_busy(self) -> None:
+    async def test_rejects_concurrent_question_in_same_session_as_busy(self) -> None:
         gate = asyncio.Event()
         runtime, _, _ = _runtime(gate=gate)
         first = asyncio.create_task(runtime.ask("第一个问题", session_id="b" * 32))
@@ -1248,6 +1251,21 @@ class RAGRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         gate.set()
         await first
+        self.assertFalse(runtime.is_busy)
+
+    async def test_allows_distinct_sessions_up_to_global_capacity(self) -> None:
+        gate = asyncio.Event()
+        runtime, _, generator = _runtime(gate=gate, max_inflight_runs=2)
+        first = asyncio.create_task(runtime.ask("第一个问题", session_id="a" * 32))
+        second = asyncio.create_task(runtime.ask("第二个问题", session_id="b" * 32))
+        while len(generator.requests) < 2:
+            await asyncio.sleep(0)
+
+        with self.assertRaises(RuntimeCapacityError):
+            await runtime.ask("第三个问题", session_id="c" * 32)
+
+        gate.set()
+        await asyncio.gather(first, second)
         self.assertFalse(runtime.is_busy)
 
     async def test_close_is_idempotent_and_prevents_new_work(self) -> None:

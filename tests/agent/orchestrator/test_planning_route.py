@@ -107,6 +107,65 @@ class PlanningRouteTests(unittest.TestCase):
                     decision.reason_code,
                     "clear_single_local_rag",
                 )
+                self.assertEqual(decision.capability, "local_rag")
+
+    def test_simple_requests_use_single_direct_chat_task(self) -> None:
+        cases = (
+            _envelope("介绍一下 RAG"),
+            _envelope("解释一下注意力机制", rag_mode="disabled"),
+            _envelope("你好"),
+        )
+
+        for envelope in cases:
+            with self.subTest(message=envelope.current_message):
+                decision = classify_planning_route(envelope, enabled=True)
+                self.assertEqual(decision.route, "fast_path")
+                self.assertEqual(decision.reason_code, "simple_direct_chat")
+                self.assertEqual(decision.capability, "direct_chat")
+
+    def test_complex_comparison_keeps_full_planner(self) -> None:
+        decision = classify_planning_route(
+            _envelope("比较 RAG 与 GraphRAG 的适用边界、成本和实验差异"),
+            enabled=True,
+        )
+
+        self.assertEqual(decision.route, "full_planner")
+        self.assertEqual(decision.reason_code, "complex_or_ambiguous")
+
+    def test_completed_workspace_allows_new_self_contained_request_only(self) -> None:
+        existing = _envelope("介绍一下 RAG", existing=True)
+        plan = existing.workspace.task_plan
+        self.assertIsNotNone(plan)
+        completed_plan = plan.model_copy(
+            update={
+                "tasks": tuple(
+                    task.model_copy(update={"status": "completed"})
+                    for task in plan.tasks
+                )
+            }
+        )
+        completed_workspace = existing.workspace.model_copy(
+            update={"task_plan": completed_plan}
+        )
+
+        standalone = classify_planning_route(
+            existing.model_copy(update={"workspace": completed_workspace}),
+            enabled=True,
+        )
+        follow_up = classify_planning_route(
+            existing.model_copy(
+                update={
+                    "current_message": "再详细说说",
+                    "workspace": completed_workspace,
+                }
+            ),
+            enabled=True,
+        )
+
+        self.assertEqual(standalone.route, "fast_path")
+        self.assertEqual(standalone.capability, "direct_chat")
+        self.assertEqual(follow_up.route, "full_planner")
+        self.assertEqual(follow_up.reason_code, "existing_workspace")
 
     def test_deny_rules_force_full_planner(self) -> None:
         cases = (

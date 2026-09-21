@@ -19,6 +19,7 @@ from paper_research_agent.agent.orchestrator.planner import (
     GoalReconciler,
     TaskPlanner,
     build_single_local_rag_decisions,
+    build_single_task_decisions,
 )
 
 
@@ -658,6 +659,24 @@ class TaskPlannerTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "1000"):
             build_single_local_rag_decisions(envelope)
+
+    def test_single_direct_chat_decisions_build_one_direct_task(self) -> None:
+        workspace = ConversationWorkspace(
+            conversation_id="conversation-1",
+            version=0,
+            updated_at=_utc(),
+        )
+        envelope = _envelope(current_message="介绍一下 RAG", workspace=workspace)
+
+        _interpretation, _goal, plan_decision = build_single_task_decisions(
+            envelope,
+            capability="direct_chat",
+        )
+
+        self.assertEqual(len(plan_decision.plan.tasks), 1)
+        task = plan_decision.plan.tasks[0]
+        self.assertEqual(task.capability, "direct_chat")
+        self.assertEqual(task.objective, "介绍一下 RAG")
 
 
 if __name__ == "__main__":

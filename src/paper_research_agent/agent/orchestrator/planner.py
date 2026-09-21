@@ -202,15 +202,17 @@ def _build_single_task_plan(
     )
 
 
-def build_single_local_rag_decisions(
+def build_single_task_decisions(
     envelope: AgentContextEnvelope,
+    *,
+    capability: Literal["direct_chat", "local_rag"],
 ) -> tuple[TurnInterpretationV2, GoalDecision, TaskPlanDecision]:
-    """Materialize a strict new-goal local-RAG plan without model calls."""
+    """Materialize a strict new-goal single-task plan without model calls."""
     request = " ".join(envelope.current_message.split())
     if not request:
-        raise ValueError("single local RAG request must not be blank")
+        raise ValueError("single-task request must not be blank")
     if len(request) > 1000:
-        raise ValueError("single local RAG request exceeds the 1000 character limit")
+        raise ValueError("single-task request exceeds the 1000 character limit")
     now = datetime.now(UTC)
     interpretation = TurnInterpretationV2(
         relation="new_goal",
@@ -229,23 +231,38 @@ def build_single_local_rag_decisions(
     goal_decision = GoalDecision(
         action="create",
         goal=goal,
-        rationale="确定性单一私有论文请求",
+        rationale="确定性单任务请求",
     )
+    if capability == "local_rag":
+        success_criteria = ("使用本地论文证据完成当前请求",)
+        title = "完成当前本地论文请求"
+        execution_reason = "使用本地论文证据完成单一研究请求"
+    else:
+        success_criteria = ("直接完成当前请求",)
+        title = "直接回答当前请求"
+        execution_reason = "当前请求无需研究规划，直接生成回答"
     plan = _build_single_task_plan(
         goal_id=goal.goal_id,
         request=request,
-        capability="local_rag",
-        success_criteria=("使用本地论文证据完成当前请求",),
-        title="完成当前本地论文请求",
-        execution_reason="使用本地论文证据完成单一研究请求",
+        capability=capability,
+        success_criteria=success_criteria,
+        title=title,
+        execution_reason=execution_reason,
         revision=1,
     )
     plan_decision = TaskPlanDecision(
         action="create",
         plan=plan,
-        rationale="确定性构造单一 local_rag 任务",
+        rationale=f"确定性构造单一 {capability} 任务",
     )
     return interpretation, goal_decision, plan_decision
+
+
+def build_single_local_rag_decisions(
+    envelope: AgentContextEnvelope,
+) -> tuple[TurnInterpretationV2, GoalDecision, TaskPlanDecision]:
+    """Backward-compatible wrapper for the strict local-RAG fast path."""
+    return build_single_task_decisions(envelope, capability="local_rag")
 
 
 class _TaskDraft(FrozenModel):

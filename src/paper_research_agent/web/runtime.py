@@ -84,6 +84,12 @@ from paper_research_agent.retrieval.query_store import (
 )
 from paper_research_agent.retrieval.rights import CorpusRightsMap
 from paper_research_agent.retrieval.vector import FaissVectorIndex
+from paper_research_agent.web.concurrency import (
+    RuntimeBusyError,
+    RuntimeClosedError,
+    SessionExecutionGate,
+    web_max_inflight_runs_from_environment,
+)
 
 if TYPE_CHECKING:
     from paper_research_agent.agent.dynamic.models import DynamicResearchResult
@@ -222,14 +228,6 @@ class RuntimeExecutionResult(_FrozenWebModel):
     comparison: SafeComparisonTrace | None = None
 
 
-class RuntimeBusyError(RuntimeError):
-    """The single local model lane is already processing another question."""
-
-
-class RuntimeClosedError(RuntimeError):
-    """The runtime has been shut down and cannot accept new work."""
-
-
 class RuntimeDependencies:
     """Injectable long-lived dependencies used by :class:`RAGRuntime`."""
 
@@ -268,7 +266,7 @@ class RuntimeDependencies:
 
 
 class RAGRuntime:
-    """Load expensive local models once and serialize complete question executions."""
+    """Load expensive dependencies once and bound executions by conversation."""
 
     rag_available = True
     agent_available = True
@@ -283,6 +281,8 @@ class RAGRuntime:
         system_rules: str = DEFAULT_RAG_SYSTEM_RULES,
         excerpt_chars: int = 360,
         research_agent_mode: ResearchAgentMode = "always",
+        execution_gate: SessionExecutionGate | None = None,
+        max_inflight_runs: int = 2,
     ) -> None:
         if not dependencies.chunks:
             raise ValueError("runtime requires at least one evidence chunk")
@@ -323,17 +323,22 @@ class RAGRuntime:
         self._output_reserve_tokens = output_reserve_tokens
         self._system_rules = system_rules
         self._excerpt_chars = excerpt_chars
-        self._execution_lock = asyncio.Lock()
-        self._busy = False
+        self._execution_gate = execution_gate or SessionExecutionGate(
+            max_inflight_runs=max_inflight_runs
+        )
         self._closed = False
 
     @property
     def is_ready(self) -> bool:
-        return not self._closed
+        return not self._closed and not self._execution_gate.is_closed
 
     @property
     def is_busy(self) -> bool:
-        return self._busy
+        return self._execution_gate.is_busy
+
+    @property
+    def execution_gate(self) -> SessionExecutionGate:
+        return self._execution_gate
 
     @property
     def chunk_count(self) -> int:
@@ -369,6 +374,8 @@ class RAGRuntime:
         excerpt_chars: int = 360,
         local_retrieval_workers: int = DEFAULT_LOCAL_RETRIEVAL_WORKERS,
         knowledge_output_root: Path | None = None,
+        execution_gate: SessionExecutionGate | None = None,
+        max_inflight_runs: int = 2,
     ) -> RAGRuntime:
         """Construct local runtime dependencies once from project-local artifacts.
 
@@ -550,10 +557,16 @@ class RAGRuntime:
             token_budget=token_budget,
             output_reserve_tokens=output_reserve_tokens,
             excerpt_chars=excerpt_chars,
+            execution_gate=execution_gate,
+            max_inflight_runs=max_inflight_runs,
         )
 
     @classmethod
-    def from_environment(cls) -> RAGRuntime:
+    def from_environment(
+        cls,
+        *,
+        execution_gate: SessionExecutionGate | None = None,
+    ) -> RAGRuntime:
         """Load local paths from environment without reading a dotenv file."""
         project_root = Path(os.getenv("PRA_PROJECT_ROOT", str(Path(__file__).resolve().parents[3])))
         corpus_value = os.getenv("PRA_CORPUS_DIR", "").strip()
@@ -577,6 +590,8 @@ class RAGRuntime:
                 "PRA_LOCAL_RETRIEVAL_WORKERS",
                 DEFAULT_LOCAL_RETRIEVAL_WORKERS,
             ),
+            execution_gate=execution_gate,
+            max_inflight_runs=web_max_inflight_runs_from_environment(),
         )
 
     @classmethod
@@ -593,7 +608,11 @@ class RAGRuntime:
         return cast(ResearchAgentMode, value)
 
     @classmethod
-    async def from_environment_with_agent(cls) -> RAGRuntime:
+    async def from_environment_with_agent(
+        cls,
+        *,
+        execution_gate: SessionExecutionGate | None = None,
+    ) -> RAGRuntime:
         """Construct the normal runtime and then attach the optional Agent lane."""
         project_root = Path(os.getenv("PRA_PROJECT_ROOT", str(Path(__file__).resolve().parents[3])))
         answer_file = _project_path(
@@ -608,7 +627,7 @@ class RAGRuntime:
             "data/runtime/research-agent-state-v1.sqlite3",
         )
         policy = _research_policy_from_environment()
-        runtime = cls.from_environment()
+        runtime = cls.from_environment(execution_gate=execution_gate)
         try:
             await runtime.enable_research_agent(
                 model_id=answer_config.model,
@@ -632,7 +651,7 @@ class RAGRuntime:
         """Attach one durable, policy-gated Agent without exposing internals to Web."""
         if self._closed:
             raise RuntimeClosedError("RAG runtime is closed")
-        if self._busy:
+        if self._execution_gate.is_busy:
             raise RuntimeBusyError("RAG runtime is busy")
         if self._research_agent is not None:
             raise RuntimeError("research agent is already enabled")
@@ -682,26 +701,14 @@ class RAGRuntime:
             raise ValueError("question cannot be blank")
         if self._closed:
             raise RuntimeClosedError("RAG runtime is closed")
-        if self._busy:
-            raise RuntimeBusyError("RAG runtime is busy")
-
-        # There is no await between checking and setting this flag.  Within one
-        # asyncio event loop this is an atomic admission gate; the lock also makes
-        # close wait for an admitted request to finish.
-        self._busy = True
-        try:
-            async with self._execution_lock:
-                if self._closed:
-                    raise RuntimeClosedError("RAG runtime is closed")
-                return await self._execute(
-                    normalized_question,
-                    session_id=session_id,
-                    research_mode=research_mode,
-                    conversation_context=conversation_context,
-                    long_term_memory=long_term_memory,
-                )
-        finally:
-            self._busy = False
+        async with self._execution_gate.admit(session_id):
+            return await self._execute(
+                normalized_question,
+                session_id=session_id,
+                research_mode=research_mode,
+                conversation_context=conversation_context,
+                long_term_memory=long_term_memory,
+            )
 
     async def run_tool_research(
         self,
@@ -716,17 +723,11 @@ class RAGRuntime:
             raise RuntimeError("dynamic research tools are unavailable")
         if self._closed:
             raise RuntimeClosedError("RAG runtime is closed")
-        if self._busy:
-            raise RuntimeBusyError("RAG runtime is busy")
-        self._busy = True
-        try:
-            async with self._execution_lock:
-                return await self._research_agent.run_dynamic_tools(
-                    normalized_question,
-                    thread_id=session_id,
-                )
-        finally:
-            self._busy = False
+        async with self._execution_gate.admit(session_id):
+            return await self._research_agent.run_dynamic_tools(
+                normalized_question,
+                thread_id=session_id,
+            )
 
     async def resume_tool_research(
         self,
@@ -738,55 +739,42 @@ class RAGRuntime:
             raise RuntimeError("dynamic research tools are unavailable")
         if self._closed:
             raise RuntimeClosedError("RAG runtime is closed")
-        if self._busy:
-            raise RuntimeBusyError("RAG runtime is busy")
-        self._busy = True
-        try:
-            async with self._execution_lock:
-                return await self._research_agent.resume_dynamic_tools(
-                    thread_id=session_id,
-                    approved=approved,
-                )
-        finally:
-            self._busy = False
+        async with self._execution_gate.admit(session_id):
+            return await self._research_agent.resume_dynamic_tools(
+                thread_id=session_id,
+                approved=approved,
+            )
 
     async def list_long_term_memories(self, *, limit: int = 20) -> object:
         if self._research_agent is None or not self._research_agent.extended_tools_enabled:
             raise RuntimeError("long-term memory is unavailable")
         if self._closed:
             raise RuntimeClosedError("RAG runtime is closed")
-        if self._busy:
-            raise RuntimeBusyError("RAG runtime is busy")
-        self._busy = True
-        try:
-            async with self._execution_lock:
-                return await self._research_agent.list_long_term_memories(limit=limit)
-        finally:
-            self._busy = False
+        async with self._execution_gate.admit("runtime:long-term-memory"):
+            return await self._research_agent.list_long_term_memories(limit=limit)
 
     async def clear_conversation(self, session_id: str) -> int:
         if self._closed:
             raise RuntimeClosedError("RAG runtime is closed")
-        if self._busy:
-            raise RuntimeBusyError("RAG runtime is busy")
-        clear = getattr(self._memory_store, "clear", None)
-        cleared = 0 if clear is None else int(await asyncio.to_thread(clear, session_id))
-        if self._research_agent is not None:
-            await self._research_agent.clear(session_id)
-        return cleared
+        async with self._execution_gate.admit(session_id):
+            clear = getattr(self._memory_store, "clear", None)
+            cleared = 0 if clear is None else int(await asyncio.to_thread(clear, session_id))
+            if self._research_agent is not None:
+                await self._research_agent.clear(session_id)
+            return cleared
 
     async def aclose(self) -> None:
         if self._closed:
             return
         self._closed = True
-        async with self._execution_lock:
-            await _close_async(self._research_agent)
-            await _close_async(self._retriever)
-            # BilingualRetrievalService does not own its provider adapter.
-            rewriter = getattr(self._retriever, "rewriter", None)
-            if rewriter is not None:
-                await _close_async(rewriter)
-            await _close_async(self._generator)
+        await self._execution_gate.close()
+        await _close_async(self._research_agent)
+        await _close_async(self._retriever)
+        # BilingualRetrievalService does not own its provider adapter.
+        rewriter = getattr(self._retriever, "rewriter", None)
+        if rewriter is not None:
+            await _close_async(rewriter)
+        await _close_async(self._generator)
 
     async def _execute(
         self,
@@ -800,7 +788,10 @@ class RAGRuntime:
         policy = self._memory_config
         if conversation_context is None:
             try:
-                memory_turns = self._memory_store.recent(session_id)
+                memory_turns = await asyncio.to_thread(
+                    self._memory_store.recent,
+                    session_id,
+                )
             except (OSError, sqlite3.Error):
                 memory_turns = ()
             resolved_question = contextualize_retrieval_query(
@@ -919,14 +910,15 @@ class RAGRuntime:
             )
         if conversation_context is None:
             try:
-                self._memory_store.append(
+                await asyncio.to_thread(
+                    self._memory_store.append,
                     turn_from_answer(
                         session_id,
                         question,
                         answer,
                         config=policy,
                         standalone_question=resolved_question,
-                    )
+                    ),
                 )
             except (OSError, sqlite3.Error, ValueError):
                 pass

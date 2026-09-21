@@ -244,6 +244,11 @@ def _runtime_error_response(error: Exception) -> HTTPException:
     name = type(error).__name__
     if name == "RuntimeBusyError":
         return HTTPException(status_code=status.HTTP_409_CONFLICT, detail="系统正在处理上一条问题")
+    if name == "RuntimeCapacityError":
+        return HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="系统繁忙，请稍后重试",
+        )
     if name == "RuntimeClosedError":
         return HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -788,7 +793,8 @@ def create_app(
             from paper_research_agent.web.chat_runtime import ConversationRuntime
 
             app.state.chat_runtime = ConversationRuntime.from_environment(
-                conversation_store=shared_store
+                conversation_store=shared_store,
+                execution_gate=getattr(active, "execution_gate", None),
             )
         try:
             yield

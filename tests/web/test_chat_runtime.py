@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import unittest
 from datetime import UTC, datetime
@@ -19,6 +20,7 @@ from paper_research_agent.web.chat_runtime import (
     RAGUnavailableError,
     RouteOutputError,
 )
+from paper_research_agent.web.concurrency import RuntimeBusyError, RuntimeCapacityError
 
 
 class ConversationRuntimeTests(unittest.IsolatedAsyncioTestCase):
@@ -388,6 +390,50 @@ class ConversationRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("".join(event.get("text", "") for event in events), "你好，我在。")
         self.assertEqual(events[-1]["type"], "done")
         self.assertEqual(events[-1]["metrics"]["total_tokens"], 16)
+        await client.aclose()
+
+    async def test_streams_distinct_sessions_concurrently_with_bounded_capacity(
+        self,
+    ) -> None:
+        release = asyncio.Event()
+        two_started = asyncio.Event()
+        call_count = 0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                two_started.set()
+            await release.wait()
+            body = 'data: {"choices":[{"delta":{"content":"完成"}}]}\n\ndata: [DONE]\n\n'
+            return httpx.Response(200, content=body.encode())
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        runtime = ConversationRuntime(
+            api_key="test",
+            model="qwen-test",
+            client=client,
+            max_inflight_runs=2,
+        )
+
+        async def consume(session_id: str) -> list[dict[str, object]]:
+            return [
+                event
+                async for event in runtime.stream_chat("你好", session_id=session_id)
+            ]
+
+        first = asyncio.create_task(consume("session-1"))
+        second = asyncio.create_task(consume("session-2"))
+        await asyncio.wait_for(two_started.wait(), timeout=1)
+
+        with self.assertRaises(RuntimeBusyError):
+            await consume("session-1")
+        with self.assertRaises(RuntimeCapacityError):
+            await consume("session-3")
+
+        release.set()
+        await asyncio.gather(first, second)
+        await runtime.aclose()
         await client.aclose()
 
     async def test_attachment_question_is_not_treated_as_file_edit(self) -> None:

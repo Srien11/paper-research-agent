@@ -23,6 +23,11 @@ from paper_research_agent.conversation.models import (
     TurnInterpretation,
 )
 from paper_research_agent.conversation.store import ConversationStore
+from paper_research_agent.web.concurrency import (
+    RuntimeClosedError,
+    SessionExecutionGate,
+    web_max_inflight_runs_from_environment,
+)
 from paper_research_agent.web.routing import RAGMode, RouteDecision
 
 logger = logging.getLogger(__name__)
@@ -76,6 +81,8 @@ class ConversationRuntime:
         client: httpx.AsyncClient | None = None,
         max_history_messages: int = 12,
         conversation_store: ConversationStore | None = None,
+        execution_gate: SessionExecutionGate | None = None,
+        max_inflight_runs: int = 2,
     ) -> None:
         if not api_key.strip():
             raise RuntimeError("conversation credentials are unavailable")
@@ -92,13 +99,17 @@ class ConversationRuntime:
             lambda: deque(maxlen=max_history_messages)
         )
         self._conversation_store = conversation_store
-        self._lock = asyncio.Lock()
+        self._execution_gate = execution_gate or SessionExecutionGate(
+            max_inflight_runs=max_inflight_runs
+        )
         self._closed = False
-        self._busy = False
 
     @classmethod
     def from_environment(
-        cls, *, conversation_store: ConversationStore | None = None
+        cls,
+        *,
+        conversation_store: ConversationStore | None = None,
+        execution_gate: SessionExecutionGate | None = None,
     ) -> ConversationRuntime:
         key = os.getenv("DASHSCOPE_API_KEY", "")
         model = os.getenv("PRA_CHAT_MODEL", "qwen3.7-plus-2026-05-26")
@@ -110,6 +121,8 @@ class ConversationRuntime:
             model=model,
             base_url=base_url,
             conversation_store=conversation_store,
+            execution_gate=execution_gate,
+            max_inflight_runs=web_max_inflight_runs_from_environment(),
         )
 
     def set_conversation_store(self, store: ConversationStore) -> None:
@@ -117,11 +130,15 @@ class ConversationRuntime:
 
     @property
     def is_ready(self) -> bool:
-        return not self._closed
+        return not self._closed and not self._execution_gate.is_closed
 
     @property
     def is_busy(self) -> bool:
-        return self._busy
+        return self._execution_gate.is_busy
+
+    @property
+    def execution_gate(self) -> SessionExecutionGate:
+        return self._execution_gate
 
     async def ask(
         self,
@@ -254,12 +271,8 @@ class ConversationRuntime:
         if not normalized:
             raise ValueError("question cannot be blank")
         if self._closed:
-            raise RuntimeError("conversation runtime is closed")
-        if self._busy:
-            raise RuntimeError("conversation runtime is busy")
-        self._busy = True
-        try:
-            async with self._lock:
+            raise RuntimeClosedError("conversation runtime is closed")
+        async with self._execution_gate.admit(session_id):
                 messages: list[dict[str, str]] = [
                     {
                         "role": "system",
@@ -290,8 +303,6 @@ class ConversationRuntime:
                     final_summary=answer,
                     termination_reason="router_finished",
                 )
-        finally:
-            self._busy = False
 
     async def stream_chat(
         self,
@@ -304,16 +315,12 @@ class ConversationRuntime:
         if not normalized:
             raise ValueError("question cannot be blank")
         if self._closed:
-            raise RuntimeError("conversation runtime is closed")
-        if self._busy:
-            raise RuntimeError("conversation runtime is busy")
-        self._busy = True
+            raise RuntimeClosedError("conversation runtime is closed")
         started = time.perf_counter()
         first_token_at: float | None = None
         answer_parts: list[str] = []
         usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-        try:
-            async with self._lock:
+        async with self._execution_gate.admit(session_id):
                 messages = [
                     {"role": "system", "content": _system_prompt()},
                     *await self._history_messages(session_id),
@@ -372,8 +379,6 @@ class ConversationRuntime:
                         "total_tokens": usage["total_tokens"],
                     },
                 }
-        finally:
-            self._busy = False
 
     async def stream_contextual_chat(
         self, request: DirectResponseRequest
@@ -383,16 +388,12 @@ class ConversationRuntime:
         if not normalized:
             raise ValueError("question cannot be blank")
         if self._closed:
-            raise RuntimeError("conversation runtime is closed")
-        if self._busy:
-            raise RuntimeError("conversation runtime is busy")
-        self._busy = True
+            raise RuntimeClosedError("conversation runtime is closed")
         started = time.perf_counter()
         first_token_at: float | None = None
         answer_parts: list[str] = []
         usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-        try:
-            async with self._lock:
+        async with self._execution_gate.admit(request.session_id):
                 messages = self._contextual_messages(request, normalized)
                 async with self._client.stream(
                     "POST",
@@ -446,8 +447,6 @@ class ConversationRuntime:
                         "total_tokens": usage["total_tokens"],
                     },
                 }
-        finally:
-            self._busy = False
 
     def _contextual_messages(
         self, request: DirectResponseRequest, normalized: str
@@ -533,9 +532,12 @@ class ConversationRuntime:
         return {"items": ()}
 
     async def clear_conversation(self, session_id: str) -> int:
-        existed = session_id in self._history
-        self._history.pop(session_id, None)
-        return int(existed)
+        if self._closed:
+            raise RuntimeClosedError("conversation runtime is closed")
+        async with self._execution_gate.admit(session_id):
+            existed = session_id in self._history
+            self._history.pop(session_id, None)
+            return int(existed)
 
     async def _history_messages(self, session_id: str) -> list[dict[str, str]]:
         if self._conversation_store is None:
@@ -555,7 +557,10 @@ class ConversationRuntime:
             )
 
     async def aclose(self) -> None:
+        if self._closed:
+            return
         self._closed = True
+        await self._execution_gate.close()
         if self._owns_client:
             await self._client.aclose()
 
