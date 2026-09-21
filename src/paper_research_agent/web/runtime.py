@@ -100,7 +100,15 @@ if TYPE_CHECKING:
 
 StorageClass = Literal["redistributable", "internal_research_only"]
 EvidenceType = Literal["text", "figure_summary"]
-RewriteStatus = Literal["success", "cache_hit", "stale_cache", "timeout", "error", "agent"]
+RewriteStatus = Literal[
+    "success",
+    "cache_hit",
+    "stale_cache",
+    "not_needed",
+    "timeout",
+    "error",
+    "agent",
+]
 ResearchAgentMode = Literal["auto", "always"]
 ResearchRequestMode = Literal["single", "planned"]
 

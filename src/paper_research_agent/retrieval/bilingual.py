@@ -175,14 +175,16 @@ class BilingualRetrievalService:
         created_at = datetime.now(UTC)
         started = time.perf_counter()
         loop = asyncio.get_running_loop()
+        direct_english = _is_direct_english_query(original_query)
         rewrite_task = asyncio.create_task(
             self._resolve_rewrite(original_query, privacy_ttl_days=privacy_ttl_days)
         )
-        zh_future = loop.run_in_executor(
+        primary_route = "en" if direct_english else "zh"
+        primary_future = loop.run_in_executor(
             self._local_executor,
             functools.partial(
                 self._recall,
-                "zh",
+                primary_route,
                 original_query,
                 filters,
                 sparse_limit,
@@ -191,7 +193,7 @@ class BilingualRetrievalService:
             ),
         )
         try:
-            zh_route = await zh_future
+            first_route = await primary_future
             rewrite = await rewrite_task
         except BaseException:
             rewrite_task.cancel()
@@ -199,8 +201,10 @@ class BilingualRetrievalService:
                 await rewrite_task
             raise
 
-        routes = {"zh": zh_route}
-        route_latencies: dict[str, float] = {"zh_recall": zh_route.latency_ms}
+        routes = {primary_route: first_route}
+        route_latencies: dict[str, float] = {
+            f"{primary_route}_recall": first_route.latency_ms
+        }
         degraded = rewrite.trace.status in {"timeout", "error", "stale_cache"}
         if rewrite.trace.status == "stale_cache":
             degraded_reason = f"query_rewrite_{rewrite.trace.fallback_reason}_using_stale_cache"
@@ -209,7 +213,7 @@ class BilingualRetrievalService:
         else:
             degraded_reason = None
 
-        if rewrite.trace.english_query is not None:
+        if rewrite.trace.english_query is not None and not direct_english:
             en_route = await loop.run_in_executor(
                 self._local_executor,
                 functools.partial(
@@ -233,7 +237,7 @@ class BilingualRetrievalService:
         )
         route_latencies["cross_route_rrf"] = _elapsed_ms(cross_started)
 
-        if rewrite.trace.english_query is not None and rerank:
+        if rewrite.trace.english_query is not None and rerank and len(fused) > 1:
             rerank_started = time.perf_counter()
             final_candidates = await loop.run_in_executor(
                 self._local_executor,
@@ -360,6 +364,17 @@ class BilingualRetrievalService:
     async def _resolve_rewrite(
         self, query: str, *, privacy_ttl_days: int | None = None
     ) -> RewriteResolution:
+        if _is_direct_english_query(query):
+            return RewriteResolution(
+                trace=QueryRewriteTrace(
+                    status="not_needed",
+                    english_query=query,
+                    requested_model=self.rewriter.model_id,
+                    prompt_version=self.rewriter.prompt_version,
+                    latency_ms=0,
+                ),
+                cache_lookup=CacheLookup(),
+            )
         flight_key = rewrite_cache_key(
             query,
             model=self.rewriter.model_id,
@@ -619,6 +634,23 @@ def _trace_from_cached(
         error_class=error_class,
         fallback_reason=fallback_reason,
         cache_error_class=cache_error_class,
+    )
+
+
+def _is_direct_english_query(query: str) -> bool:
+    """Skip provider rewrite only for conservative multi-token ASCII queries."""
+
+    tokens = query.split()
+    if len(tokens) < 2:
+        return False
+    if any(character.isalpha() and not character.isascii() for character in query):
+        return False
+    return (
+        sum(
+            any(character.isascii() and character.isalpha() for character in token)
+            for token in tokens
+        )
+        >= 2
     )
 
 

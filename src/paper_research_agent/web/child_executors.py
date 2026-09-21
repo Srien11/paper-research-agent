@@ -97,6 +97,22 @@ class RAGRuntimeChildExecutor:
                 )
             except ValidationError:
                 continue
+        if self._run_event_publisher is not None:
+            await self._run_event_publisher.publish(
+                _task_event(
+                    request,
+                    "retrieval_started",
+                    node_id=f"retrieval:{request.task_id}",
+                    status="running",
+                    title="检索本地论文",
+                    summary="正在检索并验证可引用证据",
+                    detail=SafeRunEventDetail(
+                        capability="local_rag",
+                        delivery_mode="event_only",
+                    ),
+                ),
+                idempotency_key=_task_event_key(request, "retrieval:started"),
+            )
         child_started = time.perf_counter()
         result = await self._runtime.ask(
             request.objective,

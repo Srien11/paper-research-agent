@@ -60,6 +60,7 @@ AgentStreamEventType = Literal[
     "tool_started",
     "tool_completed",
     "tool_failed",
+    "retrieval_started",
     "retrieval_completed",
     "file_created",
     "answer_started",

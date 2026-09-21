@@ -625,7 +625,7 @@ function runNodeKind(type) {
   if (type === "plan_updated" || type === "goal_updated") return "plan";
   if (type.startsWith("parallel_group_")) return "execution";
   if (type.startsWith("tool_")) return "tool";
-  if (type === "retrieval_completed") return "execution";
+  if (type.startsWith("retrieval_")) return "execution";
   if (type === "file_created") return "tool";
   if (type.startsWith("task_")) return "execution";
   if (type.startsWith("answer_")) return "answer";

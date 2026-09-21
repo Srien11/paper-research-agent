@@ -77,7 +77,14 @@ class RetrievalRun(FrozenContract):
 
 
 class QueryRewriteTrace(FrozenContract):
-    status: Literal["success", "cache_hit", "stale_cache", "timeout", "error"]
+    status: Literal[
+        "success",
+        "cache_hit",
+        "stale_cache",
+        "not_needed",
+        "timeout",
+        "error",
+    ]
     english_query: str | None = None
     requested_model: str = Field(min_length=1)
     actual_model: str | None = None
@@ -91,7 +98,12 @@ class QueryRewriteTrace(FrozenContract):
 
     @model_validator(mode="after")
     def require_query_for_success(self) -> QueryRewriteTrace:
-        successful = self.status in {"success", "cache_hit", "stale_cache"}
+        successful = self.status in {
+            "success",
+            "cache_hit",
+            "stale_cache",
+            "not_needed",
+        }
         if successful != bool(self.english_query and self.english_query.strip()):
             raise ValueError("successful rewrite status must carry a non-empty English query")
         if self.status == "stale_cache" and self.fallback_reason is None:

@@ -191,6 +191,17 @@ class _InsufficientRAGRuntime(_FakeRAGRuntime):
         return result
 
 
+class _BlockingRAGRuntime(_FakeRAGRuntime):
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def ask(self, question: str, **kwargs: object) -> object:
+        self.started.set()
+        await self.release.wait()
+        return await super().ask(question, **kwargs)
+
+
 class ConversationChildExecutorTests(unittest.IsolatedAsyncioTestCase):
     async def test_rag_child_elapsed_is_wall_time_not_answer_provider_time(self) -> None:
         artifact = await RAGRuntimeChildExecutor(
@@ -240,6 +251,46 @@ class ConversationChildExecutorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(completed.detail.citations[0].excerpt, "受控证据预览")
         await bus.aclose()
 
+    async def test_local_rag_persists_started_progress_before_runtime_finishes(self) -> None:
+        store = InMemoryConversationStore()
+        started = store.begin_agent_run(
+            request_id="req_child_12345678901",
+            conversation_id="conversation-1",
+            user_question="测试问题",
+        )
+        bus = RunEventBus(store)
+        runtime = _BlockingRAGRuntime()
+        executor = RAGRuntimeChildExecutor(
+            runtime,
+            run_event_publisher=bus.publisher,
+        )
+        pending = asyncio.create_task(
+            executor.answer(
+                _request(
+                    capability="local_rag",
+                    rag_mode="required",
+                    objective="测试问题",
+                    run_id=started.run_id,
+                    turn_id=started.turn_id,
+                )
+            )
+        )
+        try:
+            await asyncio.wait_for(runtime.started.wait(), timeout=1)
+            events = [
+                item.to_stream_event()
+                for item in store.run_events(started.request_id)
+            ]
+
+            self.assertFalse(pending.done())
+            self.assertEqual([item.type for item in events], ["retrieval_started"])
+            self.assertEqual(events[0].status, "running")
+            self.assertEqual(events[0].detail.capability, "local_rag")
+        finally:
+            runtime.release.set()
+            await pending
+            await bus.aclose()
+
     async def test_insufficient_rag_is_status_only_not_answer_replay(self) -> None:
         store = InMemoryConversationStore()
         started = store.begin_agent_run(
@@ -265,10 +316,13 @@ class ConversationChildExecutorTests(unittest.IsolatedAsyncioTestCase):
         events = [item.to_stream_event() for item in store.run_events(started.request_id)]
 
         self.assertEqual(artifact.answer.status, "insufficient_evidence")
-        self.assertEqual([item.type for item in events], ["retrieval_completed"])
-        self.assertEqual(events[0].status, "failed")
-        self.assertEqual(events[0].title, "本地论文证据不足")
-        self.assertEqual(events[0].detail.source_count, 0)
+        self.assertEqual(
+            [item.type for item in events],
+            ["retrieval_started", "retrieval_completed"],
+        )
+        self.assertEqual(events[1].status, "failed")
+        self.assertEqual(events[1].title, "本地论文证据不足")
+        self.assertEqual(events[1].detail.source_count, 0)
         await bus.aclose()
 
     async def test_provider_deltas_are_persisted_before_child_returns(self) -> None:

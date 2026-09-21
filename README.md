@@ -529,8 +529,8 @@ python scripts/serve_web.py --host 127.0.0.1 --port 8092
 切换兼容模式不会删除主 Agent checkpoint、Conversation Store（会话存储）或事件库，也不要
 手工修改本机 SQLite 状态。问题修复后复用原数据验证，再显式切回 `primary`。
 
-混合并行研究还有独立的严格回滚开关。它默认关闭且只接受大小写不敏感的 `true` / `false`；
-`1`、`yes`、空白值或其他字符串都会令启动失败。关闭时，混合请求会在两个子执行器启动前以
+混合并行研究还有独立的严格回滚开关。它默认开启且只接受大小写不敏感的 `true` / `false`；
+`1`、`yes`、空白值或其他字符串都会令启动失败。需要回滚时设为 `false`，混合请求会在两个子执行器启动前以
 `parallel_hybrid_disabled` 关闭失败，不会退回顺序执行或静默二选一；纯单任务不受影响。
 
 ```powershell

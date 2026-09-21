@@ -1,0 +1,47 @@
+{
+  "schema_version": "interaction-regression-gate-v1",
+  "rules": [
+    {
+      "metric": "aggregates.run_success_rate",
+      "direction": "higher"
+    },
+    {
+      "metric": "aggregates.status_accuracy",
+      "direction": "higher"
+    },
+    {
+      "metric": "aggregates.claim_f1",
+      "direction": "higher"
+    },
+    {
+      "metric": "aggregates.citation_f1",
+      "direction": "higher"
+    },
+    {
+      "metric": "aggregates.required_group_recall",
+      "direction": "higher"
+    },
+    {
+      "metric": "aggregates.paper_recall",
+      "direction": "higher"
+    },
+    {
+      "metric": "aggregates.forbidden_claim_rate",
+      "direction": "lower"
+    },
+    {
+      "metric": "aggregates.unsupported_claim_rate",
+      "direction": "lower"
+    },
+    {
+      "metric": "aggregates.latency_p50_ms",
+      "direction": "lower",
+      "max_relative_regression": 0.1
+    },
+    {
+      "metric": "aggregates.latency_p95_ms",
+      "direction": "lower",
+      "max_relative_regression": 0.1
+    }
+  ]
+}

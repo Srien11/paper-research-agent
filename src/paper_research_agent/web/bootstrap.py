@@ -88,7 +88,7 @@ class ApplicationEnvironment:
     corpus_configured: bool
     timeout_seconds: float = 180
     main_agent_fast_path_enabled: bool = True
-    parallel_hybrid_research_enabled: bool = False
+    parallel_hybrid_research_enabled: bool = True
     max_inflight_runs: int = 2
     web_max_inflight_runs: int = 2
 
@@ -152,7 +152,7 @@ class ApplicationEnvironment:
             parallel_hybrid_research_enabled=_strict_boolean_from_environment(
                 source,
                 "PRA_PARALLEL_HYBRID_RESEARCH_ENABLED",
-                default=False,
+                default=True,
             ),
             max_inflight_runs=_bounded_integer_from_environment(
                 source,

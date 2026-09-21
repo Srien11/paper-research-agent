@@ -205,16 +205,19 @@ class BilingualRetrievalTests(unittest.IsolatedAsyncioTestCase):
         self.zh = chunk("zh", "中文相关")
         self.en = chunk("en", "english winner")
         self.other = chunk("other", "other evidence", "T001")
+        self.english_query = "How does retrieval augmented generation work?"
         self.sparse = StaticIndex(
             {
                 "中文问题": [(self.zh, 4.0), (self.other, 1.0)],
                 "English query": [(self.en, 5.0), (self.other, 2.0)],
+                self.english_query: [(self.en, 5.0), (self.other, 2.0)],
             }
         )
         self.vector = StaticIndex(
             {
                 "中文问题": [(self.zh, 0.9), (self.other, 0.2)],
                 "English query": [(self.en, 0.95), (self.other, 0.3)],
+                self.english_query: [(self.en, 0.95), (self.other, 0.3)],
             }
         )
         self.reranker = RecordingReranker()
@@ -293,6 +296,47 @@ class BilingualRetrievalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.sparse.calls, [])
         self.assertEqual(self.vector.calls, [])
 
+    async def test_english_query_skips_provider_and_duplicate_language_route(self) -> None:
+        rewriter = FakeRewriter(error=AssertionError("must not call provider"))
+
+        run = await self.service(rewriter).search(self.english_query)
+
+        self.assertEqual(run.rewrite.status, "not_needed")
+        self.assertEqual(run.rewrite.english_query, self.english_query)
+        self.assertFalse(run.degraded)
+        self.assertEqual(rewriter.calls, [])
+        self.assertEqual(self.sparse.calls, [(self.english_query, None)])
+        self.assertEqual(self.vector.calls, [(self.english_query, None)])
+        self.assertTrue(all("en.route_rrf" in hit.ranks for hit in run.hits))
+        self.assertTrue(all("zh.route_rrf" not in hit.ranks for hit in run.hits))
+        self.assertEqual(len(self.reranker.calls), 1)
+
+    async def test_single_candidate_safely_skips_reranker(self) -> None:
+        only = chunk("only", "only evidence")
+        query = "Retrieval augmented generation"
+        sparse = StaticIndex({query: [(only, 1.0)]})
+        vector = StaticIndex({query: [(only, 1.0)]})
+        reranker = RecordingReranker()
+        rewriter = FakeRewriter(error=AssertionError("must not call provider"))
+        service = BilingualRetrievalService(
+            sparse,
+            vector,
+            reranker,
+            rewriter,
+            self.cache,
+            self.audit,
+            retrieval_config(),
+            bilingual_config(self.directory),
+            index_id="idx-single",
+        )
+        self.services.append(service)
+
+        run = await service.search(query)
+
+        self.assertEqual([hit.chunk_id for hit in run.hits], ["only"])
+        self.assertEqual(run.rewrite.status, "not_needed")
+        self.assertEqual(reranker.calls, [])
+
     async def test_request_can_expand_recall_and_skip_reranking_for_candidate_discovery(self) -> None:
         run = await self.service(FakeRewriter()).search(
             "中文问题",
@@ -334,9 +378,12 @@ class BilingualRetrievalTests(unittest.IsolatedAsyncioTestCase):
             for index, query in enumerate(queries)
         }
         rankings = {
-            **{query: [(chunks[query], 1.0)] for query in queries},
             **{
-                f"English {query}": [(chunks[query], 1.0)]
+                query: [(chunks[query], 1.0), (self.other, 0.1)]
+                for query in queries
+            },
+            **{
+                f"English {query}": [(chunks[query], 1.0), (self.other, 0.1)]
                 for query in queries
             },
         }

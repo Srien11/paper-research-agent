@@ -294,7 +294,7 @@ class ApplicationBootstrapTests(unittest.IsolatedAsyncioTestCase):
                 }
             )
 
-    def test_parallel_hybrid_environment_flag_is_strict_and_defaults_false(self) -> None:
+    def test_parallel_hybrid_environment_flag_is_strict_and_defaults_true(self) -> None:
         default = ApplicationEnvironment.from_environment(
             {"PRA_PROJECT_ROOT": str(Path.cwd())}
         )
@@ -311,7 +311,7 @@ class ApplicationBootstrapTests(unittest.IsolatedAsyncioTestCase):
             }
         )
 
-        self.assertFalse(default.parallel_hybrid_research_enabled)
+        self.assertTrue(default.parallel_hybrid_research_enabled)
         self.assertTrue(enabled.parallel_hybrid_research_enabled)
         self.assertFalse(disabled.parallel_hybrid_research_enabled)
         for invalid in ("1", "yes", "", "   ", "enabled"):
