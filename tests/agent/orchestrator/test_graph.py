@@ -1590,6 +1590,49 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
             "pending approval without a waiting task", state["validation_errors"]
         )
 
+    async def test_same_paper_can_support_multiple_local_tasks(self) -> None:
+        graph, store, _dispatcher, _planner = self._build(
+            plan_decisions=(_plan_decision((
+                _task(task_id="definition", capability="local_rag"),
+                _task(task_id="application", capability="local_rag"),
+            )),),
+            dispatch_results=(
+                _result(task_id="definition", source_id="shared-paper"),
+                _result(task_id="application", source_id="shared-paper"),
+            ),
+        )
+        request = MainAgentRequest(
+            request_id="request-shared-paper", conversation_id="conversation-1",
+            message="解释定义和应用", rag_mode="preferred",
+        )
+        state = await self._run(graph, request)
+        self.assertEqual(state["termination_reason"], "completed")
+        self.assertEqual(state["validation_errors"], ())
+        self.assertEqual(store.load_workspace("conversation-1").version, 1)
+        self.assertEqual(store.history("conversation-1")[-1].source_ids, ("shared-paper",))
+
+    async def test_duplicate_sources_within_one_child_still_abort_commit(self) -> None:
+        from paper_research_agent.agent.orchestrator.graph import _validate_commit_state
+
+        child = _result(task_id="local", source_id="shared-paper").model_copy(
+            update={"source_ids": ("shared-paper", "shared-paper")}
+        )
+        graph, store, _dispatcher, _planner = self._build(
+            plan_decisions=(_plan_decision((_task(task_id="local", capability="local_rag"),)),),
+            dispatch_results=(child,),
+        )
+        request = MainAgentRequest(
+            request_id="request-duplicate-within-child", conversation_id="conversation-1",
+            message="解释定义", rag_mode="preferred",
+        )
+        self.assertIn("child source IDs must be unique", _validate_commit_state(
+            ConversationWorkspace(conversation_id="conversation-1", updated_at=_utc()),
+            {"child_results": [child]}
+        ))
+        with self.assertRaisesRegex(ValueError, "source IDs must be unique"):
+            await self._run(graph, request)
+        self.assertEqual(store.load_workspace("conversation-1").version, 0)
+
     async def test_duplicate_child_source_ids_abort_commit(self) -> None:
         plan = _plan_decision(
             (

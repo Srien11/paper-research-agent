@@ -18,6 +18,11 @@ from paper_research_agent.answering.models import (
     GenerationResult,
     ProviderAnswer,
 )
+from paper_research_agent.answering.streaming import (
+    PreviewCallback,
+    answer_preview,
+    project_preview,
+)
 
 DEFAULT_API_KEY_ENV = "DASHSCOPE_API_KEY"
 DEFAULT_BASE_URL_ENV = "DASHSCOPE_BASE_URL"
@@ -95,6 +100,9 @@ class DashScopeAnswerGenerator:
         self._sleep = sleep
 
     async def generate(self, request: AnswerRequest) -> GenerationResult:
+        preview = answer_preview.get()
+        if preview is not None:
+            return await self._generate_stream(request, preview)
         if self._config.max_output_tokens > request.context.output_reserve_tokens:
             raise ValueError("answer max_output_tokens exceeds the context output reserve")
         payload: dict[str, object] = {
@@ -203,6 +211,88 @@ class DashScopeAnswerGenerator:
             ) from None
         raise AssertionError("answer generation loop exited unexpectedly")
 
+    async def _generate_stream(
+        self, request: AnswerRequest, preview: PreviewCallback
+    ) -> GenerationResult:
+        if self._config.max_output_tokens > request.context.output_reserve_tokens:
+            raise ValueError("answer max_output_tokens exceeds the context output reserve")
+        payload: dict[str, object] = {
+            "model": self.model_id,
+            "messages": [message.model_dump(mode="json") for message in request.context.messages],
+            "response_format": {"type": "json_object"},
+            "temperature": self._config.temperature,
+            "top_p": self._config.top_p,
+            "enable_thinking": self._config.enable_thinking,
+            "max_tokens": self._config.max_output_tokens,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        started = time.perf_counter()
+        input_tokens = output_tokens = attempts = 0
+        try:
+            async with asyncio.timeout(self._config.timeout_seconds):
+                for attempt in range(1, self._config.max_retries + 2):
+                    attempts = attempt
+                    await preview("")  # A new attempt replaces, never appends to, the old draft.
+                    try:
+                        async with self._client.stream(
+                            "POST", self._endpoint, json=payload
+                        ) as response:
+                            if response.is_error:
+                                if (
+                                    response.status_code in RETRYABLE_STATUS_CODES
+                                    and attempt <= self._config.max_retries
+                                ):
+                                    await self._sleep(_retry_delay(response, attempt))
+                                    continue
+                                raise AnswerGenerationError(
+                                    f"answer generation request failed with HTTP {response.status_code}",
+                                    status_code=response.status_code,
+                                    attempts=attempts,
+                                    input_tokens=input_tokens,
+                                    output_tokens=output_tokens,
+                                )
+                            (
+                                content,
+                                actual_model,
+                                used_input,
+                                used_output,
+                            ) = await _read_answer_stream(
+                                response, preview=preview, requested_model=self.model_id
+                            )
+                        input_tokens += used_input
+                        output_tokens += used_output
+                        ProviderAnswer.model_validate_json(content)
+                        return GenerationResult(
+                            content=content,
+                            requested_model=self.model_id,
+                            actual_model=actual_model,
+                            prompt_version=self.prompt_version,
+                            input_tokens=input_tokens,
+                            output_tokens=output_tokens,
+                            latency_ms=(time.perf_counter() - started) * 1000,
+                            attempts=attempts,
+                        )
+                    except (httpx.RequestError, ValueError, TypeError) as error:
+                        await preview("")
+                        if attempt <= self._config.max_retries:
+                            await self._sleep(_backoff_seconds(attempt))
+                            continue
+                        raise AnswerGenerationError(
+                            f"answer stream failed: {type(error).__name__}",
+                            attempts=attempts,
+                            input_tokens=input_tokens,
+                            output_tokens=output_tokens,
+                        ) from None
+        except TimeoutError:
+            raise AnswerGenerationError(
+                "answer generation exceeded its total deadline",
+                attempts=attempts,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            ) from None
+        raise AssertionError("answer stream loop exited unexpectedly")
+
     async def aclose(self) -> None:
         if self._owns_client:
             await self._client.aclose()
@@ -222,6 +312,73 @@ def _response_content(response: Mapping[str, object]) -> str:
     if not isinstance(content, str) or not content.strip():
         raise ValueError("answer response content is empty")
     return content.strip()
+
+
+async def _read_answer_stream(
+    response: httpx.Response, *, preview: PreviewCallback, requested_model: str
+) -> tuple[str, str, int, int]:
+    content = ""
+    actual_model = requested_model
+    input_tokens = output_tokens = 0
+    stopped = done = False
+    last_text = ""
+    last_paint = 0.0
+    data: list[str] = []
+
+    async def frame(raw: str) -> bool:
+        nonlocal content, actual_model, input_tokens, output_tokens, stopped, last_text, last_paint
+        if raw == "[DONE]":
+            return True
+        body = json.loads(raw)
+        if not isinstance(body, dict) or "error" in body:
+            raise ValueError("invalid stream frame")
+        if isinstance(body.get("model"), str) and body["model"].strip():
+            actual_model = body["model"].strip()
+        if isinstance(body.get("usage"), dict):
+            input_tokens, output_tokens = _usage(body["usage"])
+        for choice in body.get("choices", []):
+            if not isinstance(choice, dict) or choice.get("index", 0) != 0:
+                continue
+            finish = choice.get("finish_reason")
+            if finish is not None:
+                if finish != "stop":
+                    raise ValueError("answer stream did not finish normally")
+                stopped = True
+            delta = choice.get("delta", {})
+            piece = delta.get("content") if isinstance(delta, dict) else None
+            if piece is not None and not isinstance(piece, str):
+                raise ValueError("invalid content delta")
+            if isinstance(piece, str):
+                content += piece
+                if len(content) > 262_144:
+                    raise ValueError("answer stream exceeds limit")
+                text = project_preview(content)
+                now = time.perf_counter()
+                if text != last_text and (not last_text or now - last_paint >= 0.04):
+                    await preview(text)
+                    last_text, last_paint = text, now
+        return False
+
+    async for line in response.aiter_lines():
+        if len(line) > 262_144:
+            raise ValueError("stream frame exceeds limit")
+        if line.startswith("data:"):
+            data.append(line[5:].lstrip())
+            if sum(map(len, data)) > 262_144:
+                raise ValueError("stream frame exceeds limit")
+        elif not line and data:
+            done = await frame("\n".join(data))
+            data.clear()
+            if done:
+                break
+    if not done and data:
+        done = await frame("\n".join(data))
+    if not done or not stopped or not content.strip():
+        raise ValueError("incomplete answer stream")
+    text = project_preview(content)
+    if text != last_text:
+        await preview(text)
+    return content, actual_model, input_tokens, output_tokens
 
 
 def _usage(value: object) -> tuple[int, int]:

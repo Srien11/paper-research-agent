@@ -23,11 +23,13 @@ from paper_research_agent.agent.orchestrator.artifacts import (
 from paper_research_agent.agent.orchestrator.identifiers import child_session_id
 from paper_research_agent.agent.orchestrator.models import ChildTaskRequest
 from paper_research_agent.answering.models import RAGAnswer
+from paper_research_agent.answering.streaming import preview_scope
 from paper_research_agent.context.models import ContextLongTermMemory
 from paper_research_agent.web.chat_runtime import DirectResponseRequest
 from paper_research_agent.web.events import (
     AgentStreamEventDraft,
     AgentStreamEventType,
+    AnswerPreviewEvent,
     RunNodeStatus,
     SafeRunEventDetail,
 )
@@ -114,14 +116,30 @@ class RAGRuntimeChildExecutor:
                 idempotency_key=_task_event_key(request, "retrieval:started"),
             )
         child_started = time.perf_counter()
-        result = await self._runtime.ask(
-            request.objective,
-            session_id=_child_session_id("research", request),
-            research_mode=(
-                "planned" if requires_research_planning(request.objective) else "single"
-            ),
-            long_term_memory=tuple(long_term_memory),
-        )
+        preview_publisher = getattr(self._run_event_publisher, "publish_preview", None)
+        sequence = 0
+
+        async def preview(text: str) -> None:
+            nonlocal sequence
+            if callable(preview_publisher):
+                sequence += 1
+                await preview_publisher(AnswerPreviewEvent(
+                    request_id=request.request_id, run_id=request.run_id,
+                    node_id=f"answer:{request.task_id}", sequence=sequence, text=text,
+                ))
+
+        try:
+            with preview_scope(preview if callable(preview_publisher) else None):
+                result = await self._runtime.ask(
+                    request.objective,
+                    session_id=_child_session_id("research", request),
+                    research_mode=(
+                        "planned" if requires_research_planning(request.objective) else "single"
+                    ),
+                    long_term_memory=tuple(long_term_memory),
+                )
+        finally:
+            await preview("")
         child_elapsed_ms = (time.perf_counter() - child_started) * 1_000
         answer = RAGAnswer.model_validate(_value(result, "answer"))
         retrieval = _value(result, "retrieval")

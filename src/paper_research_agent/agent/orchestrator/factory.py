@@ -78,6 +78,7 @@ def build_main_agent_runtime(
         repository=store,
         dispatcher=dispatcher,
         synthesizer=resolved_synthesizer,
+        run_event_publisher=run_event_publisher,
     ).resume
     return MainAgentRuntime(
         graph=graph,

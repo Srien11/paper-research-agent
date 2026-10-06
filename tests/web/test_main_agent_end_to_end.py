@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from httpx import Response
+from langchain_core.messages import AIMessageChunk
 
 from paper_research_agent.agent.orchestrator.artifacts import (
     AttachmentArtifact,
@@ -72,6 +73,22 @@ class _InterpreterModel:
     async def ainvoke(self, messages: object) -> object:
         self.messages.append(messages)
         return self.response
+
+    def bind_tools(self, tools: object, *, tool_choice: str) -> object:
+        del tools
+        self.tool_choice = tool_choice
+        return self
+
+    async def astream(self, messages: object):
+        self.messages.append(messages)
+        yield AIMessageChunk(
+            content="",
+            tool_call_chunks=[{
+                "name": self.tool_choice, "id": "synthetic-call", "index": 0,
+                "args": json.dumps(self.response),
+            }],
+            response_metadata={"finish_reason": "tool_calls"},
+        )
 
 
 class _ParallelEvidenceDispatcher:

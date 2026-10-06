@@ -5,10 +5,15 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import Awaitable, Callable
+from itertools import count
 
 from paper_research_agent.conversation.models import PersistedRunEvent
 from paper_research_agent.conversation.store import ConversationStore
-from paper_research_agent.web.events import AgentStreamEvent, AgentStreamEventDraft
+from paper_research_agent.web.events import (
+    AgentStreamEvent,
+    AgentStreamEventDraft,
+    AnswerPreviewEvent,
+)
 
 _CLOSED = object()
 
@@ -20,9 +25,15 @@ class RunEventPublisher:
         self,
         store: ConversationStore,
         fanout: Callable[[PersistedRunEvent], Awaitable[None]],
+        preview_fanout: Callable[[AnswerPreviewEvent], Awaitable[None]] | None = None,
     ) -> None:
         self._store = store
         self._fanout = fanout
+        self._preview_fanout = preview_fanout
+
+    async def publish_preview(self, event: AnswerPreviewEvent) -> None:
+        if self._preview_fanout is not None:
+            await self._preview_fanout(event)
 
     async def publish(
         self,
@@ -53,7 +64,7 @@ class RunEventSubscription:
         self.token = token
         self.request_id = request_id
         self.last_event_id = after_event_id
-        self.queue: asyncio.Queue[AgentStreamEvent | object] = asyncio.Queue(
+        self.queue: asyncio.Queue[AgentStreamEvent | AnswerPreviewEvent | object] = asyncio.Queue(
             maxsize=queue_size
         )
         self.backfill: list[AgentStreamEvent] = []
@@ -64,7 +75,7 @@ class RunEventSubscription:
     def __aiter__(self) -> RunEventSubscription:
         return self
 
-    async def __anext__(self) -> AgentStreamEvent:
+    async def __anext__(self) -> AgentStreamEvent | AnswerPreviewEvent:
         if self._closed or self._segment_closed:
             await self.aclose()
             raise StopAsyncIteration
@@ -80,6 +91,8 @@ class RunEventSubscription:
                 if item is _CLOSED:
                     await self.aclose()
                     raise StopAsyncIteration
+                if isinstance(item, AnswerPreviewEvent):
+                    return item
                 assert isinstance(item, AgentStreamEvent)
                 event = item
             if event.event_id <= self.last_event_id:
@@ -93,7 +106,7 @@ class RunEventSubscription:
         if self._closed:
             return
         self._closed = True
-        await self._bus._unsubscribe(self.token)
+        self._bus._unsubscribe(self.token)
 
 
 class RunEventBus:
@@ -112,7 +125,21 @@ class RunEventBus:
         self._lock = asyncio.Lock()
         self._subscribers: dict[str, RunEventSubscription] = {}
         self._closed = False
-        self.publisher = RunEventPublisher(store, self._fanout)
+        self._preview_sequence = count(1)
+        self.publisher = RunEventPublisher(store, self._fanout, self._preview_fanout)
+
+    async def _preview_fanout(self, event: AnswerPreviewEvent) -> None:
+        async with self._lock:
+            event = event.model_copy(update={"sequence": next(self._preview_sequence)})
+            targets = tuple(s for s in self._subscribers.values()
+                            if s.request_id == event.request_id and not s._closed
+                            and not s._segment_closed)
+        for subscription in targets:
+            try:
+                subscription.queue.put_nowait(event)
+            except asyncio.QueueFull:
+                # Snapshots are disposable. Never delay generation or persist a draft.
+                pass
 
     async def subscribe(
         self,
@@ -134,13 +161,17 @@ class RunEventBus:
             if self._closed:
                 raise RuntimeError("run event bus is closed")
             self._subscribers[token] = subscription
-        subscription.backfill.extend(await self._load_after(subscription))
-        if (
-            not subscription.backfill
-            and after_event_id > 0
-            and await self._cursor_is_terminal(subscription)
-        ):
-            subscription._segment_closed = True
+        try:
+            subscription.backfill.extend(await self._load_after(subscription))
+            if (
+                not subscription.backfill
+                and after_event_id > 0
+                and await self._cursor_is_terminal(subscription)
+            ):
+                subscription._segment_closed = True
+        except BaseException:
+            await subscription.aclose()
+            raise
         return subscription
 
     async def _cursor_is_terminal(
@@ -183,9 +214,10 @@ class RunEventBus:
             except asyncio.QueueFull:
                 subscription.needs_backfill = True
 
-    async def _unsubscribe(self, token: str) -> None:
-        async with self._lock:
-            self._subscribers.pop(token, None)
+    def _unsubscribe(self, token: str) -> None:
+        # All subscriber access is on the event loop. Removing without an await
+        # makes disconnect cleanup work even inside an already cancelled scope.
+        self._subscribers.pop(token, None)
 
     async def aclose(self) -> None:
         async with self._lock:

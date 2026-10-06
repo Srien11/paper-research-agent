@@ -69,11 +69,13 @@ from paper_research_agent.agent.orchestrator.router import (
 )
 from paper_research_agent.agent.orchestrator.state import MainAgentGraphState
 from paper_research_agent.agent.orchestrator.synthesizer import AnswerSynthesizer
+from paper_research_agent.answering.streaming import preview_scope
 from paper_research_agent.conversation.models import ConversationResolution, ConversationStatus
 from paper_research_agent.conversation.store import ConversationStore
 from paper_research_agent.web.events import (
     AgentStreamEventDraft,
     AgentStreamEventType,
+    AnswerPreviewEvent,
     RunNodeStatus,
     SafeRunEventDetail,
 )
@@ -857,7 +859,24 @@ def build_main_agent_graph(
             ChildTaskResult.model_validate(raw)
             for raw in state.get("child_results", [])
         )
-        answer = await answer_synthesizer.synthesize(context, child_results)
+        preview_publisher = getattr(run_event_publisher, "publish_preview", None)
+        request = MainAgentRequest.model_validate(state["request"])
+        sequence = 0
+
+        async def preview(text: str) -> None:
+            nonlocal sequence
+            if callable(preview_publisher):
+                sequence += 1
+                await preview_publisher(AnswerPreviewEvent(
+                    request_id=request.request_id, run_id=str(state["run_id"]),
+                    node_id="answer:main", sequence=sequence, text=text,
+                ))
+
+        try:
+            with preview_scope(preview if callable(preview_publisher) else None):
+                answer = await answer_synthesizer.synthesize(context, child_results)
+        finally:
+            await preview("")
         degradation_codes = degradation_codes_for_results(child_results)
         return {
             "final_answer": answer.text[:20_000],
@@ -1126,10 +1145,12 @@ class MainAgentApprovalResumer:
         repository: ConversationStore,
         dispatcher: ChildGraphDispatcher,
         synthesizer: AnswerSynthesizer | None = None,
+        run_event_publisher: Any | None = None,
     ) -> None:
         self._repository = repository
         self._dispatcher = dispatcher
         self._synthesizer = synthesizer or AnswerSynthesizer()
+        self._run_event_publisher = run_event_publisher
 
     async def resume(self, request_id: str, approved: bool) -> MainAgentResult:
         request = MainAgentResumeRequest(request_id=request_id, approved=approved)
@@ -1211,7 +1232,20 @@ class MainAgentApprovalResumer:
                 workspace=workspace,
                 prepared_at=datetime.now(UTC),
             )
-            synthesized = await self._synthesizer.synthesize(context, child_results)
+            preview_publisher = getattr(self._run_event_publisher, "publish_preview", None)
+
+            async def preview(text: str) -> None:
+                if callable(preview_publisher):
+                    await preview_publisher(AnswerPreviewEvent(
+                        request_id=context.request_id, run_id=claim.result.run_id,
+                        node_id="answer:main", sequence=1, text=text,
+                    ))
+
+            try:
+                with preview_scope(preview if callable(preview_publisher) else None):
+                    synthesized = await self._synthesizer.synthesize(context, child_results)
+            finally:
+                await preview("")
             answer = synthesized.text[:20_000]
             status: Literal["completed", "waiting_approval"] = "completed"
         else:
@@ -1538,13 +1572,20 @@ def _validate_commit_state(
         ]
         if pending_approval is not None and not approval_task:
             errors.append("pending approval without a waiting task")
-    source_ids = tuple(
-        source_id
-        for item in state.get("child_results", [])
-        for source_id in ChildTaskResult.model_validate(item).source_ids
-    )
-    if len(source_ids) != len(set(source_ids)):
-        errors.append("child source IDs must be unique")
+    source_kinds: dict[str, str] = {}
+    for item in state.get("child_results", []):
+        child = ChildTaskResult.model_validate(item)
+        if len(child.source_ids) != len(set(child.source_ids)):
+            errors.append("child source IDs must be unique")
+            break
+        for source_id in child.source_ids:
+            previous_kind = source_kinds.get(source_id)
+            if previous_kind is not None and previous_kind != child.citation_kind:
+                errors.append("child source IDs must be unique")
+                break
+            source_kinds[source_id] = child.citation_kind
+        if errors and errors[-1] == "child source IDs must be unique":
+            break
     return tuple(errors)
 
 

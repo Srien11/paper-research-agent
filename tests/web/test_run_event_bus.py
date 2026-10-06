@@ -3,13 +3,31 @@ from __future__ import annotations
 import asyncio
 import unittest
 from datetime import UTC, datetime
+from unittest.mock import patch
 
 from paper_research_agent.conversation.store import InMemoryConversationStore
-from paper_research_agent.web.events import AgentStreamEventDraft
+from paper_research_agent.web.events import AgentStreamEventDraft, AnswerPreviewEvent
 from paper_research_agent.web.run_event_bus import RunEventBus
 
 
 class RunEventBusTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancelled_refresh_during_backfill_removes_subscription(self) -> None:
+        entered = asyncio.Event()
+
+        async def delayed_load(subscription):
+            entered.set()
+            await asyncio.Future()
+
+        with patch.object(self.bus, "_load_after", delayed_load):
+            for _ in range(20):
+                entered.clear()
+                task = asyncio.create_task(self.bus.subscribe(self.request_id))
+                await asyncio.wait_for(entered.wait(), 1)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                self.assertEqual(self.bus._subscribers, {})
+
     def setUp(self) -> None:
         self.store = InMemoryConversationStore()
         self.bus = RunEventBus(self.store, subscriber_queue_size=1)
@@ -39,6 +57,43 @@ class RunEventBusTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self) -> None:
         await self.bus.aclose()
+
+    async def test_preview_is_request_local_volatile_and_does_not_advance_cursor(self):
+        self.begin()
+        own = await self.bus.subscribe(self.request_id)
+        other = await self.bus.subscribe("req_other_1234567890")
+        preview = AnswerPreviewEvent(request_id=self.request_id, run_id=self.started.run_id,
+                                     node_id="answer:main", sequence=1, text="draft")
+        await self.bus.publisher.publish_preview(preview)
+        event = await anext(own)
+        self.assertEqual(event.text, "draft")
+        self.assertEqual(own.last_event_id, 0)
+        self.assertEqual(self.store.run_events(self.request_id), ())
+        self.assertTrue(other.queue.empty())
+        replay = await self.bus.subscribe(self.request_id)
+        self.assertEqual(replay.backfill, [])
+        await self.bus.publisher.publish_preview(preview)
+        await self.bus.publisher.publish_preview(preview.model_copy(update={"text": "dropped"}))
+        await self.bus.publisher.publish(self.draft("run_completed", status="completed"))
+        terminal = await anext(own)
+        self.assertEqual(terminal.type, "run_completed")
+        with self.assertRaises(StopAsyncIteration):
+            await anext(own)
+        self.assertEqual(len(self.store.run_events(self.request_id)), 1)
+        await other.aclose()
+        await replay.aclose()
+
+    async def test_preview_sequence_survives_reinvocation(self):
+        self.begin()
+        own = await self.bus.subscribe(self.request_id)
+        preview = AnswerPreviewEvent(request_id=self.request_id, run_id=self.started.run_id,
+                                     node_id="answer:main", sequence=1, text="draft")
+        await self.bus.publisher.publish_preview(preview)
+        first = await anext(own)
+        await self.bus.publisher.publish_preview(preview)
+        second = await anext(own)
+        self.assertGreater(second.sequence, first.sequence)
+        await own.aclose()
 
     async def test_subscribe_before_run_creation_receives_first_event(self) -> None:
         subscription = await self.bus.subscribe(self.request_id)

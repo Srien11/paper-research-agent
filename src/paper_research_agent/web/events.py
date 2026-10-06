@@ -93,6 +93,20 @@ RunNodeStatus = Literal[
 DeliveryMode = Literal["provider_live", "validated_replay", "event_only"]
 
 
+class AnswerPreviewEvent(WebModel):
+    """Volatile text snapshot: never a durable event and never a resume cursor."""
+
+    schema_version: Literal["main-agent-preview-v1"] = "main-agent-preview-v1"
+    request_id: str = Field(pattern=r"^[A-Za-z0-9_-]{16,128}$")
+    run_id: str = Field(min_length=1, max_length=256)
+    node_id: str = Field(min_length=1, max_length=256)
+    sequence: int = Field(ge=1)
+    text: str = Field(max_length=20_000)
+
+    def to_ndjson(self) -> bytes:
+        return (self.model_dump_json() + "\n").encode("utf-8")
+
+
 class SafeRunEventDetail(WebModel):
     """Strict public projection; arbitrary provider and tool payloads are forbidden."""
 

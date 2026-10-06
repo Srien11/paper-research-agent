@@ -45,6 +45,7 @@ from paper_research_agent.web.events import (
     RunNodeStatus,
     SafeRunEventDetail,
 )
+from paper_research_agent.web.models import SafeEvidenceSource
 
 ApprovalResumer = Callable[[str, bool], Awaitable[MainAgentResult]]
 Closer = Callable[[], Awaitable[None]]
@@ -344,14 +345,39 @@ class MainAgentRuntime:
                 idempotency_key="reasoning:completed",
                 node_id="reasoning:main",
             )
-        if result.status == "completed" and result.answer and "answer_delta" not in event_types:
+        final_answer_sent = any(
+            item.node_id == "answer:main" and item.event_type == "answer_completed"
+            for item in existing
+        )
+        if result.status == "completed" and result.answer and not final_answer_sent:
+            # Reuse validated public source metadata; ambiguous child IDs stay plain text.
+            source_candidates: dict[str, SafeEvidenceSource] = {}
+            ambiguous = set()
+            for item in existing:
+                if item.event_type != "answer_completed":
+                    continue
+                for source in item.to_stream_event().detail.citations:
+                    previous = source_candidates.get(source.citation_id)
+                    if previous is not None and previous != source:
+                        ambiguous.add(source.citation_id)
+                    source_candidates[source.citation_id] = source
+            final_source_list: list[SafeEvidenceSource] = []
+            source_chars = 0
+            for key, source in source_candidates.items():
+                if key in ambiguous:
+                    continue
+                source_chars += len(source.model_dump_json()) + 1
+                if source_chars > 16_000 or len(final_source_list) >= 100:
+                    break
+                final_source_list.append(source)
+            final_sources = tuple(final_source_list)
             await self._publish_product_event(
                 request,
                 start,
                 event_type="answer_started",
                 status="running",
                 title="整理回答",
-                detail=SafeRunEventDetail(delivery_mode="validated_replay"),
+                detail=SafeRunEventDetail(delivery_mode="validated_replay", reason_code="final_answer"),
                 idempotency_key="answer:start",
                 node_id="answer:main",
             )
@@ -372,7 +398,7 @@ class MainAgentRuntime:
                 event_type="answer_completed",
                 status="completed",
                 title="回答完成",
-                detail=SafeRunEventDetail(delivery_mode="validated_replay"),
+                detail=SafeRunEventDetail(delivery_mode="validated_replay", citations=final_sources),
                 idempotency_key="answer:completed",
                 node_id="answer:main",
             )

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Literal
+from typing import Any, Literal
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -18,6 +18,7 @@ from paper_research_agent.agent.orchestrator.prompts import (
     ANSWER_SYNTHESIZER_PROMPT_VERSION,
     ANSWER_SYNTHESIZER_SYSTEM,
 )
+from paper_research_agent.answering.streaming import answer_preview, project_preview
 
 _MAX_MODEL_INPUT_CHARS = 24_000
 _MAX_ARTIFACT_CHARS = 6_000
@@ -84,6 +85,7 @@ class AnswerSynthesizer:
         *,
         version: str = ANSWER_SYNTHESIZER_PROMPT_VERSION,
     ) -> None:
+        self._raw_model = model
         self._model = (
             model.with_structured_output(_SynthesisDraft, method="function_calling")
             if model is not None
@@ -108,7 +110,31 @@ class AnswerSynthesizer:
         )
         user = HumanMessage(content=_model_input(context, results))
         try:
-            raw = await self._model.ainvoke([system, user])
+            preview = answer_preview.get()
+            if preview is not None and self._raw_model is not None:
+                bound = self._raw_model.bind_tools([_SynthesisDraft], tool_choice="_SynthesisDraft")
+                collected: Any = None
+                arguments = ""
+                async for chunk in bound.astream([system, user]):
+                    collected = chunk if collected is None else collected + chunk
+                    for call in getattr(chunk, "tool_call_chunks", []):
+                        if call.get("index", 0) == 0:
+                            arguments += call.get("args") or ""
+                            if len(arguments) > 262_144:
+                                raise ValueError("synthesis stream exceeds limit")
+                    await preview(project_preview(arguments, synthesis=True))
+                calls = getattr(collected, "tool_calls", [])
+                if len(calls) != 1 or calls[0].get("name") != "_SynthesisDraft":
+                    raise ValueError("synthesis stream missing structured result")
+                if getattr(collected, "response_metadata", {}).get("finish_reason") not in (
+                    "stop", "tool_calls"
+                ):
+                    raise ValueError("synthesis stream did not finish normally")
+                # LangChain parses partial tool JSON for display; final validation must
+                # parse the original complete arguments rather than that partial object.
+                raw = json.loads(arguments)
+            else:
+                raw = await self._model.ainvoke([system, user])
         except Exception as error:
             if _all_evidence_unavailable(results):
                 raise SynthesisUnavailableError(

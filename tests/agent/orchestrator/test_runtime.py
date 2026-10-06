@@ -574,3 +574,36 @@ class MainAgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FinalAnswerReconciliationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_child_deltas_do_not_suppress_committed_final_or_its_citations(self):
+        from paper_research_agent.web.events import AgentStreamEventDraft, SafeRunEventDetail
+        from paper_research_agent.web.models import SafeEvidenceSource
+        store = InMemoryConversationStore()
+        bus = RunEventBus(store)
+        request = _request(request_id="req_final_reconcile_123")
+        start = store.begin_agent_run(request_id=request.request_id,
+                                      conversation_id=request.conversation_id, user_question=request.message)
+        source = SafeEvidenceSource(citation_id="E1", chunk_id="chunk-1", corpus_id="C001",
+                                    title="Synthetic", page_start=1, page_end=1, evidence_type="text",
+                                    storage_class="redistributable", excerpt="Synthetic excerpt", final_rank=1)
+        for kind in ("answer_delta", "answer_completed"):
+            await bus.publisher.publish(AgentStreamEventDraft(
+                type=kind, occurred_at=datetime.now(UTC), request_id=request.request_id,
+                run_id=start.run_id, turn_id=start.turn_id, node_id="answer:child",
+                delta="child" if kind == "answer_delta" else None,
+                detail=SafeRunEventDetail(citations=(source,) if kind == "answer_completed" else ())))
+        runtime = MainAgentRuntime(graph=_FakeGraph(), repository=store, run_event_publisher=bus.publisher)
+        result = MainAgentResult(run_id=start.run_id, request_id=request.request_id,
+                                 conversation_id=request.conversation_id, status="completed",
+                                 answer="committed final [E1]")
+        await runtime._publish_result(request, start, result)
+        await runtime._publish_result(request, start, result)
+        final = [event.to_stream_event() for event in store.run_events(request.request_id)
+                 if event.node_id == "answer:main"]
+        self.assertEqual(sum(event.type == "answer_completed" for event in final), 1)
+        self.assertEqual(''.join(event.delta or '' for event in final), result.answer)
+        self.assertEqual(final[0].detail.reason_code, "final_answer")
+        self.assertEqual(final[-1].detail.citations, (source,))
+        await bus.aclose()

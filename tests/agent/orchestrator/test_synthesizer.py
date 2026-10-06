@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import unittest
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, Mock
@@ -280,3 +282,49 @@ class AnswerSynthesizerTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StreamingSynthesisTests(unittest.IsolatedAsyncioTestCase):
+    async def test_structured_preview_precedes_final_and_sources_remain_validated(self):
+        from langchain_core.messages import AIMessageChunk
+
+        from paper_research_agent.answering.streaming import preview_scope
+        gate, first_seen = asyncio.Event(), asyncio.Event()
+        previews = []
+        draft = {"conclusion": "early conclusion", "evidence_sections": [
+            {"task_id": "local", "text": "local conclusion", "source_ids": ["chunk-1"]},
+            {"task_id": "dynamic", "text": "external state", "source_ids": ["external-1"]}]}
+        encoded = json.dumps(draft)
+        split = encoded.index('early conclusion') + len('early')
+
+        async def chunks(messages):
+            yield AIMessageChunk(content="", tool_call_chunks=[{
+                "name": "_SynthesisDraft", "id": "call1", "index": 0, "args": encoded[:split]}])
+            await gate.wait()
+            yield AIMessageChunk(content="", response_metadata={"finish_reason": "tool_calls"}, tool_call_chunks=[{
+                "name": None, "id": None, "index": 0, "args": encoded[split:]}])
+
+        async def preview(text):
+            previews.append(text)
+            if text:
+                first_seen.set()
+
+        model = Mock()
+        model.bind_tools.return_value.astream = chunks
+        synthesizer = AnswerSynthesizer(model)
+        with preview_scope(preview):
+            task = asyncio.create_task(synthesizer.synthesize(_context(), (_local_child(), _dynamic_child())))
+            try:
+                await asyncio.wait_for(first_seen.wait(), 1)
+                self.assertFalse(task.done())
+                self.assertEqual(previews[-1], "early")
+            finally:
+                gate.set()
+            answer = await task
+        self.assertEqual(answer.conclusion, "early conclusion")
+        self.assertEqual(answer.source_ids, ("chunk-1", "external-1"))
+
+        draft["evidence_sections"][0]["source_ids"] = ["untrusted"]
+        encoded = json.dumps(draft)
+        with preview_scope(preview), self.assertRaisesRegex(ValueError, "unknown"):
+            await synthesizer.synthesize(_context(), (_local_child(), _dynamic_child()))

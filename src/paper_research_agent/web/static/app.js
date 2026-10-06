@@ -30,6 +30,8 @@ const HISTORY_KEY = "paper-research.dialogue-history.v1";
 const PENDING_REQUEST_KEY = "paper-research.pending-request.v1";
 const state = {
   busy: false,
+  pageUnloading: false,
+  streamAbortController: null,
   citations: new Map(),
   history: [],
   phaseTimer: null,
@@ -546,27 +548,62 @@ async function handleAsk(event) {
   try {
     await streamConversation(pendingRequest);
   } catch (error) {
+    if (state.pageUnloading || error.name === "AbortError") return;
     if (error.status === 401) {
       showToast("登录已过期，请重新登录。");
       setAuthenticated(false);
     } else if (error.status === 409) {
-      appendErrorMessage("上一项研究仍在处理中，请稍后重试。", true);
+      appendErrorMessage("上一项研究仍在处理中，请稍后重试。", false);
     } else {
       if (error.status >= 400 && error.status < 500) clearPendingRequest();
-      appendErrorMessage(error.message, true);
+      appendErrorMessage(error.message, false);
+    if (isTransientStreamError(error)) showNotice("连接暂时中断，可继续接收原运行；不会重新提交问题。", "warning");
     }
   } finally {
     setBusy(false);
-    await refreshPlanControl();
-    await restoreServerHistory(false);
-    scrollMessages();
+    if (!state.pageUnloading) {
+      await refreshPlanControl();
+      await restoreServerHistory(false);
+      scrollMessages();
+    }
     if (!elements.appView.hidden) elements.question.focus();
+  }
+}
+
+async function fetchAgentStream(url, options) {
+  state.streamAbortController = new AbortController();
+  return fetch(url, { ...options, signal: state.streamAbortController.signal });
+}
+
+function isTransientStreamError(error) {
+  return [408, 429, 500, 502, 503, 504].includes(error.status)
+    || error.retryable === true || error.name === "TypeError" || error.name === "NetworkError";
+}
+
+async function receiveRunEvents(pendingRequest) {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    if (state.pageUnloading) return;
+    pendingRequest.lastEventId = state.runViews.get(pendingRequest.requestId)?.state.lastEventId || 0;
+    savePendingRequest(pendingRequest);
+    try {
+      const response = await fetchAgentStream(
+        API.agentEvents(pendingRequest.requestId, pendingRequest.lastEventId),
+        { method: "GET", credentials: "same-origin" },
+      );
+      await consumeAgentStream(response, pendingRequest, "断线续传");
+      return;
+    } catch (error) {
+      if (state.pageUnloading || error.name === "AbortError") return;
+      if (!isTransientStreamError(error) || attempt === 3) throw error;
+      showNotice("连接暂时中断，正在继续接收原运行…", "warning");
+      await new Promise((resolve) => window.setTimeout(resolve, 250 * (2 ** attempt)));
+    }
   }
 }
 
 async function streamConversation(pendingRequest, sourceNote = "") {
   activatePlanControl(pendingRequest.requestId);
-  const responsePromise = fetch(API.agentRuns, {
+  const responsePromise = fetchAgentStream(API.agentRuns, {
     method: "POST",
     credentials: "same-origin",
     headers: { "Content-Type": "application/json" },
@@ -647,6 +684,15 @@ function reduceRunEvent(runState, event) {
   const order = [...runState.order];
   const kind = runNodeKind(event.type || "");
   const nodeId = runNodeId(event, kind);
+  if (event.type === "answer_started" && event.detail?.reason_code === "final_answer") {
+    Object.keys(nodes).forEach((id) => {
+      if (nodes[id]?.kind === "answer" && id !== nodeId) {
+        delete nodes[id];
+        const index = order.indexOf(id);
+        if (index >= 0) order.splice(index, 1);
+      }
+    });
+  }
   const previous = nodes[nodeId] || {
     nodeId,
     kind,
@@ -677,6 +723,28 @@ function reduceRunEvent(runState, event) {
     lastEventId: Math.max(runState.lastEventId || 0, eventId),
     lastEventType: event.type || runState.lastEventType || "",
   };
+}
+
+function restoreRunState(events) {
+  const initial = { nodes: {}, order: [], lastEventId: 0, lastEventType: "" };
+  if (!Array.isArray(events)) return initial;
+  return events
+    .filter((event) => event?.schema_version === "main-agent-stream-v2" && Number.isSafeInteger(event.event_id) && event.event_id > 0)
+    .slice().sort((left, right) => left.event_id - right.event_id)
+    .reduce(reduceRunEvent, initial);
+}
+
+function reconcilePendingHistory(pendingRequest) {
+  const message = state.history.find((item) => item.role === "assistant" && item.requestId === pendingRequest.requestId);
+  if (message && ["completed", "failed", "cancelled", "conflict", "error"].includes(message.status)) {
+    clearPendingRequest();
+    return null;
+  }
+  // The cursor must match the rendered server snapshot, even if browser storage
+  // is ahead of it. Replayed event IDs are deduplicated by the reducer.
+  pendingRequest.lastEventId = state.runViews.get(pendingRequest.requestId)?.state.lastEventId || 0;
+  savePendingRequest(pendingRequest);
+  return pendingRequest;
 }
 
 function citationMap(values) {
@@ -732,6 +800,15 @@ function renderRunEvent(runView, event) {
   const previousState = runView.state;
   runView.state = reduceRunEvent(runView.state, event);
   if (runView.state === previousState) return null;
+  runView.registry.forEach((element, id) => {
+    if (!runView.state.nodes[id]) {
+      element.remove();
+      runView.registry.delete(id);
+    }
+  });
+  if (event.type === "answer_started") {
+    clearAnswerPreviews(runView, event.detail?.reason_code === "final_answer" ? null : event.node_id);
+  }
   const node = runView.state.nodes[runNodeId(event, runNodeKind(event.type || ""))];
   const existing = runView.registry.get(node.nodeId);
   if (!existing) {
@@ -770,6 +847,7 @@ function renderRunEvent(runView, event) {
 }
 
 function finalizeRunAnswers(runView) {
+  clearAnswerPreviews(runView);
   let finalAnswer = "";
   runView.state.order.forEach((nodeId) => {
     const node = runView.state.nodes[nodeId];
@@ -799,7 +877,15 @@ function terminalStatusLabel(status) {
   })[status] || ["运行未完成", "可在右侧查看运行详情。"];
 }
 
+function renderCompletedRunAnswers(runState) {
+  const completed = runState.order.map((id) => runState.nodes[id])
+    .filter((node) => node?.kind === "answer" && node.status === "completed" && node.text);
+  if (!completed.length) return [];
+  return [createElement("small", "source-note", "已完成部分（本轮运行尚未完成）"), ...completed.map(renderRunNode)];
+}
+
 function finalizeProgress(runView, status) {
+  clearAnswerPreviews(runView);
   if (status === "completed") {
     runView.transcript.classList.add("is-completing");
     window.setTimeout(() => {
@@ -813,7 +899,8 @@ function finalizeProgress(runView, status) {
     createElement("strong", "run-node-title", title),
     createElement("span", "run-node-summary", summary),
   );
-  runView.transcript.replaceChildren(terminal);
+  runView.copy.hidden = true;
+  runView.transcript.replaceChildren(terminal, ...renderCompletedRunAnswers(runView.state));
 }
 
 function getOrCreateRunView(pendingRequest, sourceNote = "") {
@@ -836,6 +923,8 @@ function getOrCreateRunView(pendingRequest, sourceNote = "") {
     copy,
     transcript,
     registry: new Map(),
+    previewElements: new Map(),
+    previewSequences: new Map(),
     state: {
       nodes: {},
       order: [],
@@ -847,6 +936,35 @@ function getOrCreateRunView(pendingRequest, sourceNote = "") {
   elements.messages.append(article);
   state.runViews.set(pendingRequest.requestId, runView);
   return runView;
+}
+
+function clearAnswerPreviews(runView, nodeId = null) {
+  runView.previewElements?.forEach((element, id) => {
+    if (nodeId === null || nodeId === id) {
+      element.remove();
+      runView.previewElements.delete(id);
+    }
+  });
+}
+
+function renderAnswerPreview(runView, event) {
+  if (typeof event.text !== "string" || event.text.length > 20000 || typeof event.node_id !== "string") return;
+  const sequence = Number(event.sequence);
+  if (!Number.isSafeInteger(sequence) || sequence <= (runView.previewSequences.get(event.node_id) || 0)) return;
+  runView.previewSequences.set(event.node_id, sequence);
+  if (!event.text) {
+    clearAnswerPreviews(runView, event.node_id);
+    return;
+  }
+  let preview = runView.previewElements.get(event.node_id);
+  if (!preview) {
+    preview = createElement("section", "run-answer-preview");
+    preview.append(createElement("small", "source-note", "生成中，待校验"), createElement("div", "run-answer-copy"));
+    runView.previewElements.set(event.node_id, preview);
+    runView.transcript.append(preview);
+  }
+  preview.querySelector(".run-answer-copy").textContent = event.text;
+  runView.copy.hidden = true;
 }
 
 function answerTextFromRunView(runView) {
@@ -874,7 +992,7 @@ async function consumeAgentStream(response, pendingRequest, sourceNote = "") {
   if (!response.body) throw new Error("浏览器不支持流式输出。请升级浏览器后重试。");
 
   const runView = getOrCreateRunView(pendingRequest, sourceNote);
-  const { article, copy } = runView;
+  const { article, copy, meta } = runView;
   state.citations.clear();
   elements.routeMetrics.replaceChildren();
   elements.tokenMetrics.replaceChildren();
@@ -892,6 +1010,7 @@ async function consumeAgentStream(response, pendingRequest, sourceNote = "") {
   let waitingApproval = false;
   const outputAttachmentIds = [];
   let lastPaint = 0;
+  try {
   while (true) {
     const { value, done } = await reader.read();
     buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
@@ -900,6 +1019,14 @@ async function consumeAgentStream(response, pendingRequest, sourceNote = "") {
     for (const line of lines) {
       if (!line.trim()) continue;
       const event = JSON.parse(line);
+      if (event.schema_version === "main-agent-preview-v1") {
+        if (event.request_id === pendingRequest.requestId && finalStatus === "running") {
+          const followOutput = shouldAutoScroll();
+          renderAnswerPreview(runView, event);
+          scrollMessages(followOutput);
+        }
+        continue;
+      }
       if (event.schema_version === "main-agent-stream-v2") {
         const followOutput = shouldAutoScroll();
         copy.hidden = true;
@@ -1011,6 +1138,18 @@ async function consumeAgentStream(response, pendingRequest, sourceNote = "") {
     }
     if (done) break;
   }
+  } catch (error) {
+    if (finalStatus === "running") throw error;
+  } finally {
+    clearAnswerPreviews(runView);
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+  if (finalStatus === "running") {
+    const error = new Error("连接已中断，可继续接收原运行。刷新不会重新生成回答。");
+    error.retryable = true;
+    throw error;
+  }
   if (["completed", "failed", "cancelled", "conflict"].includes(finalStatus)) {
     clearPendingRequest();
   }
@@ -1030,6 +1169,11 @@ async function consumeAgentStream(response, pendingRequest, sourceNote = "") {
     showNotice("需要补充信息后才能继续运行。", "warning");
     return;
   }
+  if (["failed", "cancelled", "conflict"].includes(finalStatus)) {
+    finalizeProgress(runView, finalStatus);
+    showNotice(terminalStatusLabel(finalStatus)[1], "error");
+    return;
+  }
   const editMode = route === "file_edit";
   rawText = answerTextFromRunView(runView) || rawText;
   const finalText = (editMode ? rawText : naturalText(rawText)).trim();
@@ -1038,11 +1182,6 @@ async function consumeAgentStream(response, pendingRequest, sourceNote = "") {
     copy.textContent = "文件修改完成，可以下载新文件。";
   } else if (!copy.hidden) copy.replaceChildren(renderTextWithCitations(finalText));
   else finalizeRunAnswers(runView);
-  if (["failed", "cancelled", "conflict"].includes(finalStatus)) {
-    finalizeProgress(runView, finalStatus);
-    showNotice(terminalStatusLabel(finalStatus)[1], "error");
-    return;
-  }
   finalizeProgress(runView, "completed");
   if (runDegraded) {
     article.classList.add("is-degraded");
@@ -1052,7 +1191,7 @@ async function consumeAgentStream(response, pendingRequest, sourceNote = "") {
   outputAttachmentIds.forEach((attachmentId) => {
     article.append(createServerDownloadButton(attachmentId));
   });
-  saveHistoryItem({ role: "assistant", text: finalText, status: finalStatus });
+  saveHistoryItem({ role: "assistant", text: finalText, status: finalStatus, requestId: pendingRequest.requestId });
 }
 
 function activatePlanControl(requestId) {
@@ -1504,7 +1643,7 @@ async function resolveToolApproval(approved) {
   elements.toolApprovalAccept.disabled = true;
   elements.toolApprovalReject.disabled = true;
   try {
-    const response = await fetch(API.agentApproval(state.pendingTool.requestId), {
+    const response = await fetchAgentStream(API.agentApproval(state.pendingTool.requestId), {
       method: "POST",
       credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
@@ -2016,7 +2155,8 @@ async function restoreServerHistory(renderCurrent = true) {
       renderDialogueMessages([], "新研究会话");
     }
     const pendingRequest = loadPendingRequest();
-    if (pendingRequest && pendingRequest.conversationId === state.currentConversationId) {
+    if (pendingRequest && pendingRequest.conversationId === state.currentConversationId
+        && (!renderCurrent || reconcilePendingHistory(pendingRequest))) {
       showNotice("检测到未结束的运行，正在从上次事件继续接收。", "warning");
       if (renderCurrent) await retryPendingRequest();
     }
@@ -2137,7 +2277,9 @@ function resetWorkspace() {
 }
 
 function saveHistoryItem(item) {
-  state.history.push(item);
+  const existingIndex = item.requestId ? state.history.findIndex((entry) => entry.role === item.role && entry.requestId === item.requestId) : -1;
+  if (existingIndex >= 0) state.history[existingIndex] = { ...state.history[existingIndex], ...item };
+  else state.history.push(item);
   state.history = state.history.slice(-24);
   if (state.currentConversationId) {
     const now = new Date().toISOString();
@@ -2283,14 +2425,16 @@ function appendRestoredAssistant(text, status, events = [], requestId = null) {
   const meta = createElement("div", "message-meta");
   meta.append(createElement("span", "assistant-mark", "研"), createElement("strong", "", "论文研究 Agent"));
   article.append(meta);
-  const answerEvents = Array.isArray(events) ? events.filter((event) => event?.type === "answer_completed") : [];
+  const allAnswerEvents = Array.isArray(events) ? events.filter((event) => event?.type === "answer_completed") : [];
+  const finalAnswerEvents = allAnswerEvents.filter((event) => event.node_id === "answer:main");
+  const answerEvents = finalAnswerEvents.length ? finalAnswerEvents : allAnswerEvents;
   const citations = answerEvents.flatMap((event) => Array.isArray(event.detail?.citations) ? event.detail.citations : []);
   const terminalStatuses = new Set(["failed", "cancelled", "conflict", "paused", "waiting_approval", "waiting_user", "error"]);
   if (terminalStatuses.has(status)) {
     const [title, summary] = terminalStatusLabel(status === "error" ? "failed" : status);
     const line = createElement("div", `terminal-status is-${status}`);
     line.append(createElement("strong", "run-node-title", title), createElement("span", "run-node-summary", summary));
-    article.append(line);
+    article.append(line, ...renderCompletedRunAnswers(restoreRunState(events)));
   } else {
     const copy = createElement("div", "answer-copy natural-answer");
     copy.append(renderTextWithCitations(naturalText(text), citationMap(citations)));
@@ -2303,24 +2447,17 @@ function appendRestoredAssistant(text, status, events = [], requestId = null) {
         copy,
         transcript,
         registry: new Map(),
-        state: {
-          nodes: {
-            "answer:restored": {
-              nodeId: "answer:restored",
-              kind: "answer",
-              title: "生成回答",
-              summary: "",
-              status: "running",
-              text,
-              detail: { citations },
-            },
-          },
-          order: ["answer:restored"],
-          lastEventId: Number(loadPendingRequest()?.lastEventId) || 0,
-          lastEventType: "answer_delta",
-        },
+        previewElements: new Map(),
+        previewSequences: new Map(),
+        state: restoreRunState(events),
       };
       article.insertBefore(transcript, copy);
+      for (const nodeId of runView.state.order) {
+        const element = renderRunNode(runView.state.nodes[nodeId]);
+        runView.registry.set(nodeId, element);
+        transcript.append(element);
+      }
+      copy.hidden = true;
       state.runViews.set(requestId, runView);
     }
   }
@@ -2349,6 +2486,10 @@ async function retryPendingRequest() {
   if (pendingRequest.conversationId !== state.currentConversationId) return;
   const existingView = state.runViews.get(pendingRequest.requestId);
   const segmentBoundary = existingView?.state.lastEventType;
+  if (["run_completed", "run_failed", "run_cancelled", "run_conflict"].includes(segmentBoundary)) {
+    clearPendingRequest();
+    return;
+  }
   if (segmentBoundary === "run_waiting_approval") {
     showNotice("运行正在等待工具审批；处理后会从当前游标继续。", "warning");
     return;
@@ -2365,21 +2506,21 @@ async function retryPendingRequest() {
   setBusy(true);
   try {
     activatePlanControl(pendingRequest.requestId);
-    const response = await fetch(
-      API.agentEvents(pendingRequest.requestId, Number(pendingRequest.lastEventId) || 0),
-      { method: "GET", credentials: "same-origin" },
-    );
-    await consumeAgentStream(response, pendingRequest, "断线续传");
+    await receiveRunEvents(pendingRequest);
   } catch (error) {
-    if (error.status >= 400 && error.status < 500 && error.status !== 409) {
+    if (state.pageUnloading || error.name === "AbortError") return;
+    if (error.status >= 400 && error.status < 500 && ![408, 409, 429].includes(error.status)) {
       clearPendingRequest();
     }
-    appendErrorMessage(error.message, true);
+    appendErrorMessage(error.message, false);
+    if (isTransientStreamError(error)) showNotice("连接暂时中断，可继续接收原运行；不会重新提交问题。", "warning");
     } finally {
       setBusy(false);
-      await refreshPlanControl();
-      await restoreServerHistory(false);
-      scrollMessages();
+      if (!state.pageUnloading) {
+        await refreshPlanControl();
+        await restoreServerHistory(false);
+        scrollMessages();
+      }
   }
 }
 
@@ -2468,4 +2609,9 @@ elements.planSaveObjective.addEventListener("click", () => {
 });
 
 syncNavigationViewport();
+window.addEventListener("pagehide", () => {
+  state.pageUnloading = true;
+  state.streamAbortController?.abort();
+  stopPlanRefresh();
+});
 checkSession();
