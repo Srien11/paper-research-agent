@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from typing import Any, cast
 from urllib.parse import quote
 
@@ -13,6 +14,11 @@ from paper_research_agent.agent.tooling.contracts import (
     IdentifierInput,
     ScholarlySearchInput,
     ToolExecutionResult,
+)
+from paper_research_agent.agent.tooling.provenance import (
+    ScholarlyLookupRecord,
+    ScholarlyToolName,
+    source_record,
 )
 from paper_research_agent.agent.tooling.scholarly_providers import (
     SCHOLARLY_OPERATIONS,
@@ -57,16 +63,39 @@ class ScholarlyResearchTools:
 
     async def _execute(
         self,
-        tool_name: str,
+        tool_name: ScholarlyToolName,
         operation: ScholarlyOperation,
         request: ScholarlyProviderRequest,
     ) -> ToolExecutionResult:
         result = await self._registry.execute(operation, request)
+        source = result.summary.get("source", result.provider_id)
+        lookup = None
+        if source in {"crossref", "arxiv", "semantic_scholar"}:
+            records = (
+                tuple(
+                    record
+                    for item in result.items[:50]
+                    if (record := source_record(item)) is not None
+                )
+                if result.status == "ok"
+                else ()
+            )
+            lookup = ScholarlyLookupRecord(
+                provider=source,
+                tool_name=tool_name,
+                queried_at=datetime.now(UTC),
+                status=result.status,
+                cache_hit=result.summary.get("cache_hit") is True,
+                network_accessed=result.summary.get("network_accessed", True) is True,
+                returned_count=len(result.items),
+                sources=records,
+            )
         return ToolExecutionResult(
             tool_name=tool_name,
             status=result.status,
             items=result.items,
             summary={**result.summary, "provider": result.provider_id},
+            scholarly_lookup=lookup,
         )
 
 
@@ -237,7 +266,10 @@ class SemanticScholarCrossrefProvider:
             )
         if response.status_code == 408 or response.status_code >= 500:
             raise ScholarlyProviderUnavailable()
-        response.raise_for_status()
+        if response.status_code == 404:
+            return {}
+        if response.status_code != 200:
+            raise ScholarlyProviderUnavailable() from None
         try:
             payload = response.json()
         except ValueError as exc:
@@ -259,6 +291,8 @@ def _retry_after_seconds(value: str | None) -> float | None:
 
 def _paper_item(value: object) -> dict[str, Any] | None:
     if not isinstance(value, Mapping):
+        return None
+    if not value.get("paperId") and not value.get("title"):
         return None
     authors = value.get("authors")
     author_names = (

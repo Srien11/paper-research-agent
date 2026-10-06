@@ -81,6 +81,19 @@ def _envelope(
 
 
 class PlanningRouteTests(unittest.TestCase):
+    def test_natural_bibliographic_requests_reach_semantic_planning_without_online_keyword(self):
+        for message in (
+            "给我三篇 RAG 的代表文献和链接",
+            "有没有采用这个方法的新工作",
+            "这篇后来被谁引用过",
+            "找几篇关于稀疏注意力的文章",
+        ):
+            with self.subTest(message=message):
+                result = classify_planning_route(
+                    _envelope(message, rag_mode="disabled"), enabled=True
+                )
+                self.assertEqual(result.route, "full_planner")
+
     def test_decision_contract_is_closed(self) -> None:
         decision = PlanningRouteDecision(
             route="fast_path",
@@ -95,8 +108,7 @@ class PlanningRouteTests(unittest.TestCase):
             _envelope("请总结本地论文 C001 的方法", rag_mode="required"),
             _envelope("比较 C001 与 T001 的实验方法"),
             _envelope(
-                "在逻辑推理研究中，一篇认为没有外部反馈时无效，"
-                "另一篇区分找错与改错。请找出论文。"
+                "在逻辑推理研究中，一篇认为没有外部反馈时无效，另一篇区分找错与改错。请找出论文。"
             ),
         )
         for envelope in cases:
@@ -139,14 +151,11 @@ class PlanningRouteTests(unittest.TestCase):
         completed_plan = plan.model_copy(
             update={
                 "tasks": tuple(
-                    task.model_copy(update={"status": "completed"})
-                    for task in plan.tasks
+                    task.model_copy(update={"status": "completed"}) for task in plan.tasks
                 )
             }
         )
-        completed_workspace = existing.workspace.model_copy(
-            update={"task_plan": completed_plan}
-        )
+        completed_workspace = existing.workspace.model_copy(update={"task_plan": completed_plan})
 
         standalone = classify_planning_route(
             existing.model_copy(update={"workspace": completed_workspace}),

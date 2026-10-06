@@ -289,9 +289,7 @@ class RecalledContext(FrozenModel):
     content: str = Field(min_length=1, max_length=3000)
     relevance: float = Field(ge=0, le=1)
     trust: Literal["non_evidence", "research_context"]
-    memory_kind: Literal[
-        "preference", "project_context", "confirmed_conclusion"
-    ] | None = None
+    memory_kind: Literal["preference", "project_context", "confirmed_conclusion"] | None = None
 
     @field_validator("content")
     @classmethod
@@ -324,6 +322,10 @@ class TurnInterpretationV2(FrozenModel):
     needs_clarification: bool = False
     clarification_question: str | None = Field(default=None, max_length=500)
     confidence: float = Field(ge=0, le=1)
+    information_need: Literal["unspecified", "general", "local", "external", "hybrid"] = (
+        "unspecified"
+    )
+    scholarly_source: Literal["auto", "crossref", "arxiv", "semantic_scholar"] = "auto"
 
     @field_validator("resolved_request")
     @classmethod
@@ -495,9 +497,7 @@ class MainAgentResult(FrozenModel):
     @model_validator(mode="after")
     def validate_degradation_state(self) -> MainAgentResult:
         if self.degraded != bool(self.degradation_codes):
-            raise ValueError(
-                "degraded must be true exactly when degradation codes are present"
-            )
+            raise ValueError("degraded must be true exactly when degradation codes are present")
         return self
 
 

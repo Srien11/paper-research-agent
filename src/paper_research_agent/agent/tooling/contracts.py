@@ -7,6 +7,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from paper_research_agent.agent.tooling.provenance import ScholarlyLookupRecord
+
 
 class ToolInput(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -22,6 +24,7 @@ class ToolExecutionResult(BaseModel):
     )
     items: tuple[dict[str, Any], ...] = ()
     summary: dict[str, Any] = Field(default_factory=dict)
+    scholarly_lookup: ScholarlyLookupRecord | None = None
 
 
 class AdjacentChunksInput(ToolInput):
@@ -43,6 +46,7 @@ class CorpusInput(ToolInput):
 
 
 class ScholarlySearchInput(ToolInput):
+    source: Literal["auto", "crossref", "arxiv", "semantic_scholar"] = "auto"
     query: str = Field(min_length=1, max_length=500)
     limit: int = Field(default=10, ge=1, le=20)
     year_from: int | None = Field(default=None, ge=1900, le=2100)
@@ -56,6 +60,7 @@ class ScholarlySearchInput(ToolInput):
 
 
 class IdentifierInput(ToolInput):
+    source: Literal["auto", "crossref", "arxiv", "semantic_scholar"] = "auto"
     identifier: str = Field(min_length=1, max_length=500)
 
 

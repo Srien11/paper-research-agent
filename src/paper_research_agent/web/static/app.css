@@ -303,6 +303,8 @@ input:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 4px
 .answer-copy > :first-child { margin-top: 0; }
 .answer-copy > :last-child { margin-bottom: 0; }
 .answer-copy p { margin: 0 0 var(--space-2); }
+.answer-link { color: var(--accent-dark); text-decoration: underline; text-underline-offset: .15em; }
+.answer-link:hover { text-decoration-thickness: 2px; }
 .answer-copy ul, .answer-copy ol { margin: var(--space-1) 0 var(--space-2); padding-left: 1.35rem; }
 .answer-copy li { margin: .15rem 0; padding-left: .1rem; }
 .citation-buttons { display: inline-flex; flex-wrap: wrap; gap: .2rem; margin: 0 0 0 .4rem; vertical-align: baseline; }
@@ -557,6 +559,12 @@ kbd { padding: .1rem .3rem; background: #ebe6dc; border: 1px solid var(--line); 
   color: #245f4b;
   background: #dcefe7;
 }
+
+.scholarly-sources { margin-top: 1rem; padding-top: .8rem; border-top: 1px solid var(--line, #dce3de); display: grid; gap: .65rem; }
+.scholarly-source-card { padding: .65rem .8rem; background: var(--paper, #f7f8f5); border-radius: .5rem; display: grid; gap: .3rem; }
+.scholarly-source-card small, .scholarly-source-note { color: var(--muted, #667069); font-size: .75rem; }
+.scholarly-source-paper { display: grid; gap: .15rem; padding-top: .35rem; overflow-wrap: anywhere; }
+.scholarly-source-paper a { color: var(--forest, #245f4b); text-decoration: underline; }
 
 /* Dense, border-light full-screen workspaces. */
 .workspace-toggle.is-active { color: var(--accent-dark); box-shadow: inset 0 -2px 0 var(--accent); }

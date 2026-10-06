@@ -105,6 +105,9 @@ def _interpreter_user_content(
     )
     return (
         f"CURRENT_MESSAGE\n{envelope.current_message}\n\n"
+        f"RAG_MODE\n{envelope.rag_mode}\n\n"
+        "READ_ONLY_SCHOLARLY_TOOLS\n搜索书目、解析 DOI/arXiv ID、有限参考文献、出版更新元数据。"
+        "只发送用户请求的书目关键词或公开标识符，不发送本地全文、证据或对话历史。\n\n"
         f"ACTIVE_GOAL\n{goal_text}\n\n"
         f"TASK_PLAN\n{tasks_text}\n\n"
         f"UNRESOLVED_QUESTIONS\n{envelope.workspace.unresolved_questions}\n\n"

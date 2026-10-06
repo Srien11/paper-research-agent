@@ -98,6 +98,22 @@ def _interpret(model: _FakeModel, envelope: AgentContextEnvelope) -> TurnInterpr
 
 
 class TurnInterpreterTests(unittest.TestCase):
+    def test_semantic_information_need_uses_same_single_interpretation_call(self):
+        model = _FakeModel(
+            [
+                _interpretation(
+                    "new_goal",
+                    resolved_request="给我几篇代表文献",
+                    information_need="external",
+                    scholarly_source="arxiv",
+                )
+            ]
+        )
+        result = _interpret(model, _envelope(current_message="给我几篇代表文献"))
+        self.assertEqual(result.information_need, "external")
+        self.assertEqual(result.scholarly_source, "arxiv")
+        self.assertEqual(model.calls, 1)
+
     def test_prompt_contains_bounded_context_content_as_untrusted_data(self) -> None:
         memory_id = "m" * 32
         envelope = _envelope(
@@ -118,9 +134,7 @@ class TurnInterpreterTests(unittest.TestCase):
                 ),
             )
         )
-        model = _FakeModel(
-            [_interpretation("continue_goal", selected_context_ids=(memory_id,))]
-        )
+        model = _FakeModel([_interpretation("continue_goal", selected_context_ids=(memory_id,))])
 
         result = _interpret(model, envelope)
 
@@ -134,15 +148,11 @@ class TurnInterpreterTests(unittest.TestCase):
         self.assertEqual(result.selected_context_ids, (memory_id,))
 
     def test_interpret_new_goal(self) -> None:
-        result = _interpret(
-            _FakeModel([_interpretation("new_goal")]), _envelope()
-        )
+        result = _interpret(_FakeModel([_interpretation("new_goal")]), _envelope())
         self.assertEqual(result.relation, "new_goal")
 
     def test_interpret_continue_goal(self) -> None:
-        result = _interpret(
-            _FakeModel([_interpretation("continue_goal")]), _envelope()
-        )
+        result = _interpret(_FakeModel([_interpretation("continue_goal")]), _envelope())
         self.assertEqual(result.relation, "continue_goal")
 
     def test_interpret_refine_goal(self) -> None:
@@ -154,27 +164,19 @@ class TurnInterpreterTests(unittest.TestCase):
         self.assertEqual(result.goal_change_summary, "只比较指标")
 
     def test_interpret_answer_within_goal(self) -> None:
-        result = _interpret(
-            _FakeModel([_interpretation("answer_within_goal")]), _envelope()
-        )
+        result = _interpret(_FakeModel([_interpretation("answer_within_goal")]), _envelope())
         self.assertEqual(result.relation, "answer_within_goal")
 
     def test_interpret_cancel_goal(self) -> None:
-        result = _interpret(
-            _FakeModel([_interpretation("cancel_goal")]), _envelope()
-        )
+        result = _interpret(_FakeModel([_interpretation("cancel_goal")]), _envelope())
         self.assertEqual(result.relation, "cancel_goal")
 
     def test_interpret_resume_after_approval(self) -> None:
-        result = _interpret(
-            _FakeModel([_interpretation("resume_after_approval")]), _envelope()
-        )
+        result = _interpret(_FakeModel([_interpretation("resume_after_approval")]), _envelope())
         self.assertEqual(result.relation, "resume_after_approval")
 
     def test_interpret_meta_conversation(self) -> None:
-        result = _interpret(
-            _FakeModel([_interpretation("meta_conversation")]), _envelope()
-        )
+        result = _interpret(_FakeModel([_interpretation("meta_conversation")]), _envelope())
         self.assertEqual(result.relation, "meta_conversation")
 
     def test_unknown_context_id_triggers_retry_then_success(self) -> None:
@@ -206,9 +208,7 @@ class TurnInterpreterTests(unittest.TestCase):
         self.assertIsNotNone(result.clarification_question)
 
     def test_high_confidence_goal_change_needs_no_clarification(self) -> None:
-        result = _interpret(
-            _FakeModel([_interpretation("new_goal", confidence=0.9)]), _envelope()
-        )
+        result = _interpret(_FakeModel([_interpretation("new_goal", confidence=0.9)]), _envelope())
         self.assertFalse(result.needs_clarification)
 
     def test_retry_after_first_model_failure(self) -> None:
@@ -236,9 +236,7 @@ class TurnInterpreterTests(unittest.TestCase):
         self.assertEqual(result.relation, "new_goal")
 
     def test_interpreter_never_outputs_route_or_capability(self) -> None:
-        result = _interpret(
-            _FakeModel([_interpretation("continue_goal")]), _envelope()
-        )
+        result = _interpret(_FakeModel([_interpretation("continue_goal")]), _envelope())
         self.assertFalse(hasattr(result, "route"))
         self.assertFalse(hasattr(result, "capability"))
 

@@ -119,6 +119,12 @@ _CONTEXTUAL_FOLLOW_UP = re.compile(
     re.IGNORECASE,
 )
 _TERMINAL_TASK_STATUSES = frozenset({"completed", "failed", "skipped", "cancelled"})
+_SIMPLE_GENERAL = re.compile(
+    r"^(?:你好|您好|谢谢|早上好|晚上好|hi|hello|thanks)[。.!！\s]*$|"
+    r"^(?:请)?(?:解释|介绍|讲解|说明|什么是|what is|explain)"
+    r"(?!.*(?:文献|链接|找出|列出|推荐|最新|代表论文|DOI|arxiv)).{1,100}$",
+    re.IGNORECASE,
+)
 
 
 def classify_planning_route(
@@ -176,7 +182,7 @@ def classify_planning_route(
             reason_code="clear_single_local_rag",
             capability="local_rag",
         )
-    if envelope.rag_mode in {"disabled", "preferred"}:
+    if envelope.rag_mode in {"disabled", "preferred"} and _SIMPLE_GENERAL.search(message):
         return PlanningRouteDecision(
             route="fast_path",
             reason_code="simple_direct_chat",

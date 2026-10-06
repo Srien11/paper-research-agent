@@ -76,9 +76,7 @@ class GoalReconciler:
         model = self._model
         if model is None:
             return decision
-        system = SystemMessage(
-            content=f"{GOAL_RECONCILER_SYSTEM}\nPROMPT_VERSION={self.version}"
-        )
+        system = SystemMessage(content=f"{GOAL_RECONCILER_SYSTEM}\nPROMPT_VERSION={self.version}")
         goal = decision.goal
         user = HumanMessage(
             content=(
@@ -103,9 +101,7 @@ class GoalReconciler:
                 "updated_at": datetime.now(UTC),
             }
         )
-        return GoalDecision(
-            action=decision.action, goal=updated, rationale=decision.rationale
-        )
+        return GoalDecision(action=decision.action, goal=updated, rationale=decision.rationale)
 
 
 def _deterministic_goal_decision(
@@ -163,9 +159,7 @@ def _create_decision(interpretation: TurnInterpretationV2, turn_id: str) -> Goal
     return GoalDecision(action="create", goal=goal, rationale="建立新目标")
 
 
-def _merge_constraints(
-    existing: tuple[str, ...], new: tuple[str, ...]
-) -> tuple[str, ...]:
+def _merge_constraints(existing: tuple[str, ...], new: tuple[str, ...]) -> tuple[str, ...]:
     merged = tuple(dict.fromkeys((*existing, *new)))
     return merged[:20]
 
@@ -272,9 +266,7 @@ class _TaskDraft(FrozenModel):
     success_criteria: tuple[str, ...] = Field(min_length=1, max_length=8)
     capability: Capability
     depends_on: tuple[str, ...] = Field(default=(), max_length=8)
-    execution_reason: str = Field(
-        default="完成目标所需的计划步骤", min_length=1, max_length=500
-    )
+    execution_reason: str = Field(default="完成目标所需的计划步骤", min_length=1, max_length=500)
 
 
 class _TaskPlanDraft(FrozenModel):
@@ -308,9 +300,7 @@ class TaskPlanner:
             interpretation.relation == "resume_after_approval"
             or (goal_decision.goal is None and current is None)
         ):
-            return TaskPlanDecision(
-                action="keep", plan=current, rationale="目标未变，计划保持不变"
-            )
+            return TaskPlanDecision(action="keep", plan=current, rationale="目标未变，计划保持不变")
         if goal_decision.action in {"abandon", "satisfy", "block"}:
             return TaskPlanDecision(
                 action="keep", plan=current, rationale="目标结束，任务状态由结果评估更新"
@@ -318,19 +308,17 @@ class TaskPlanner:
         model = self._model
         if model is None:
             return self._fallback_decision(goal_decision, current, envelope, interpretation)
-        system = SystemMessage(
-            content=f"{TASK_PLANNER_SYSTEM}\nPROMPT_VERSION={self.version}"
-        )
+        system = SystemMessage(content=f"{TASK_PLANNER_SYSTEM}\nPROMPT_VERSION={self.version}")
         user = HumanMessage(content=_task_planner_user_content(envelope, interpretation))
         try:
             raw = await model.ainvoke([system, user])
-            draft = _TaskPlanDraft.model_validate(raw) if not isinstance(raw, _TaskPlanDraft) else raw
+            draft = (
+                _TaskPlanDraft.model_validate(raw) if not isinstance(raw, _TaskPlanDraft) else raw
+            )
         except Exception:  # noqa: BLE001 - single-task fallback on planner failure
             return self._fallback_decision(goal_decision, current, envelope, interpretation)
         try:
-            return self._build_decision(
-                goal_decision, current, envelope, interpretation, draft
-            )
+            return self._build_decision(goal_decision, current, envelope, interpretation, draft)
         except ValidationError:
             return self._fallback_decision(goal_decision, current, envelope, interpretation)
 
@@ -373,11 +361,10 @@ class TaskPlanner:
             envelope=envelope,
             resolved_request=interpretation.resolved_request,
             goal_id=goal_id,
+            interpretation=interpretation,
         )
         revision = (
-            1
-            if goal_decision.action == "create" or current is None
-            else current.revision + 1
+            1 if goal_decision.action == "create" or current is None else current.revision + 1
         )
         now = datetime.now(UTC)
         plan = TaskPlan(
@@ -388,9 +375,7 @@ class TaskPlanner:
             created_at=now,
             updated_at=now,
         )
-        action: Literal["create", "revise"] = (
-            "create" if current is None else "revise"
-        )
+        action: Literal["create", "revise"] = "create" if current is None else "revise"
         return TaskPlanDecision(
             action=action,
             plan=plan,
@@ -405,13 +390,14 @@ class TaskPlanner:
         interpretation: TurnInterpretationV2,
     ) -> TaskPlanDecision:
         goal_id = _goal_id(goal_decision, current, envelope)
-        capability: Capability = (
-            "direct_chat" if envelope.rag_mode == "disabled" else "local_rag"
-        )
+        capability: Capability = "direct_chat" if envelope.rag_mode == "disabled" else "local_rag"
+        if interpretation.confidence >= 0.75:
+            if interpretation.information_need == "general":
+                capability = "direct_chat"
+            elif interpretation.information_need in {"external", "hybrid"}:
+                capability = "dynamic_tools"
         revision = (
-            1
-            if goal_decision.action == "create" or current is None
-            else current.revision + 1
+            1 if goal_decision.action == "create" or current is None else current.revision + 1
         )
         plan = _build_single_task_plan(
             goal_id=goal_id,
@@ -427,12 +413,11 @@ class TaskPlanner:
             envelope=envelope,
             resolved_request=interpretation.resolved_request,
             goal_id=goal_id,
+            interpretation=interpretation,
         )
         if tasks != plan.tasks:
             plan = plan.model_copy(update={"tasks": tasks})
-        action: Literal["create", "revise"] = (
-            "create" if current is None else "revise"
-        )
+        action: Literal["create", "revise"] = "create" if current is None else "revise"
         return TaskPlanDecision(
             action=action,
             plan=plan,
@@ -446,6 +431,7 @@ def enforce_capability_plan(
     envelope: AgentContextEnvelope,
     resolved_request: str,
     goal_id: str,
+    interpretation: TurnInterpretationV2 | None = None,
 ) -> tuple[AgentTask, ...]:
     """Deterministically enforce local/external evidence policy after model planning."""
     goal = envelope.workspace.active_goal
@@ -459,9 +445,14 @@ def enforce_capability_plan(
         if part
     )
     requirements = validate_source_policy(source_text, envelope.rag_mode)
+    if (
+        interpretation is not None
+        and interpretation.confidence >= 0.75
+        and interpretation.information_need in {"external", "hybrid"}
+        and not requirements.external_forbidden
+    ):
+        requirements = requirements.model_copy(update={"external_required": True})
     if not requirements.external_required:
-        return tasks
-    if envelope.rag_mode == "preferred" and requirements.local_forbidden:
         return tasks
 
     active = tuple(task for task in tasks if task.status != "completed")
@@ -477,7 +468,13 @@ def enforce_capability_plan(
             )
         return (*completed, local.model_copy(update={"parallel_group_id": None}))
 
-    if envelope.rag_mode == "disabled":
+    semantic_external_only = (
+        interpretation is not None
+        and interpretation.confidence >= 0.75
+        and interpretation.information_need == "external"
+        and not requirements.local_required
+    )
+    if envelope.rag_mode == "disabled" or requirements.local_forbidden or semantic_external_only:
         dynamic = next((task for task in active if task.capability == "dynamic_tools"), None)
         if dynamic is None:
             dynamic = _evidence_task(
@@ -486,6 +483,7 @@ def enforce_capability_plan(
                 capability="dynamic_tools",
                 objective=resolved_request,
             )
+        dynamic = _with_scholarly_source(dynamic, interpretation)
         return (
             *completed,
             dynamic.model_copy(
@@ -513,6 +511,7 @@ def enforce_capability_plan(
             capability="dynamic_tools",
             objective=resolved_request,
         )
+    dynamic = _with_scholarly_source(dynamic, interpretation)
     member_ids = {local.task_id, dynamic.task_id}
     common_dependencies = tuple(
         dict.fromkeys(
@@ -543,9 +542,26 @@ def enforce_capability_plan(
     other_active = tuple(
         task
         for task in active
-        if task.task_id not in selected and task.capability not in {"direct_chat", "local_rag", "dynamic_tools"}
+        if task.task_id not in selected
+        and task.capability not in {"direct_chat", "local_rag", "dynamic_tools"}
     )
     return (*completed, local, dynamic, *other_active)
+
+
+def _with_scholarly_source(
+    task: AgentTask,
+    interpretation: TurnInterpretationV2 | None,
+) -> AgentTask:
+    if (
+        interpretation is None
+        or interpretation.confidence < 0.75
+        or interpretation.scholarly_source == "auto"
+    ):
+        return task
+    prefix = f"学术数据库：{interpretation.scholarly_source}。\n"
+    if task.objective.startswith(prefix):
+        return task
+    return task.model_copy(update={"objective": prefix + task.objective[:1800]})
 
 
 def _evidence_task(
@@ -625,6 +641,9 @@ def _task_planner_user_content(
     return (
         f"CURRENT_MESSAGE\n{envelope.current_message}\n\n"
         f"RESOLVED_REQUEST\n{interpretation.resolved_request}\n\n"
+        f"INFORMATION_NEED\n{interpretation.information_need}\n\n"
+        f"INTENT_CONFIDENCE\n{interpretation.confidence}\n\n"
+        f"SCHOLARLY_SOURCE\n{interpretation.scholarly_source}\n\n"
         f"ACTIVE_GOAL\n{goal_text}\n\n"
         f"EXISTING_TASKS\n{existing_tasks}\n\n"
         f"RAG_MODE\n{envelope.rag_mode}\n"

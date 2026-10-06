@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 from paper_research_agent.agent.dynamic.models import (
@@ -22,6 +23,7 @@ from paper_research_agent.agent.orchestrator.models import (
     RecalledContext,
 )
 from paper_research_agent.agent.tooling.contracts import ToolExecutionResult
+from paper_research_agent.agent.tooling.provenance import ScholarlyLookupRecord, source_record
 from paper_research_agent.answering.models import (
     AnswerCitation,
     AnswerClaim,
@@ -110,9 +112,7 @@ class _FakeLocalRuntime:
         research_mode: str = "single",
         long_term_memory: tuple[object, ...] = (),
     ) -> object:
-        self.calls.append(
-            (question, session_id, research_mode == "planned", long_term_memory)
-        )
+        self.calls.append((question, session_id, research_mode == "planned", long_term_memory))
         return self.result
 
 
@@ -188,7 +188,9 @@ class _FakeGraph:
     def __init__(self) -> None:
         self.inputs: list[dict[str, object]] = []
 
-    async def ainvoke(self, value: dict[str, object], config: object = None, **kwargs: object) -> object:
+    async def ainvoke(
+        self, value: dict[str, object], config: object = None, **kwargs: object
+    ) -> object:
         del config, kwargs
         self.inputs.append(value)
         return {
@@ -214,6 +216,46 @@ def _pending() -> PendingApproval:
 
 
 class ChildGraphDispatcherTests(unittest.TestCase):
+    def test_actual_source_projection_survives_child_artifact_without_raw_payload(self):
+        lookup = ScholarlyLookupRecord(
+            provider="arxiv",
+            tool_name="resolve_paper_identifier",
+            queried_at=datetime.now(UTC),
+            status="ok",
+            cache_hit=False,
+            network_accessed=True,
+            returned_count=1,
+            sources=(
+                source_record({"title": "API title", "external_ids": {"ArXiv": "1706.03762"}}),
+            ),
+        )
+        observation = ToolObservation(
+            sequence=1,
+            decision_fingerprint="f" * 64,
+            tool_name="resolve_paper_identifier",
+            purpose="解析公开标识符",
+            result=ToolExecutionResult(
+                tool_name="resolve_paper_identifier",
+                scholarly_lookup=lookup,
+                items=({"abstract": "raw abstract must not persist"},),
+            ),
+        )
+        fake = _FakeDynamicExecutor(
+            DynamicResearchResult(
+                run_id="a" * 32,
+                thread_id="t",
+                status="completed",
+                observations=(observation,),
+                final_summary="API title",
+            )
+        )
+        child = asyncio.run(
+            ChildGraphDispatcher(dynamic_tools=fake).dispatch(_request(capability="dynamic_tools"))
+        )
+        self.assertEqual(child.artifact.scholarly_lookups[0].provider, "arxiv")
+        self.assertEqual(child.artifact.scholarly_lookups[0].sources[0].title, "API title")
+        self.assertNotIn("raw abstract", child.model_dump_json())
+
     def test_local_uses_task_objective_as_question(self) -> None:
         fake = _FakeLocalRuntime(_FakeLocalResult(sufficient=True))
         dispatcher = ChildGraphDispatcher(local_rag=RAGRuntimeChildExecutor(fake))
@@ -399,7 +441,9 @@ class ChildGraphDispatcherTests(unittest.TestCase):
             )
         )
         self.assertTrue(graph.inputs[0]["memory_supplied"])
-        self.assertEqual(graph.inputs[0]["memory_context"], [{"memory_id": "m1", "content": "偏好"}])
+        self.assertEqual(
+            graph.inputs[0]["memory_context"], [{"memory_id": "m1", "content": "偏好"}]
+        )
         self.assertEqual(graph.inputs[0]["child_context"], {"goal_id": "a" * 32})
         self.assertEqual(result.status, "completed")
 
@@ -440,9 +484,7 @@ class ChildGraphDispatcherTests(unittest.TestCase):
         dispatcher = ChildGraphDispatcher(dynamic_tools=fake)
 
         child = asyncio.run(
-            dispatcher.dispatch(
-                _request(capability="dynamic_tools", task_id="task-write-denied")
-            )
+            dispatcher.dispatch(_request(capability="dynamic_tools", task_id="task-write-denied"))
         )
 
         self.assertEqual(child.status, "failed")
@@ -575,9 +617,7 @@ class ChildGraphDispatcherTests(unittest.TestCase):
     def test_attachment_qa_returns_typed_artifact(self) -> None:
         dispatcher = ChildGraphDispatcher(attachment_qa=_FakeAttachmentExecutor())
         result = asyncio.run(
-            dispatcher.dispatch(
-                _request(capability="attachment_qa", attachment_ids=("a" * 32,))
-            )
+            dispatcher.dispatch(_request(capability="attachment_qa", attachment_ids=("a" * 32,)))
         )
         self.assertEqual(result.status, "completed")
         self.assertEqual(result.artifact.kind, "attachment_qa")
@@ -586,9 +626,7 @@ class ChildGraphDispatcherTests(unittest.TestCase):
     def test_file_edit_returns_output_attachment_reference(self) -> None:
         dispatcher = ChildGraphDispatcher(file_edit=_FakeFileExecutor())
         result = asyncio.run(
-            dispatcher.dispatch(
-                _request(capability="file_edit", attachment_ids=("a" * 32,))
-            )
+            dispatcher.dispatch(_request(capability="file_edit", attachment_ids=("a" * 32,)))
         )
         self.assertEqual(result.status, "completed")
         self.assertEqual(result.artifact.kind, "file_edit")
@@ -601,9 +639,7 @@ class ChildGraphDispatcherTests(unittest.TestCase):
             session_id="session-1",
             current_message="继续",
             recent_messages=(
-                ContextMessage(
-                    turn_id="t1", sequence=1, role="user", content="旧问题"
-                ),
+                ContextMessage(turn_id="t1", sequence=1, role="user", content="旧问题"),
             ),
             active_goal="比较 RAG 与 GraphRAG",
             recalled_context=(

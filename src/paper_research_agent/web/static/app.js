@@ -800,6 +800,7 @@ function renderRunEvent(runView, event) {
   const previousState = runView.state;
   runView.state = reduceRunEvent(runView.state, event);
   if (runView.state === previousState) return null;
+  renderScholarlySources(runView.article, runView.state.order.map((id) => runView.state.nodes[id]));
   runView.registry.forEach((element, id) => {
     if (!runView.state.nodes[id]) {
       element.remove();
@@ -1099,6 +1100,7 @@ async function consumeAgentStream(response, pendingRequest, sourceNote = "") {
         meta.append(createElement("small", "source-note source-note-rag", `本地论文来源 ${sourceCount} 条`));
         renderAgentInspectorEvent("本地论文检索", event);
       } else if (event.type === "tool_result") {
+        renderScholarlySources(article, [event]);
         const toolNames = Array.isArray(event.tool_names) ? event.tool_names : [];
         meta.append(createElement("small", "source-note", toolNames.length ? `工具：${toolNames.join("、")}` : "动态工具已完成"));
         renderAgentInspectorEvent("动态工具", event);
@@ -1590,12 +1592,38 @@ function naturalText(value) {
 function renderTextWithCitations(value, citations = state.citations) {
   const fragment = document.createDocumentFragment();
   const text = String(value || "");
-  const pattern = /\[E[1-9]\d*\]/g;
+  const pattern = /\[([^\]\n]+)\]\(((?:[^()\s<>]|\([^()\s<>]*\))+)\)|https?:\/\/[^\s<>"'\[\]，。；！？、）】》]+|\[E[1-9]\d*\]/g;
   let cursor = 0;
   for (const match of text.matchAll(pattern)) {
     const index = match.index ?? 0;
     if (index > cursor) fragment.append(document.createTextNode(text.slice(cursor, index)));
     const marker = match[0];
+    if (match[1] !== undefined || /^https?:\/\//i.test(marker)) {
+      let address = match[2] || marker;
+      if (match[1] === undefined) {
+        address = address.replace(/[.,;:!?]+$/, "");
+        while (address.endsWith(")") && (address.match(/\)/g) || []).length > (address.match(/\(/g) || []).length) {
+          address = address.slice(0, -1);
+        }
+      }
+      let url = null;
+      try {
+        const parsed = new URL(address);
+        if (["http:", "https:"].includes(parsed.protocol) && !parsed.username && !parsed.password) url = parsed;
+      } catch { /* Invalid links remain readable text. */ }
+      if (url) {
+        const link = createElement("a", "answer-link", match[1] || address);
+        link.href = url.href;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        fragment.append(link);
+        if (!match[1] && address.length < marker.length) fragment.append(document.createTextNode(marker.slice(address.length)));
+      } else {
+        fragment.append(document.createTextNode(marker));
+      }
+      cursor = index + marker.length;
+      continue;
+    }
     const citationId = marker.slice(1, -1);
     if (citations.has(citationId)) {
       const button = createElement("button", "citation-button inline-citation", marker);
@@ -1778,7 +1806,9 @@ function renderAnswer(payload, persist) {
 
   if (normalized.status === "insufficient_evidence") {
     const text = normalized.answerText || "当前检索上下文没有足够证据，无法可靠回答该问题。";
-    article.append(createElement("p", "insufficient", text));
+    const paragraph = createElement("p", "insufficient");
+    paragraph.append(renderTextWithCitations(text));
+    article.append(paragraph);
     showNotice("证据不足：系统没有调用猜测性答案补全。", "warning");
     if (persist) saveHistoryItem({ role: "assistant", text, status: "insufficient_evidence" });
   } else if (normalized.claims.length) {
@@ -1789,7 +1819,9 @@ function renderAnswer(payload, persist) {
     if (persist) saveHistoryItem({ role: "assistant", text: plainText, status: "answered" });
   } else {
     const text = normalized.answerText || "回答已完成，但没有返回可展示的 claims。";
-    article.append(createElement("p", "insufficient", text));
+    const paragraph = createElement("p", "insufficient");
+    paragraph.append(renderTextWithCitations(text));
+    article.append(paragraph);
     if (persist) saveHistoryItem({ role: "assistant", text, status: "answered" });
   }
 
@@ -1842,12 +1874,16 @@ function renderCompactText(value) {
         listType = nextListType;
         container.append(list);
       }
-      list.append(createElement("li", "", (ordered || unordered)[1]));
+      const item = createElement("li", "");
+      item.append(renderTextWithCitations((ordered || unordered)[1]));
+      list.append(item);
       return;
     }
     list = null;
     listType = "";
-    container.append(createElement("p", "", trimmed));
+    const paragraph = createElement("p", "");
+    paragraph.append(renderTextWithCitations(trimmed));
+    container.append(paragraph);
   });
 
   if (!container.childElementCount) container.append(createElement("p", "", "—"));
@@ -2466,7 +2502,51 @@ function appendRestoredAssistant(text, status, events = [], requestId = null) {
     .map((event) => event.detail?.output_attachment_id)
     .filter((attachmentId) => /^[0-9a-f]{32}$/.test(attachmentId || ""));
   [...new Set(outputAttachmentIds)].forEach((attachmentId) => article.append(createServerDownloadButton(attachmentId)));
+  renderScholarlySources(article, Array.isArray(events) ? events : []);
   elements.messages.append(article);
+}
+
+function renderScholarlySources(article, records) {
+  const lookups = records.flatMap((record) => record?.detail?.scholarly_lookups || record?.scholarly_lookups || []);
+  const unique = new Map();
+  lookups.forEach((lookup) => {
+    if (["crossref", "arxiv", "semantic_scholar"].includes(lookup?.provider)) {
+      unique.set(`${lookup.provider}:${lookup.tool_name}:${lookup.queried_at}`, lookup);
+    }
+  });
+  if (!unique.size) return;
+  let container = article.querySelector(".scholarly-sources");
+  if (!container) {
+    container = createElement("section", "scholarly-sources");
+    container.setAttribute("aria-label", "外部学术 API 来源");
+    article.append(container);
+  }
+  container.replaceChildren(createElement("strong", "", "外部学术 API 来源"));
+  const labels = { crossref: "Crossref", arxiv: "arXiv", semantic_scholar: "Semantic Scholar" };
+  unique.forEach((lookup) => {
+    const card = createElement("div", "scholarly-source-card");
+    const mode = lookup.cache_hit ? "缓存命中" : lookup.network_accessed ? "实时 API 查询" : "未发起联网请求";
+    const status = { ok: "查询成功", not_found: "未检出结果", insufficient: "未完成核验" }[lookup.status] || "状态未知";
+    card.append(createElement("strong", "", `${labels[lookup.provider]} · ${mode}`));
+    const queriedAt = new Date(lookup.queried_at);
+    card.append(createElement("small", "", `${status} · 返回 ${lookup.returned_count || 0} 项 · ${Number.isNaN(queriedAt.getTime()) ? "时间未知" : queriedAt.toLocaleString()}`));
+    const sources = Array.isArray(lookup.sources) ? lookup.sources : [];
+    sources.forEach((source) => {
+      let url;
+      try { url = new URL(source.url); } catch { return; }
+      if (url.protocol !== "https:" || !["doi.org", "arxiv.org", "www.semanticscholar.org", "api.semanticscholar.org"].includes(url.hostname) || url.username || url.password || (url.port && url.port !== "443")) return;
+      const row = createElement("div", "scholarly-source-paper");
+      const link = createElement("a", "", source.title || source.identifier || "查看论文");
+      link.href = url.href;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      row.append(link, createElement("small", "", source.identifier || ""));
+      card.append(row);
+    });
+    if (lookup.returned_count > sources.length) card.append(createElement("small", "", `展示 ${sources.length} 条可核对的书目来源`));
+    container.append(card);
+  });
+  container.append(createElement("small", "scholarly-source-note", "来源记录由工具实际返回结果生成；外部书目信息与本地全文证据分开标注。"));
 }
 
 function clearLocalDialogue() {

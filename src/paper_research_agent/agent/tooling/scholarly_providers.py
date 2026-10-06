@@ -139,6 +139,13 @@ class ScholarlyProviderRegistry:
         attempts: list[dict[str, Any]] = []
         last_result: ScholarlyProviderResult | None = None
         for provider in self._providers:
+            selector = (
+                "semantic_scholar"
+                if provider.provider_id == "semantic_scholar_crossref"
+                else provider.provider_id
+            )
+            if request.source != "auto" and selector not in {request.source, "offline"}:
+                continue
             if operation not in provider.capabilities:
                 continue
             try:

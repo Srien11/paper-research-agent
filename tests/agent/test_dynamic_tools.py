@@ -399,9 +399,7 @@ class DynamicToolGraphTests(unittest.IsolatedAsyncioTestCase):
         result = await runtime.run(
             "继续",
             thread_id="memory-supplied",
-            memory_context=(
-                {"memory_id": "m" * 32, "content": "偏好", "kind": "preference"},
-            ),
+            memory_context=({"memory_id": "m" * 32, "content": "偏好", "kind": "preference"},),
         )
 
         self.assertEqual(result.status, "completed")
@@ -470,6 +468,31 @@ class DynamicToolGraphTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         self.assertEqual(toolkit.memory_recalls[0]["action"], "search")
+
+    async def test_long_final_summary_preserves_completed_tool_observations(self) -> None:
+        summary = "公开研究总结。" * 400 + "https://doi.org/10.1234/example"
+        toolkit = FakeToolkit()
+        graph = build_dynamic_tool_graph(
+            router=SequenceRouter(
+                ToolDecision(
+                    action="call_tool",
+                    tool_name="calculate",
+                    arguments={"expression": "6 * 7"},
+                    purpose="计算",
+                ),
+                ToolDecision(action="finish", purpose="总结", final_summary=summary),
+            ),
+            toolkit=toolkit,  # type: ignore[arg-type]
+            max_steps=3,
+        )
+        result = await DynamicResearchRuntime(graph=graph, max_steps=3).run(
+            "计算 6 * 7", thread_id="long-summary"
+        )
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.final_summary, summary)
+        self.assertEqual(len(result.observations), 1)
+        with self.assertRaises(ValidationError):
+            ToolDecision(action="finish", purpose="总结", final_summary="x" * 20_001)
 
     async def test_stops_identical_repeated_tool_call(self) -> None:
         decision = ToolDecision(

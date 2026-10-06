@@ -14,6 +14,7 @@ from paper_research_agent.agent.orchestrator.artifacts import (
 from paper_research_agent.agent.orchestrator.identifiers import dynamic_thread_id
 from paper_research_agent.agent.orchestrator.models import ChildTaskRequest, ChildTaskResult
 from paper_research_agent.agent.tooling.catalog import SCHOLARLY_NETWORK_TOOL_NAMES, ToolRisk
+from paper_research_agent.agent.tooling.provenance import bounded_lookups
 
 if TYPE_CHECKING:
     from paper_research_agent.agent.dynamic.models import DynamicResearchResult
@@ -28,9 +29,7 @@ class DirectChatChildExecutor(Protocol):
 
 
 class AttachmentChildExecutor(Protocol):
-    async def answer_attachment(
-        self, request: ChildTaskRequest
-    ) -> AttachmentArtifact: ...
+    async def answer_attachment(self, request: ChildTaskRequest) -> AttachmentArtifact: ...
 
 
 class FileEditChildExecutor(Protocol):
@@ -130,9 +129,7 @@ class ChildGraphDispatcher:
             task_id=request.task_id,
             capability="local_rag",
             status=(
-                "completed"
-                if artifact.answer.status == "answered"
-                else "insufficient_evidence"
+                "completed" if artifact.answer.status == "answered" else "insufficient_evidence"
             ),
             summary=artifact.text,
             source_ids=artifact.source_ids,
@@ -202,9 +199,7 @@ def _child_context_from_request(request: ChildTaskRequest) -> dict[str, object]:
     }
 
 
-def _dynamic_result(
-    request: ChildTaskRequest, result: DynamicResearchResult
-) -> ChildTaskResult:
+def _dynamic_result(request: ChildTaskRequest, result: DynamicResearchResult) -> ChildTaskResult:
     if result.status == "approval_required":
         pending = result.pending_approval
         pending_payload = pending.model_dump(mode="json") if pending is not None else None
@@ -265,8 +260,13 @@ def _dynamic_result(
         citation_kind="external",
         artifact=DynamicToolArtifact(
             text=result.final_summary or "动态研究已完成",
-            tool_names=tuple(
-                dict.fromkeys(item.tool_name for item in result.observations)
+            tool_names=tuple(dict.fromkeys(item.tool_name for item in result.observations)),
+            scholarly_lookups=bounded_lookups(
+                tuple(
+                    item.result.scholarly_lookup
+                    for item in result.observations[-20:]
+                    if item.result.scholarly_lookup is not None
+                )
             ),
         ),
     )
@@ -322,16 +322,18 @@ def _scholarly_failure_code(result: DynamicResearchResult) -> str | None:
         )
         attempts = observation.result.summary.get("provider_attempts", ())
         attempt_reasons = {
-            str(item.get("reason_code", ""))
-            for item in attempts
-            if isinstance(item, dict)
+            str(item.get("reason_code", "")) for item in attempts if isinstance(item, dict)
         }
         if "timeout" in reason or any("timeout" in item for item in attempt_reasons):
             return "external_research_timeout"
-        if reason in {
-            "provider_not_configured",
-            "all_providers_unavailable",
-            "provider_capability_not_configured",
-        } or attempt_reasons:
+        if (
+            reason
+            in {
+                "provider_not_configured",
+                "all_providers_unavailable",
+                "provider_capability_not_configured",
+            }
+            or attempt_reasons
+        ):
             unavailable = True
     return "external_research_unavailable" if unavailable else None

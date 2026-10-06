@@ -20,6 +20,7 @@ from paper_research_agent.agent.orchestrator.planner import (
     TaskPlanner,
     build_single_local_rag_decisions,
     build_single_task_decisions,
+    enforce_capability_plan,
 )
 
 
@@ -139,9 +140,7 @@ class GoalReconcilerTests(unittest.TestCase):
         self.assertEqual(decision.goal.status, "abandoned")
 
     def test_answer_within_goal_keeps_goal(self) -> None:
-        decision = _reconcile(
-            self.reconciler, _envelope(), _interpretation("answer_within_goal")
-        )
+        decision = _reconcile(self.reconciler, _envelope(), _interpretation("answer_within_goal"))
         self.assertEqual(decision.action, "keep")
         self.assertEqual(decision.goal.goal_id, "a" * 32)
 
@@ -150,9 +149,7 @@ class GoalReconcilerTests(unittest.TestCase):
             conversation_id="conversation-1", version=0, updated_at=_utc()
         )
         envelope = _envelope(workspace=workspace)
-        decision = _reconcile(
-            self.reconciler, envelope, _interpretation("meta_conversation")
-        )
+        decision = _reconcile(self.reconciler, envelope, _interpretation("meta_conversation"))
         self.assertEqual(decision.action, "keep")
         self.assertIsNone(decision.goal)
 
@@ -161,9 +158,7 @@ class GoalReconcilerTests(unittest.TestCase):
             conversation_id="conversation-1", version=0, updated_at=_utc()
         )
         envelope = _envelope(workspace=workspace)
-        decision = _reconcile(
-            self.reconciler, envelope, _interpretation("continue_goal")
-        )
+        decision = _reconcile(self.reconciler, envelope, _interpretation("continue_goal"))
         self.assertEqual(decision.action, "create")
         self.assertEqual(decision.goal.origin_turn_id, "c" * 32)
 
@@ -183,9 +178,7 @@ class GoalReconcilerTests(unittest.TestCase):
             ]
         )
         reconciler = GoalReconciler(model=fake)
-        decision = _reconcile(
-            reconciler, _envelope(), _interpretation("new_goal")
-        )
+        decision = _reconcile(reconciler, _envelope(), _interpretation("new_goal"))
         self.assertEqual(decision.action, "create")
         self.assertEqual(decision.goal.objective, "比较 RAG 与 GraphRAG 并给出选型建议")
         self.assertEqual(len(decision.goal.acceptance_criteria), 1)
@@ -193,9 +186,7 @@ class GoalReconcilerTests(unittest.TestCase):
     def test_model_failure_falls_back_to_deterministic(self) -> None:
         fake = _FakeModel([RuntimeError("down")])
         reconciler = GoalReconciler(model=fake)
-        decision = _reconcile(
-            reconciler, _envelope(), _interpretation("new_goal")
-        )
+        decision = _reconcile(reconciler, _envelope(), _interpretation("new_goal"))
         self.assertEqual(decision.action, "create")
         self.assertEqual(decision.goal.objective, "继续比较 RAG 与 GraphRAG")
         self.assertIsNotNone(decision.goal.goal_id)
@@ -628,9 +619,7 @@ class TaskPlannerTests(unittest.TestCase):
             workspace=workspace,
         )
 
-        interpretation, goal_decision, plan_decision = (
-            build_single_local_rag_decisions(envelope)
-        )
+        interpretation, goal_decision, plan_decision = build_single_local_rag_decisions(envelope)
 
         self.assertEqual(interpretation.relation, "new_goal")
         self.assertFalse(interpretation.needs_clarification)
@@ -677,6 +666,89 @@ class TaskPlannerTests(unittest.TestCase):
         task = plan_decision.plan.tasks[0]
         self.assertEqual(task.capability, "direct_chat")
         self.assertEqual(task.objective, "介绍一下 RAG")
+
+
+class SemanticInformationNeedTests(unittest.TestCase):
+    def _tasks(
+        self,
+        *,
+        need="external",
+        confidence=0.9,
+        mode="disabled",
+        message="给我几篇代表文献",
+        source="auto",
+    ):
+        envelope = _envelope(current_message=message, rag_mode=mode)
+        task = AgentTask(
+            task_id="initial",
+            goal_id="a" * 32,
+            title="初始任务",
+            objective=message,
+            success_criteria=("完成请求",),
+            capability="direct_chat",
+            execution_reason="测试模型提出普通回答",
+        )
+        interpretation = _interpretation(
+            "new_goal",
+            resolved_request=message,
+            information_need=need,
+            confidence=confidence,
+            scholarly_source=source,
+        )
+        return enforce_capability_plan(
+            (task,),
+            envelope=envelope,
+            resolved_request=message,
+            goal_id="a" * 32,
+            interpretation=interpretation,
+        )
+
+    def test_external_need_overrides_direct_chat_draft_and_is_read_only(self):
+        tasks = self._tasks()
+        self.assertEqual([task.capability for task in tasks], ["dynamic_tools"])
+        self.assertEqual(tasks[0].allowed_tool_risks, ("network_read",))
+        self.assertNotIn("save_research_note", tasks[0].allowed_tool_names)
+
+    def test_external_only_does_not_add_optional_local_branch(self):
+        self.assertEqual(
+            [task.capability for task in self._tasks(mode="preferred")], ["dynamic_tools"]
+        )
+
+    def test_hybrid_need_creates_two_independent_branches(self):
+        tasks = self._tasks(mode="preferred", need="hybrid")
+        self.assertEqual([task.capability for task in tasks], ["local_rag", "dynamic_tools"])
+        self.assertEqual(tasks[0].parallel_group_id, tasks[1].parallel_group_id)
+
+    def test_required_mode_is_not_relaxed_by_semantic_need(self):
+        self.assertEqual([task.capability for task in self._tasks(mode="required")], ["local_rag"])
+
+    def test_low_confidence_never_forces_network(self):
+        self.assertEqual([task.capability for task in self._tasks(confidence=0.5)], ["direct_chat"])
+
+    def test_explicit_no_network_overrides_model_external_need(self):
+        self.assertEqual(
+            [task.capability for task in self._tasks(message="不要联网，解释这个方法")],
+            ["direct_chat"],
+        )
+
+    def test_explicit_database_preference_reaches_dynamic_task(self):
+        self.assertTrue(self._tasks(source="arxiv")[0].objective.startswith("学术数据库：arxiv。"))
+
+    def test_model_planner_failure_retains_semantically_identified_read_only_need(self):
+        envelope = _envelope(current_message="给我几篇代表文献", rag_mode="disabled")
+        interpretation = _interpretation(
+            "new_goal", resolved_request="给我几篇代表文献", information_need="external"
+        )
+        model = _FakeModel([RuntimeError("planner failed")])
+        decision = asyncio.run(
+            TaskPlanner(model).plan(
+                envelope,
+                interpretation,
+                GoalDecision(action="keep", goal=_goal(), rationale="保留目标"),
+            )
+        )
+        self.assertEqual(model.calls, 1)
+        self.assertEqual(decision.plan.tasks[0].capability, "dynamic_tools")
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from paper_research_agent.agent.tooling.provenance import ScholarlyLookupRecord
 from paper_research_agent.answering.models import RAGAnswer
 
 
@@ -76,6 +77,7 @@ class PendingApprovalArtifact(FrozenArtifact):
 class DynamicToolArtifact(ChildArtifactBase):
     kind: Literal["dynamic_tools"] = "dynamic_tools"
     tool_names: tuple[str, ...] = Field(default=(), max_length=20)
+    scholarly_lookups: tuple[ScholarlyLookupRecord, ...] = Field(default=(), max_length=20)
     pending_approval: PendingApprovalArtifact | None = None
 
     @field_validator("tool_names")
@@ -114,10 +116,6 @@ class FileArtifact(ChildArtifactBase):
 
 
 ChildArtifact = Annotated[
-    ChatArtifact
-    | LocalRAGArtifact
-    | DynamicToolArtifact
-    | AttachmentArtifact
-    | FileArtifact,
+    ChatArtifact | LocalRAGArtifact | DynamicToolArtifact | AttachmentArtifact | FileArtifact,
     Field(discriminator="kind"),
 ]

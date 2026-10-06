@@ -16,6 +16,7 @@ from paper_research_agent.agent.tooling.analysis import AnalysisResearchTools
 from paper_research_agent.agent.tooling.approval import ApprovalManager
 from paper_research_agent.agent.tooling.content import ContentResearchTools
 from paper_research_agent.agent.tooling.local import LocalResearchTools
+from paper_research_agent.agent.tooling.public_scholarly import ArxivProvider, CrossrefProvider
 from paper_research_agent.agent.tooling.scholarly import (
     ScholarlyResearchTools,
     SemanticScholarCrossrefProvider,
@@ -79,6 +80,7 @@ def create_extended_research_toolkit(
     source = os.environ if environ is None else environ
     client: httpx.AsyncClient | None = None
     provider = scholarly_provider
+    providers: tuple[ScholarlyProvider, ...]
     if provider is None:
         mode = _resolve_scholarly_mode(
             scholarly_mode if scholarly_mode is not None else source.get("PRA_SCHOLARLY_MODE")
@@ -89,13 +91,16 @@ def create_extended_research_toolkit(
             client = httpx.AsyncClient(
                 timeout=httpx.Timeout(10),
                 follow_redirects=False,
+                trust_env=False,
                 headers={"User-Agent": "paper-research-agent/0.1 (local research)"},
             )
-            provider = SemanticScholarCrossrefProvider(
-                client,
-                api_key=semantic_scholar_api_key or source.get("SEMANTIC_SCHOLAR_API_KEY"),
-            )
-    scholarly = ScholarlyResearchTools(ScholarlyProviderRegistry((provider,)))
+            api_key = semantic_scholar_api_key or source.get("SEMANTIC_SCHOLAR_API_KEY")
+            providers = (CrossrefProvider(client), ArxivProvider(client))
+            if api_key:
+                providers = (SemanticScholarCrossrefProvider(client, api_key=api_key), *providers)
+    if provider is not None:
+        providers = (provider,)
+    scholarly = ScholarlyResearchTools(ScholarlyProviderRegistry(providers))
     toolkit = ExtendedResearchToolkit(
         local=LocalResearchTools(
             chunks=chunks,

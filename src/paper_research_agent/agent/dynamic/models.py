@@ -22,7 +22,7 @@ class ToolDecision(FrozenModel):
     tool_name: str | None = None
     arguments: dict[str, Any] = Field(default_factory=dict)
     purpose: str = Field(min_length=1, max_length=500)
-    final_summary: str | None = Field(default=None, min_length=1, max_length=2000)
+    final_summary: str | None = Field(default=None, min_length=1, max_length=20_000)
 
     @model_validator(mode="after")
     def validate_action(self) -> ToolDecision:

@@ -12,6 +12,7 @@ from paper_research_agent.agent.orchestrator.models import (
     ChildTaskResult,
     MainAgentResult,
 )
+from paper_research_agent.agent.tooling.provenance import ScholarlyLookupRecord
 from paper_research_agent.web.models import (
     SafeEvidenceSource,
     SafePendingToolApproval,
@@ -141,6 +142,7 @@ class SafeRunEventDetail(WebModel):
     first_token_ms: int | None = Field(default=None, ge=0)
     browser_first_answer_byte_ms: int | None = Field(default=None, ge=0)
     citations: tuple[SafeEvidenceSource, ...] = Field(default=(), max_length=100)
+    scholarly_lookups: tuple[ScholarlyLookupRecord, ...] = Field(default=(), max_length=20)
 
 
 class AgentStreamEventDraft(WebModel):
@@ -186,26 +188,17 @@ class AgentStreamEventDraft(WebModel):
             "parallel_group_completed",
         }
         has_parallel_detail = (
-            self.detail.parallel_group_id is not None
-            or self.detail.requested_count is not None
+            self.detail.parallel_group_id is not None or self.detail.requested_count is not None
         )
         if parallel_event:
             if self.task_id is not None:
                 raise ValueError("parallel group events must not identify one task")
-            if (
-                self.detail.parallel_group_id is None
-                or self.detail.requested_count != 2
-            ):
-                raise ValueError(
-                    "parallel group events require an ID and requested_count=2"
-                )
+            if self.detail.parallel_group_id is None or self.detail.requested_count != 2:
+                raise ValueError("parallel group events require an ID and requested_count=2")
             if self.type == "parallel_group_completed" and (
-                self.detail.returned_count is None
-                or self.detail.degraded is None
+                self.detail.returned_count is None or self.detail.degraded is None
             ):
-                raise ValueError(
-                    "parallel_group_completed requires returned_count and degraded"
-                )
+                raise ValueError("parallel_group_completed requires returned_count and degraded")
         elif has_parallel_detail:
             raise ValueError("parallel group detail is reserved for parallel events")
         return self
@@ -262,6 +255,7 @@ class LegacyAgentStreamEvent(WebModel):
     source_ids: tuple[str, ...] = Field(default=(), max_length=100)
     output_attachment_ids: tuple[str, ...] = Field(default=(), max_length=5)
     tool_names: tuple[str, ...] = Field(default=(), max_length=20)
+    scholarly_lookups: tuple[ScholarlyLookupRecord, ...] = Field(default=(), max_length=20)
     pending_approval: SafePendingToolApproval | None = None
 
     @field_validator("counts")
@@ -303,6 +297,8 @@ class LegacyAgentStreamEvent(WebModel):
             raise ValueError("output attachments are reserved for file_result")
         if self.tool_names and self.type != "tool_result":
             raise ValueError("tool names are reserved for tool_result")
+        if self.scholarly_lookups and self.type != "tool_result":
+            raise ValueError("scholarly provenance is reserved for tool_result")
         if self.type == "approval_required" and self.pending_approval is None:
             raise ValueError("approval_required requires a safe approval projection")
         if self.type != "approval_required" and self.pending_approval is not None:
@@ -334,6 +330,7 @@ class AgentEventProjector:
         source_ids: tuple[str, ...] = (),
         output_attachment_ids: tuple[str, ...] = (),
         tool_names: tuple[str, ...] = (),
+        scholarly_lookups: tuple[ScholarlyLookupRecord, ...] = (),
         pending_approval: SafePendingToolApproval | None = None,
     ) -> LegacyAgentStreamEvent:
         if self._done:
@@ -353,6 +350,7 @@ class AgentEventProjector:
             source_ids=source_ids,
             output_attachment_ids=output_attachment_ids,
             tool_names=tool_names,
+            scholarly_lookups=scholarly_lookups,
             pending_approval=pending_approval,
         )
         self._next_event_id += 1
@@ -404,16 +402,10 @@ class AgentEventProjector:
         )
         return tuple(events)
 
-    def _project_child(
-        self, child: ChildTaskResult
-    ) -> list[LegacyAgentStreamEvent]:
+    def _project_child(self, child: ChildTaskResult) -> list[LegacyAgentStreamEvent]:
         events = [
-            self.event(
-                "task_started", task_id=child.task_id, capability=child.capability
-            ),
-            self.event(
-                "route_selected", task_id=child.task_id, capability=child.capability
-            ),
+            self.event("task_started", task_id=child.task_id, capability=child.capability),
+            self.event("route_selected", task_id=child.task_id, capability=child.capability),
         ]
         event_types: dict[Capability, LegacyAgentStreamEventType] = {
             "local_rag": "rag_result",
@@ -444,6 +436,7 @@ class AgentEventProjector:
                     source_ids=source_ids,
                     output_attachment_ids=output_ids,
                     tool_names=tool_names,
+                    scholarly_lookups=tuple(getattr(artifact, "scholarly_lookups", ())),
                     counts={"source_count": len(source_ids), **metric_counts},
                     task_id=child.task_id,
                     capability=child.capability,

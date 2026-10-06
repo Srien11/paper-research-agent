@@ -6,11 +6,13 @@ import unittest
 from collections import deque
 from collections.abc import Callable
 from datetime import UTC, datetime
+from unittest.mock import patch
 
 from paper_research_agent.agent.observability import AgentEvent
 from paper_research_agent.agent.orchestrator.artifacts import ChatArtifact
 from paper_research_agent.agent.orchestrator.control import RunControlCommand
 from paper_research_agent.agent.orchestrator.graph import build_main_agent_graph
+from paper_research_agent.agent.orchestrator.hydrator import ContextHydrator
 from paper_research_agent.agent.orchestrator.models import (
     AgentContextEnvelope,
     AgentTask,
@@ -251,9 +253,7 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
         graph = build_main_agent_graph(
             repository=resolved_store,
             hydrator=FakeHydrator(recalled_context),
-            interpreter=FakeInterpreter(
-                interpretation or _interpretation()
-            ),
+            interpreter=FakeInterpreter(interpretation or _interpretation()),
             goal_reconciler=FakeReconciler(_goal_decision()),
             task_planner=planner,
             dispatcher=dispatcher,
@@ -265,9 +265,7 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
         )
         return graph, resolved_store, dispatcher, planner
 
-    async def _run(
-        self, graph: object, request: MainAgentRequest
-    ) -> dict[str, object]:
+    async def _run(self, graph: object, request: MainAgentRequest) -> dict[str, object]:
         return await graph.ainvoke({"request": request.model_dump(mode="json")})  # type: ignore[attr-defined]
 
     async def test_direct_chat_flow(self) -> None:
@@ -323,10 +321,7 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
         )
 
         await self._run(graph, request)
-        events = [
-            item.to_stream_event()
-            for item in store.run_events(request.request_id)
-        ]
+        events = [item.to_stream_event() for item in store.run_events(request.request_id)]
         event_types = [item.type for item in events]
 
         expected = [
@@ -366,9 +361,7 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
         graph, _store, dispatcher, _planner = self._build(
             interpretation=_interpretation(selected_context_ids=(selected_id,)),
             recalled_context=recalled,
-            plan_decisions=(
-                _plan_decision((_task(task_id="chat", capability="direct_chat"),)),
-            ),
+            plan_decisions=(_plan_decision((_task(task_id="chat", capability="direct_chat"),)),),
             dispatch_results=(
                 _result(
                     capability="direct_chat",
@@ -582,19 +575,14 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
             tuple(task.status for task in persisted.task_plan.tasks),
             ("completed", "completed"),
         )
-        events = [
-            item.to_stream_event()
-            for item in store.run_events(request.request_id)
-        ]
+        events = [item.to_stream_event() for item in store.run_events(request.request_id)]
         event_types = [event.type for event in events]
         group_started_index = event_types.index("parallel_group_started")
         task_started_indices = [
             index for index, value in enumerate(event_types) if value == "task_started"
         ]
         task_completed_indices = [
-            index
-            for index, value in enumerate(event_types)
-            if value == "task_completed"
+            index for index, value in enumerate(event_types) if value == "task_completed"
         ]
         group_completed_index = event_types.index("parallel_group_completed")
         self.assertLess(group_started_index, min(task_started_indices))
@@ -722,13 +710,13 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
         assert persisted is not None
         self.assertEqual(persisted.status, "failed")
         self.assertEqual(
-            tuple(task.status for task in store.load_workspace(request.conversation_id).task_plan.tasks),
+            tuple(
+                task.status
+                for task in store.load_workspace(request.conversation_id).task_plan.tasks
+            ),
             ("failed", "failed"),
         )
-        event_types = [
-            item.to_stream_event().type
-            for item in store.run_events(request.request_id)
-        ]
+        event_types = [item.to_stream_event().type for item in store.run_events(request.request_id)]
         self.assertNotIn("parallel_group_started", event_types)
         self.assertNotIn("task_started", event_types)
         await bus.aclose()
@@ -787,9 +775,7 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(persisted)
         self.assertEqual(
             tuple(
-                source_id
-                for result in persisted.child_results
-                for source_id in result.source_ids
+                source_id for result in persisted.child_results for source_id in result.source_ids
             ),
             (),
         )
@@ -829,8 +815,7 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
             request_id="request-fast-comparison",
             conversation_id="conversation-fast-comparison",
             message=(
-                "在逻辑推理研究中，一篇认为没有外部反馈时无效，"
-                "另一篇区分找错与改错。请找出论文。"
+                "在逻辑推理研究中，一篇认为没有外部反馈时无效，另一篇区分找错与改错。请找出论文。"
             ),
             rag_mode="preferred",
         )
@@ -950,9 +935,7 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
 
         full_sink = MemorySink()
         full_graph, _store, _dispatcher, _planner = self._build(
-            plan_decisions=(
-                _plan_decision((_task(task_id="local", capability="local_rag"),)),
-            ),
+            plan_decisions=(_plan_decision((_task(task_id="local", capability="local_rag"),)),),
             dispatch_results=(_result(task_id="local", source_id="chunk-1"),),
             event_sink=full_sink,
             fast_path_enabled=False,
@@ -995,9 +978,7 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
                     rag_mode="preferred",
                     attachment_ids=("file-1",),
                 ),
-                _plan_decision(
-                    (_task(task_id="attachment", capability="attachment_qa"),)
-                ),
+                _plan_decision((_task(task_id="attachment", capability="attachment_qa"),)),
                 (
                     _result(
                         task_id="attachment",
@@ -1032,9 +1013,7 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
                     message="查询这个项目今天最新的网页状态",
                     rag_mode="preferred",
                 ),
-                _plan_decision(
-                    (_task(task_id="dynamic", capability="dynamic_tools"),)
-                ),
+                _plan_decision((_task(task_id="dynamic", capability="dynamic_tools"),)),
                 (
                     _result(
                         task_id="dynamic",
@@ -1163,7 +1142,10 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(dispatcher.calls[1].task_id, "web")
 
     async def test_clarification_stops_execution(self) -> None:
+        store = InMemoryConversationStore()
         graph, _store, dispatcher, _planner = self._build(
+            store=store,
+            run_event_publisher=RunEventBus(store).publisher,
             interpretation=_interpretation(
                 needs_clarification=True,
                 clarification_question="你想比较哪两个方案？",
@@ -1171,7 +1153,7 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
         request = MainAgentRequest(
-            request_id="request-1",
+            request_id="request-clarification-1234",
             conversation_id="conversation-1",
             message="比较它们",
             rag_mode="preferred",
@@ -1179,6 +1161,20 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
         state = await self._run(graph, request)
         self.assertEqual(dispatcher.calls, [])
         self.assertEqual(state["final_answer"], "你想比较哪两个方案？")
+        turns = store.recent(request.conversation_id)
+        self.assertEqual(turns[-1].assistant_summary, state["final_answer"])
+        followup = request.model_copy(update={"message": "RAG 和 GraphRAG"})
+        # Legacy records stored workspace progress instead of the spoken question.
+        legacy_turns = tuple(
+            t.model_copy(update={"assistant_summary": "目标：旧任务"}) for t in turns
+        )
+        with patch.object(store, "recent", return_value=legacy_turns):
+            context = await ContextHydrator(store).hydrate(
+                followup, store.load_workspace(request.conversation_id), turn_id="e" * 32
+            )
+        self.assertEqual(context.recent_messages[-1].role, "assistant")
+        self.assertEqual(context.recent_messages[-1].content, state["final_answer"])
+        self.assertEqual(context.recent_messages[-1].trust, "non_evidence")
 
     async def test_replan_path_replans_then_succeeds(self) -> None:
         store = InMemoryConversationStore()
@@ -1210,10 +1206,7 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
             rag_mode="preferred",
         )
         state = await self._run(graph, request)
-        event_types = [
-            item.to_stream_event().type
-            for item in store.run_events(request.request_id)
-        ]
+        event_types = [item.to_stream_event().type for item in store.run_events(request.request_id)]
         self.assertEqual(planner.calls, 2)
         self.assertEqual(len(dispatcher.calls), 2)
         self.assertEqual(
@@ -1239,9 +1232,7 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
         )
         graph, store, dispatcher, planner = self._build(
             plan_decisions=(first_plan, duplicate_plan),
-            dispatch_results=(
-                _result(status="insufficient_evidence", task_id="local"),
-            ),
+            dispatch_results=(_result(status="insufficient_evidence", task_id="local"),),
         )
         request = MainAgentRequest(
             request_id="request-replan-deduplicated",
@@ -1255,9 +1246,7 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(planner.calls, 2)
         self.assertEqual(len(dispatcher.calls), 1)
         duplicate = next(
-            result
-            for result in state["child_results"]
-            if result.task_id == "local-retry"
+            result for result in state["child_results"] if result.task_id == "local-retry"
         )
         self.assertEqual(duplicate.error_code, "duplicate_evidence_retry_blocked")
         persisted = store.load_workspace(request.conversation_id)
@@ -1299,9 +1288,7 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
         )
         graph, store, dispatcher, _planner = self._build(
             plan_decisions=(plan,),
-            dispatch_results=(
-                _result(status="insufficient_evidence", task_id="local"),
-            ),
+            dispatch_results=(_result(status="insufficient_evidence", task_id="local"),),
             max_child_calls=1,
         )
         request = MainAgentRequest(
@@ -1514,9 +1501,7 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
         state = await self._run(graph, request)
 
         self.assertEqual(state["termination_reason"], "failed")
-        self.assertTrue(
-            any("plan goal ID" in error for error in state["validation_errors"])
-        )
+        self.assertTrue(any("plan goal ID" in error for error in state["validation_errors"]))
         self.assertEqual(store.load_workspace("conversation-1").version, 0)
         self.assertEqual(store.history("conversation-1")[0].status, "failed")
 
@@ -1586,24 +1571,28 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(state["termination_reason"], "failed")
-        self.assertIn(
-            "pending approval without a waiting task", state["validation_errors"]
-        )
+        self.assertIn("pending approval without a waiting task", state["validation_errors"])
 
     async def test_same_paper_can_support_multiple_local_tasks(self) -> None:
         graph, store, _dispatcher, _planner = self._build(
-            plan_decisions=(_plan_decision((
-                _task(task_id="definition", capability="local_rag"),
-                _task(task_id="application", capability="local_rag"),
-            )),),
+            plan_decisions=(
+                _plan_decision(
+                    (
+                        _task(task_id="definition", capability="local_rag"),
+                        _task(task_id="application", capability="local_rag"),
+                    )
+                ),
+            ),
             dispatch_results=(
                 _result(task_id="definition", source_id="shared-paper"),
                 _result(task_id="application", source_id="shared-paper"),
             ),
         )
         request = MainAgentRequest(
-            request_id="request-shared-paper", conversation_id="conversation-1",
-            message="解释定义和应用", rag_mode="preferred",
+            request_id="request-shared-paper",
+            conversation_id="conversation-1",
+            message="解释定义和应用",
+            rag_mode="preferred",
         )
         state = await self._run(graph, request)
         self.assertEqual(state["termination_reason"], "completed")
@@ -1622,13 +1611,18 @@ class MainAgentGraphTests(unittest.IsolatedAsyncioTestCase):
             dispatch_results=(child,),
         )
         request = MainAgentRequest(
-            request_id="request-duplicate-within-child", conversation_id="conversation-1",
-            message="解释定义", rag_mode="preferred",
+            request_id="request-duplicate-within-child",
+            conversation_id="conversation-1",
+            message="解释定义",
+            rag_mode="preferred",
         )
-        self.assertIn("child source IDs must be unique", _validate_commit_state(
-            ConversationWorkspace(conversation_id="conversation-1", updated_at=_utc()),
-            {"child_results": [child]}
-        ))
+        self.assertIn(
+            "child source IDs must be unique",
+            _validate_commit_state(
+                ConversationWorkspace(conversation_id="conversation-1", updated_at=_utc()),
+                {"child_results": [child]},
+            ),
+        )
         with self.assertRaisesRegex(ValueError, "source IDs must be unique"):
             await self._run(graph, request)
         self.assertEqual(store.load_workspace("conversation-1").version, 0)

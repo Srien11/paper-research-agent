@@ -351,7 +351,7 @@ ORDER BY event_id;
 该旧工具名已从严格目录移除，恢复时会按未知工具关闭失败。
 
 工具目录为每项能力固定风险级别、默认超时和最大结果数。本地读取直接执行；学术网络只向
-Semantic Scholar 或 Crossref 发送当前检索式/论文标识符，不发送本地 chunk 或论文正文；
+Crossref、arXiv 或 Semantic Scholar 发送当前检索式/论文标识符，不发送本地 chunk 或论文正文；
 计算器只解释算术 AST，实验分析只支持最多 1000 行、20 列和固定统计白名单。
 长期记忆会在主 Agent 解释本轮请求前由现有 `manage_long_term_memory(search)` 只读召回，
 解释器只能从实际召回 ID 中选择。被选中的记忆可进入普通聊天、本地 RAG 或动态工具三条
@@ -562,16 +562,40 @@ python scripts/serve_web.py
 
 单元测试通过依赖注入使用确定性 Fixture Provider（测试假提供方），可覆盖成功、无结果、
 限流、超时和多提供方降级；该实现只存在于测试代码，不能进入生产 Registry（注册表）。
-真实接入必须显式设置 `PRA_SCHOLARLY_MODE=live`。现有 Semantic Scholar/Crossref 适配器
-会从 `SEMANTIC_SCHOLAR_API_KEY` 读取可选凭据，后续
-OpenAlex 等提供方可加入同一有序注册表，而无需改变 Agent 路由、工具参数或结果信任等级。
+真实接入必须显式设置 `PRA_SCHOLARLY_MODE=live`。无 Key 时使用免申请的 Crossref 和 arXiv；
+配置 `SEMANTIC_SCHOLAR_API_KEY` 时优先使用既有 Semantic Scholar，失败后再尝试免 Key 来源。
+工具参数可选 `source=auto|crossref|arxiv|semantic_scholar`，默认 auto 返回第一个成功来源；
+明确选择来源时不跨库降级。OpenAlex 未接入。
 
 ```powershell
 $env:PRA_SCHOLARLY_MODE = 'live'
 $env:PRA_PARALLEL_HYBRID_RESEARCH_ENABLED = 'true'
-$env:SEMANTIC_SCHOLAR_API_KEY = '<本机可选 Key>'
 python scripts/serve_web.py --host 127.0.0.1 --port 8092
 ```
+
+在页面问答中可以输入“在 arXiv 检索 attention transformer 相关论文，列出标题与链接”或
+“通过 Crossref 解析 DOI 10.1038/nature14539”。入口沿用当前 Agent 问答，无需新按钮。
+标题解析只给出候选；Crossref 摘要可能缺失，参考文献仅反映已登记数据，不支持完整反向引用图。
+出版更新核查只返回登记的更新元数据，不能保证论文未撤稿。arXiv 只支持搜索和 ID 解析，
+年份筛选采用投稿日期。PDF 链接只作为书目信息返回，不自动下载或入库。
+
+每个提供方使用有界内存缓存（5 分钟、最多 128 项、总响应不超过 8 MB），重启即清空；
+Crossref 请求至少间隔 1 秒，arXiv 至少 3 秒。并发相同请求合并为一次 HTTP 请求，
+限流后短期暂停该提供方，不自动重试。每次 HTTP 请求超时为 10 秒，响应上限 2 MB；
+固定官方 HTTPS 地址，不跟随重定向，也不继承系统代理环境变量。
+可以运行 `python scripts/smoke_public_scholarly.py` 做公开书目联网验收，输出仅含状态、数量与耗时。
+
+回答下方的“外部学术 API 来源”卡片由后台工具实际返回结果生成，显示 Crossref/arXiv/
+Semantic Scholar、实时 API 查询或缓存命中、查询时间、返回数量、公开标识符和官方链接。
+卡片随会话历史恢复，刷新不重新查询；旧回答没有来源记录时不会伪造卡片。
+只保存有界书目投影，不保存检索参数、摘要或原始响应。卡片说明工具返回了哪些书目，
+不等同于本地全文事实验证，也不保证回答中的每句话都已被外部文献支持。
+
+意图判定沿用现有解释模型，输出普通解释、本地、外部或混合信息需求；例如“给我几篇 RAG
+的代表文献和链接”无需使用“联网”口令，也能进入学术检索。明确的问候与概念解释保留快捷
+路径，其余请求进入现有语义规划。高置信纯外部需求只查外部书目，混合需求才同时启动本地与
+外部分支；数据库偏好传递给工具路由。模型不能越过禁止联网、required 模式、只读白名单、
+审批或引用校验。模型失败/低置信度采用既有降级，不新增独立分类模型或自动下载权限。
 
 这里的“外部”是受控学术元数据与引用关系检索，不是通用网页搜索。并行学术分支同时受
 `network_read` 风险白名单和四个固定工具名白名单约束，不能调用写工具、本地文件工具、计算

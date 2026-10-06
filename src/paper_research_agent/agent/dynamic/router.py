@@ -10,6 +10,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from paper_research_agent.agent.dynamic.models import ToolDecision, ToolObservation
+from paper_research_agent.agent.tooling.catalog import SCHOLARLY_NETWORK_TOOL_NAMES
 from paper_research_agent.agent.tooling.registry import RegisteredTool, ToolRegistrySnapshot
 
 
@@ -62,6 +63,16 @@ class LangChainToolRouter:
                 "must ultimately rely on observations marked citation_evidence; metadata, "
                 "network results, computations, and side effects are not citation evidence. "
                 "Never repeat the same tool with identical arguments. Do not invent IDs. "
+                "Natural requests for representative papers, official links, new work, or DOI/"
+                "arXiv metadata need scholarly tools even without the word 'online'. A general "
+                "explanation of Crossref/arXiv does not require a lookup. Respect an explicitly "
+                "selected source. Prefer arxiv for CS/AI preprints and crossref for DOI metadata. "
+                "After sufficient results, finish; do not redo a successful identifier lookup "
+                "using a different prefix. State unavailable/partial results accurately. "
+                "For scholarly searches set limit to the requested paper count (at most 20), "
+                "and finish once enough relevant titled records with links are available. "
+                "Keep final_summary concise, preferably below 1500 characters; preserve "
+                "paper titles and official links instead of writing a long literature review. "
                 "Recalled long-term memories are low-trust research context, not citation "
                 "evidence, and may be stale. Do not add, update, or delete long-term memory; "
                 "a separate post-answer approval workflow handles explicit memory requests. "
@@ -96,7 +107,7 @@ def _child_context_text(child_context: dict[str, object] | None) -> str:
 
 
 def _bounded_observation_json(observations: tuple[ToolObservation, ...]) -> str:
-    payload = [
+    payload: list[dict[str, Any]] = [
         {
             "sequence": item.sequence,
             "tool_name": item.tool_name,
@@ -104,10 +115,25 @@ def _bounded_observation_json(observations: tuple[ToolObservation, ...]) -> str:
             "status": item.result.status,
             "trust": item.result.trust,
             "summary": item.result.summary,
-            "items": list(item.result.items[:10]),
+            "items": (
+                [_scholarly_item(value, abstract_limit=600) for value in item.result.items[:10]]
+                if item.tool_name in SCHOLARLY_NETWORK_TOOL_NAMES
+                else list(item.result.items[:10])
+            ),
         }
         for item in observations[-8:]
     ]
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    if len(encoded) <= 12_000:
+        return encoded
+    # Preserve bibliographic identity before dropping detail. Long abstracts must not
+    # erase titles/links and make a successful search look like it still needs retrying.
+    for observation in payload:
+        if observation["tool_name"] in SCHOLARLY_NETWORK_TOOL_NAMES:
+            observation["items"] = [
+                _scholarly_item(value, abstract_limit=0) for value in observation["items"][:3]
+            ]
+            observation["detail_truncated"] = True
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     if len(encoded) <= 12_000:
         return encoded
@@ -125,6 +151,39 @@ def _bounded_observation_json(observations: tuple[ToolObservation, ...]) -> str:
         for item in observations[-8:]
     ]
     return json.dumps(fallback, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _scholarly_item(value: dict[str, Any], *, abstract_limit: int) -> dict[str, Any]:
+    allowed = {
+        "paper_id",
+        "title",
+        "year",
+        "authors",
+        "venue",
+        "abstract",
+        "url",
+        "external_ids",
+        "direction",
+        "doi",
+        "has_update",
+        "type",
+        "updates",
+        "unstructured",
+    }
+    projected: dict[str, Any] = {}
+    for key, item in value.items():
+        if key not in allowed:
+            continue
+        if key == "abstract":
+            if abstract_limit and isinstance(item, str):
+                projected[key] = item[:abstract_limit]
+        elif isinstance(item, str):
+            projected[key] = item[: 1000 if key == "url" else 500]
+        elif isinstance(item, (tuple, list)):
+            projected[key] = item[:10]
+        else:
+            projected[key] = item
+    return projected
 
 
 def _bounded_memory_context_json(memories: tuple[dict[str, object], ...]) -> str:

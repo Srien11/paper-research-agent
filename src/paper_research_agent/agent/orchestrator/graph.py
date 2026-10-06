@@ -229,7 +229,9 @@ def build_main_agent_graph(
                 "turn_id": start.turn_id,
                 "base_workspace_version": start.workspace.version,
                 "final_answer": start.result.answer if start.result is not None else "运行已暂停。",
-                "child_results": list(start.result.child_results) if start.result is not None else [],
+                "child_results": list(start.result.child_results)
+                if start.result is not None
+                else [],
                 "termination_reason": "paused_cached",
             }
         if start.outcome == "waiting_approval_cached":
@@ -246,13 +248,20 @@ def build_main_agent_graph(
                 update["pending_approval"] = cached.pending_approval
             return update
         if start.outcome == "resuming":
-            used_calls = sum(task.usage.call_count for task in (start.workspace.task_plan.tasks if start.workspace.task_plan is not None else ()))
+            used_calls = sum(
+                task.usage.call_count
+                for task in (
+                    start.workspace.task_plan.tasks if start.workspace.task_plan is not None else ()
+                )
+            )
             return {
                 "run_id": start.run_id,
                 "turn_id": start.turn_id,
                 "base_workspace_version": start.workspace.version,
                 "workspace_draft": start.workspace,
-                "child_results": list(start.result.child_results) if start.result is not None else [],
+                "child_results": list(start.result.child_results)
+                if start.result is not None
+                else [],
                 "remaining_child_calls": max(0, max_child_calls - used_calls),
                 "remaining_replans": max_replans,
                 "resuming": True,
@@ -325,8 +334,8 @@ def build_main_agent_graph(
         capability = state.get("planning_capability")
         if capability not in {"direct_chat", "local_rag"}:
             raise ValueError("fast path requires a deterministic single-task capability")
-        interpretation, goal_decision, plan_decision = (
-            build_single_task_decisions(envelope, capability=capability)
+        interpretation, goal_decision, plan_decision = build_single_task_decisions(
+            envelope, capability=capability
         )
         workspace = reduce_workspace(
             ConversationWorkspace.model_validate(state["workspace_draft"]),
@@ -383,9 +392,11 @@ def build_main_agent_graph(
             summary=(
                 f"请求类型：{interpretation.relation}；需要补充信息"
                 if interpretation.needs_clarification
-                else f"请求类型：{interpretation.relation}"
+                else f"请求类型：{interpretation.relation}；信息需求：{interpretation.information_need}"
             ),
-            detail=SafeRunEventDetail(route=interpretation.relation),
+            detail=SafeRunEventDetail(
+                route=interpretation.relation, query_kind=interpretation.information_need
+            ),
             idempotency_key="reasoning:interpret",
         )
         return {"interpretation": interpretation}
@@ -467,9 +478,7 @@ def build_main_agent_graph(
         batch = select_next_batch_pure(workspace)
         if batch is None:
             raise ValueError("execute selection requires a task batch")
-        selected_tasks = tuple(
-            _task_by_id(workspace, task_id) for task_id in batch.task_ids
-        )
+        selected_tasks = tuple(_task_by_id(workspace, task_id) for task_id in batch.task_ids)
         envelope = AgentContextEnvelope.model_validate(state["context"])
         insufficient_signatures = {
             str(item) for item in state.get("insufficient_task_signatures", [])
@@ -714,23 +723,15 @@ def build_main_agent_graph(
             "child_result": normalized_results[0],
             "batch_results": normalized_results,
             "batch_elapsed_seconds": dispatched.elapsed_seconds,
-            "remaining_child_calls": int(
-                state.get("remaining_child_calls", max_child_calls)
-            )
+            "remaining_child_calls": int(state.get("remaining_child_calls", max_child_calls))
             - len(normalized_results),
         }
 
     async def evaluate_result(state: MainAgentGraphState) -> MainAgentGraphState:
         workspace = ConversationWorkspace.model_validate(state["workspace_draft"])
-        results = tuple(
-            ChildTaskResult.model_validate(item) for item in state["batch_results"]
-        )
-        used_calls = max_child_calls - int(
-            state.get("remaining_child_calls", max_child_calls)
-        )
-        used_replans = max_replans - int(
-            state.get("remaining_replans", max_replans)
-        )
+        results = tuple(ChildTaskResult.model_validate(item) for item in state["batch_results"])
+        used_calls = max_child_calls - int(state.get("remaining_child_calls", max_child_calls))
+        used_replans = max_replans - int(state.get("remaining_replans", max_replans))
         evaluations = tuple(
             evaluate_task(
                 _task_by_id(workspace, result.task_id),
@@ -750,12 +751,8 @@ def build_main_agent_graph(
         evaluations = tuple(
             TaskEvaluation.model_validate(item) for item in state["batch_evaluations"]
         )
-        results = tuple(
-            ChildTaskResult.model_validate(item) for item in state["batch_results"]
-        )
-        insufficient_signatures = list(
-            state.get("insufficient_task_signatures", [])
-        )
+        results = tuple(ChildTaskResult.model_validate(item) for item in state["batch_results"])
+        insufficient_signatures = list(state.get("insufficient_task_signatures", []))
         for result in results:
             if result.status != "insufficient_evidence":
                 continue
@@ -781,6 +778,13 @@ def build_main_agent_graph(
                     status="completed" if completed else "failed",
                     title="任务完成" if completed else "任务未完成",
                     summary=evaluation.reason,
+                    detail=SafeRunEventDetail(
+                        scholarly_lookups=tuple(
+                            getattr(
+                                results_by_id[evaluation.task_id].artifact, "scholarly_lookups", ()
+                            )
+                        ),
+                    ),
                     task_id=evaluation.task_id,
                     idempotency_key=(
                         f"task:{evaluation.task_id}:evaluation:{evaluation.outcome}:"
@@ -812,9 +816,7 @@ def build_main_agent_graph(
             "insufficient_task_signatures": insufficient_signatures,
         }
         if any(evaluation.outcome == "replan" for evaluation in evaluations):
-            update["remaining_replans"] = int(
-                state.get("remaining_replans", max_replans)
-            ) - 1
+            update["remaining_replans"] = int(state.get("remaining_replans", max_replans)) - 1
             update["next_action"] = "plan_tasks"
         elif any(evaluation.outcome == "wait_user" for evaluation in evaluations):
             waiting = next(
@@ -856,8 +858,7 @@ def build_main_agent_graph(
             return {"final_answer": direct[:20_000]}
         context = AgentContextEnvelope.model_validate(state["context"])
         child_results = tuple(
-            ChildTaskResult.model_validate(raw)
-            for raw in state.get("child_results", [])
+            ChildTaskResult.model_validate(raw) for raw in state.get("child_results", [])
         )
         preview_publisher = getattr(run_event_publisher, "publish_preview", None)
         request = MainAgentRequest.model_validate(state["request"])
@@ -867,10 +868,15 @@ def build_main_agent_graph(
             nonlocal sequence
             if callable(preview_publisher):
                 sequence += 1
-                await preview_publisher(AnswerPreviewEvent(
-                    request_id=request.request_id, run_id=str(state["run_id"]),
-                    node_id="answer:main", sequence=sequence, text=text,
-                ))
+                await preview_publisher(
+                    AnswerPreviewEvent(
+                        request_id=request.request_id,
+                        run_id=str(state["run_id"]),
+                        node_id="answer:main",
+                        sequence=sequence,
+                        text=text,
+                    )
+                )
 
         try:
             with preview_scope(preview if callable(preview_publisher) else None):
@@ -915,9 +921,7 @@ def build_main_agent_graph(
         workspace = ConversationWorkspace.model_validate(state["workspace_draft"])
         pending = state.get("pending_approval")
         termination = str(state.get("termination_reason", ""))
-        status: Literal[
-            "paused", "cancelled", "waiting_approval", "completed", "failed"
-        ]
+        status: Literal["paused", "cancelled", "waiting_approval", "completed", "failed"]
         if termination == "paused":
             status = "paused"
         elif termination == "cancelled":
@@ -941,8 +945,7 @@ def build_main_agent_graph(
         if not answer and status == "waiting_approval":
             answer = "等待敏感工具审批。"
         child_results = tuple(
-            ChildTaskResult.model_validate(item)
-            for item in state.get("child_results", [])
+            ChildTaskResult.model_validate(item) for item in state.get("child_results", [])
         )
         source_ids = _source_ids(child_results)
         result = MainAgentResult(
@@ -973,7 +976,7 @@ def build_main_agent_graph(
             route="main_agent",
             status=turn_status,
             resolution=resolution,
-            assistant_summary=workspace.summary,
+            assistant_summary=answer,
             source_ids=source_ids,
             result=result,
         )
@@ -997,11 +1000,7 @@ def build_main_agent_graph(
         return "hydrate_context"
 
     def after_hydrate(state: MainAgentGraphState) -> str:
-        return (
-            "select_next_task"
-            if state.get("resuming")
-            else "classify_planning_route"
-        )
+        return "select_next_task" if state.get("resuming") else "classify_planning_route"
 
     def after_planning_route(state: MainAgentGraphState) -> str:
         return (
@@ -1067,7 +1066,9 @@ def build_main_agent_graph(
     builder.add_node("abort_turn", abort_turn)
     builder.add_node("commit_turn", commit_turn)
     builder.add_edge(START, "initialize_turn")
-    builder.add_conditional_edges("initialize_turn", after_initialize, {END: END, "hydrate_context": "hydrate_context"})
+    builder.add_conditional_edges(
+        "initialize_turn", after_initialize, {END: END, "hydrate_context": "hydrate_context"}
+    )
     builder.add_conditional_edges(
         "hydrate_context",
         after_hydrate,
@@ -1154,9 +1155,7 @@ class MainAgentApprovalResumer:
 
     async def resume(self, request_id: str, approved: bool) -> MainAgentResult:
         request = MainAgentResumeRequest(request_id=request_id, approved=approved)
-        stored = await asyncio.to_thread(
-            self._repository.load_agent_run, request.request_id
-        )
+        stored = await asyncio.to_thread(self._repository.load_agent_run, request.request_id)
         if stored is None or stored.status != "waiting_approval":
             raise RuntimeError("approval request is not waiting")
         pending_payload = stored.pending_approval
@@ -1217,8 +1216,7 @@ class MainAgentApprovalResumer:
             result=resumed,
         )
         child_results = tuple(
-            resumed if item.task_id == task.task_id else item
-            for item in claim.result.child_results
+            resumed if item.task_id == task.task_id else item for item in claim.result.child_results
         )
         degradation_codes = degradation_codes_for_results(child_results)
         pending = resumed.pending_approval if resumed.status == "waiting_approval" else None
@@ -1236,10 +1234,15 @@ class MainAgentApprovalResumer:
 
             async def preview(text: str) -> None:
                 if callable(preview_publisher):
-                    await preview_publisher(AnswerPreviewEvent(
-                        request_id=context.request_id, run_id=claim.result.run_id,
-                        node_id="answer:main", sequence=1, text=text,
-                    ))
+                    await preview_publisher(
+                        AnswerPreviewEvent(
+                            request_id=context.request_id,
+                            run_id=claim.result.run_id,
+                            node_id="answer:main",
+                            sequence=1,
+                            text=text,
+                        )
+                    )
 
             try:
                 with preview_scope(preview if callable(preview_publisher) else None):
@@ -1288,7 +1291,7 @@ class MainAgentApprovalResumer:
             route="main_agent",
             status="pending" if status == "waiting_approval" else "completed",
             resolution=resolution,
-            assistant_summary=workspace.summary,
+            assistant_summary=result.answer,
             source_ids=_source_ids(child_results),
             result=result,
         )
@@ -1391,9 +1394,7 @@ def _replace_task(
     plan = workspace.task_plan
     if plan is None:
         raise ValueError("no task plan in workspace")
-    tasks = tuple(
-        updated_task if task.task_id == task_id else task for task in plan.tasks
-    )
+    tasks = tuple(updated_task if task.task_id == task_id else task for task in plan.tasks)
     now = datetime.now(UTC)
     return workspace.model_copy(
         update={
@@ -1429,9 +1430,7 @@ def _fail_task_for_budget(
     return _replace_task(workspace, task_id, failed)
 
 
-def _budget_failure_result(
-    task: AgentTask, *, reason: str, summary: str
-) -> ChildTaskResult:
+def _budget_failure_result(task: AgentTask, *, reason: str, summary: str) -> ChildTaskResult:
     return ChildTaskResult(
         child_run_id=f"budget-{task.task_id}",
         task_id=task.task_id,
@@ -1449,9 +1448,7 @@ def _cancel_open_tasks(workspace: ConversationWorkspace) -> ConversationWorkspac
     tasks = tuple(
         task
         if task.status in {"completed", "skipped", "cancelled"}
-        else task.model_copy(
-            update={"status": "cancelled", "blocked_reason": "用户取消运行"}
-        )
+        else task.model_copy(update={"status": "cancelled", "blocked_reason": "用户取消运行"})
         for task in plan.tasks
     )
     now = datetime.now(UTC)
@@ -1491,9 +1488,7 @@ def _child_request_for(
         turn_id=str(state.get("turn_id", "")),
         goal_id=task.goal_id,
         goal_objective=(
-            workspace.active_goal.objective
-            if workspace.active_goal is not None
-            else ""
+            workspace.active_goal.objective if workspace.active_goal is not None else ""
         ),
         task_id=task.task_id,
         attempt_count=task.attempt_count,
@@ -1502,9 +1497,7 @@ def _child_request_for(
         capability=route,
         current_message=request.message,
         conversation_summary=workspace.summary,
-        constraints=task.constraints
-        if hasattr(task, "constraints")
-        else goal_constraints,
+        constraints=task.constraints if hasattr(task, "constraints") else goal_constraints,
         recent_messages=envelope.recent_messages,
         selected_context=_selected_recalled_context(envelope, interpretation),
         rag_mode=request.rag_mode,
@@ -1522,9 +1515,7 @@ def _selected_recalled_context(
     if interpretation is None:
         return ()
     selected = set(interpretation.selected_context_ids)
-    return tuple(
-        item for item in envelope.recalled_context if item.source_id in selected
-    )
+    return tuple(item for item in envelope.recalled_context if item.source_id in selected)
 
 
 def _build_summary(workspace: ConversationWorkspace) -> str:
@@ -1534,9 +1525,7 @@ def _build_summary(workspace: ConversationWorkspace) -> str:
     if workspace.stable_constraints:
         parts.append(f"约束：{'；'.join(workspace.stable_constraints)}")
     if workspace.task_plan is not None:
-        completed = [
-            task.title for task in workspace.task_plan.tasks if task.status == "completed"
-        ]
+        completed = [task.title for task in workspace.task_plan.tasks if task.status == "completed"]
         pending = [
             task.title
             for task in workspace.task_plan.tasks

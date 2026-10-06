@@ -98,7 +98,15 @@ EXTENDED_TOOL_SPECS: tuple[ToolSpec, ...] = (
         "trace_evidence_source", "local_read", 2, 20, "Trace chunk provenance.", "citation_evidence"
     ),
     _spec("get_paper_outline", "local_read", 2, 100, "Read a paper section outline."),
-    _spec("search_scholarly_sources", "network_read", 10, 20, "Search scholarly metadata."),
+    _spec(
+        "search_scholarly_sources",
+        "network_read",
+        10,
+        20,
+        "Search scholarly metadata. Select source=arxiv for preprints, crossref for DOI works; "
+        "auto uses first available provider. Send only user-requested public keywords/title, "
+        "never local evidence or history.",
+    ),
     _spec("resolve_paper_identifier", "network_read", 10, 5, "Resolve a DOI, title, or paper ID."),
     _spec("get_citation_graph", "network_read", 10, 50, "Read references or citations."),
     _spec("check_paper_status", "network_read", 10, 10, "Check publication status."),

@@ -82,9 +82,7 @@ class ContextHydrator:
         event_run_id = run_id or turn_id
         hydration_started = time.perf_counter()
         recent_started = time.perf_counter()
-        recent_turns = await asyncio.to_thread(
-            self.store.recent, request.conversation_id, limit=self.recent_turns
-        )
+        recent_turns = await asyncio.to_thread(self._recent_turns, request.conversation_id)
         self._emit_hydration_event(
             run_id=event_run_id,
             name="main_hydrate_recent",
@@ -107,9 +105,7 @@ class ContextHydrator:
         ranked = _rank_history(recall_query, history)
         recent_ids = {turn.turn_id for turn in recent_turns}
         recalled_turns = tuple(
-            (turn, score)
-            for turn, score in ranked
-            if turn.turn_id not in recent_ids
+            (turn, score) for turn, score in ranked if turn.turn_id not in recent_ids
         )[: self.recalled_turns]
         memory_started = time.perf_counter()
         memories, memory_degraded = await self._recall_memories(recall_query)
@@ -150,14 +146,30 @@ class ContextHydrator:
             recalled_conversation_count=sum(
                 item.kind != "long_term_memory" for item in recalled_context
             ),
-            recalled_memory_count=sum(
-                item.kind == "long_term_memory" for item in recalled_context
-            ),
+            recalled_memory_count=sum(item.kind == "long_term_memory" for item in recalled_context),
             context_char_count=context_char_count,
             estimated_context_tokens=(context_char_count + 2) // 3,
             degraded=memory_degraded,
         )
         return envelope
+
+    def _recent_turns(self, conversation_id: str) -> tuple[ConversationTurn, ...]:
+        """Read actual replies, including runs saved with legacy workspace summaries."""
+        turns = self.store.recent(conversation_id, limit=self.recent_turns)
+        restored: list[ConversationTurn] = []
+        for turn in turns:
+            if turn.route == "main_agent" and turn.status == "completed":
+                events = self.store.turn_events(turn.turn_id, limit=1)
+                result = self.store.load_agent_run(events[0].request_id) if events else None
+                if (
+                    result is not None
+                    and result.conversation_id == conversation_id
+                    and result.status == "completed"
+                    and result.answer.strip()
+                ):
+                    turn = turn.model_copy(update={"assistant_summary": result.answer[:3_000]})
+            restored.append(turn)
+        return tuple(restored)
 
     def _emit_hydration_event(
         self,
@@ -211,9 +223,7 @@ class ContextHydrator:
         parts.extend(workspace.unresolved_questions)
         return " ".join(part for part in parts if part)
 
-    async def _recall_memories(
-        self, query: str
-    ) -> tuple[tuple[dict[str, object], ...], bool]:
+    async def _recall_memories(self, query: str) -> tuple[tuple[dict[str, object], ...], bool]:
         if self.memory_provider is None:
             return (), False
         try:
@@ -325,9 +335,7 @@ def _apply_budgets(
     recalled_turns_limit: int,
     memories_limit: int,
 ) -> tuple[tuple[ContextMessage, ...], tuple[RecalledContext, ...]]:
-    recalled_turns = tuple(
-        item for item in recalled_context if item.kind != "long_term_memory"
-    )
+    recalled_turns = tuple(item for item in recalled_context if item.kind != "long_term_memory")
     memories = tuple(item for item in recalled_context if item.kind == "long_term_memory")
     trimmed_turns = _trim_recalled(recalled_turns, _RECALLED_CHARS, recalled_turns_limit)
     trimmed_memories = _trim_recalled(memories, _MEMORY_CHARS, memories_limit)

@@ -12,7 +12,7 @@ APP = Path(__file__).resolve().parents[2] / "src/paper_research_agent/web/static
 class StreamingUITests(unittest.TestCase):
     def test_failed_history_keeps_validated_child_answers_and_marks_partial(self) -> None:
         source = APP.read_text(encoding="utf-8")
-        names = ("runNodeKind", "runNodeId", "reduceRunEvent", "restoreRunState", "renderCompletedRunAnswers", "finalizeProgress", "appendRestoredAssistant")
+        names = ("runNodeKind", "runNodeId", "reduceRunEvent", "restoreRunState", "renderCompletedRunAnswers", "finalizeProgress", "appendRestoredAssistant", "renderScholarlySources")
         functions = []
         for name in names:
             start = source.index(f"function {name}(")
