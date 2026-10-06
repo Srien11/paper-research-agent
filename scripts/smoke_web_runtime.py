@@ -217,6 +217,11 @@ def _comparison_stage_trace(
         "comparison_plan_ms": None,
         "comparison_search_batch_ms": None,
         "compiler_ms": None,
+        "research_plan_ms": None,
+        "research_search_ms": None,
+        "research_assessment_ms": None,
+        "research_search_batches": 0,
+        "research_assessment_calls": 0,
     }
     try:
         with closing(sqlite3.connect(path)) as connection:
@@ -233,10 +238,12 @@ def _comparison_stage_trace(
     except (OSError, sqlite3.Error):
         return empty
     totals: dict[str, float] = {}
+    counts: dict[str, int] = {}
     planning_route = None
     planning_route_reason = None
     planner_fallback_reason = None
     for name, duration_ms, route, reason_code, fallback_reason in rows:
+        counts[str(name)] = counts.get(str(name), 0) + 1
         if isinstance(duration_ms, (int, float)):
             totals[str(name)] = totals.get(str(name), 0.0) + float(duration_ms)
         if name == "main_planning_route":
@@ -256,6 +263,11 @@ def _comparison_stage_trace(
             totals.get("execute_tools")
         ),
         "compiler_ms": _optional_milliseconds(totals.get("assess_evidence")),
+        "research_plan_ms": _optional_milliseconds(totals.get("plan")),
+        "research_search_ms": _optional_milliseconds(totals.get("execute_tools")),
+        "research_assessment_ms": _optional_milliseconds(totals.get("assess_evidence")),
+        "research_search_batches": counts.get("execute_tools", 0),
+        "research_assessment_calls": counts.get("assess_evidence", 0),
     }
 
 

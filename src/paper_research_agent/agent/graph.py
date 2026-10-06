@@ -6,13 +6,15 @@ import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict, TypeVar, cast
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from paper_research_agent.agent.batching import direct_assessment_limits
 from paper_research_agent.agent.coverage import validate_evidence_assessment
+from paper_research_agent.agent.evidence_budget import direct_batch_fits_evidence_budget
 from paper_research_agent.agent.fact_queries import materialize_atomic_fact_steps
 from paper_research_agent.agent.langchain_tools import build_langchain_tools
 from paper_research_agent.agent.models import (
@@ -96,6 +98,7 @@ class ResearchGraphState(TypedDict, total=False):
     assessments: list[dict[str, Any]]
     assessment_observation_counts: list[int]
     assessment_durations_ms: list[float]
+    direct_batching_allowed: bool
     pending_followups: list[dict[str, Any]]
     action_history: list[dict[str, Any]]
     replan_count: int
@@ -197,6 +200,7 @@ def build_research_graph(
             "assessments": [],
             "assessment_observation_counts": [],
             "assessment_durations_ms": [],
+            "direct_batching_allowed": runtime_policy.direct_search_concurrency > 1,
             "pending_followups": [],
             "action_history": [],
             "replan_count": 0,
@@ -261,8 +265,8 @@ def build_research_graph(
         assessments = tuple(
             EvidenceAssessment.model_validate(value) for value in state["assessments"]
         )
-        if not is_comparison and len(assessments) != len(observations):
-            raise ValueError("research assessments do not match observations")
+        if not is_comparison:
+            _validate_direct_assessment_batches(state, len(observations))
         if is_comparison and (
             not assessments or len(assessments) > len(observations)
         ):
@@ -591,6 +595,8 @@ def build_research_graph(
                 runtime_policy.comparison_search_concurrency,
                 len(plan.steps) - current_step,
             )
+        else:
+            batch_size = _direct_search_batch_size(state, plan, runtime_policy)
         steps = plan.steps[current_step : current_step + batch_size]
         if not steps or steps[0].step_id != first_step.step_id:
             raise ValueError("active research step does not match the planned batch")
@@ -615,7 +621,7 @@ def build_research_graph(
                 tool_call_count,
             )
             search_call_counts.append(tool_call_count)
-        searches = await asyncio.gather(
+        searches = await _gather_read_only_calls(
             *(
                 run_search(state, step, tool_call_count=call_count)
                 for step, call_count in zip(steps, search_call_counts, strict=True)
@@ -640,7 +646,7 @@ def build_research_graph(
             assessment_count=len(state.get("assessments", [])),
             is_comparison=plan.task_type == "comparison",
         )
-        evidence_results = await asyncio.gather(
+        evidence_results = await _gather_read_only_calls(
             *(
                 run_evidence(
                     state,
@@ -851,6 +857,71 @@ def build_research_graph(
 
 
 ResearchNode = Callable[[ResearchGraphState], Awaitable[ResearchGraphState]]
+
+ReadOnlyResult = TypeVar("ReadOnlyResult")
+
+
+async def _gather_read_only_calls(
+    *calls: Awaitable[ReadOnlyResult],
+) -> list[ReadOnlyResult]:
+    """Do not leave sibling calls running after a failed or cancelled batch."""
+    tasks = [asyncio.ensure_future(call) for call in calls]
+    try:
+        return list(await asyncio.gather(*tasks))
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+
+def _validate_direct_assessment_batches(
+    state: ResearchGraphState, observation_count: int
+) -> None:
+    direct_assessment_limits(
+        state, observation_count=observation_count, assessment_count=len(state["assessments"])
+    )
+
+
+def _direct_search_batch_size(
+    state: ResearchGraphState, plan: ResearchPlan, policy: ResearchRuntimePolicy
+) -> int:
+    """Batch only declared independent searches with safe budget headroom."""
+    if (
+        not state.get("direct_batching_allowed", False)
+        or state["replan_count"] > 0
+        or state["consecutive_no_new_evidence"] > 0
+    ):
+        return 1
+    start = state["current_step"]
+    maximum = min(
+        policy.direct_search_concurrency,
+        len(plan.steps) - start,
+        _state_step_budget(state, policy) - start,
+        (_state_tool_call_budget(state, policy) - state["tool_call_count"]) // 2,
+    )
+    if maximum < 2:
+        return 1
+    candidates = plan.steps[start : start + maximum]
+    if not all(step.independent_search for step in candidates):
+        return 1
+    observations = tuple(
+        ResearchObservation.model_validate(value) for value in state["observations"]
+    )
+    executed = {
+        _query_scope_key(item.search.query, item.search.corpus_id) for item in observations
+    }
+    keys = tuple(_step_query_key(step) for step in candidates)
+    if len(set(keys)) != len(keys) or any(key in executed for key in keys):
+        return 1
+    new_record_bound = sum(
+        min(step.top_k, policy.initial_evidence_per_step) for step in candidates
+    )
+    if not direct_batch_fits_evidence_budget(
+        observations, additional_records=new_record_bound
+    ):
+        return 1
+    return maximum
 
 
 def _state_step_budget(

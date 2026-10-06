@@ -7,8 +7,11 @@ from unittest.mock import AsyncMock, patch
 from langgraph.checkpoint.memory import InMemorySaver
 
 from paper_research_agent.agent.graph import (
+    _direct_search_batch_size,
+    _gather_read_only_calls,
     _remaining_runtime_seconds,
     _supplemental_completion_reserve_seconds,
+    _validate_direct_assessment_batches,
     build_research_graph,
 )
 from paper_research_agent.agent.models import (
@@ -1745,6 +1748,237 @@ class ResearchGraphTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(intercepted), 1)
         self.assertEqual(intercepted[0].name, "get_evidence")
         self.assertEqual(intercepted[0].reason_code, "tool_budget_exceeded")
+
+
+class DirectBatchGraphTests(unittest.IsolatedAsyncioTestCase):
+    def _plan(self, *, independent: bool = True, count: int = 4) -> ResearchPlan:
+        return ResearchPlan(
+            steps=tuple(
+                ResearchStep(
+                    step_id=f"step-{index}", objective=f"Find fact {index}",
+                    query=f"query-{index}", top_k=1, independent_search=independent,
+                )
+                for index in range(1, count + 1)
+            )
+        )
+
+    def _service(self):
+        service = AsyncMock()
+        activity = {"active": 0, "maximum": 0}
+
+        async def search(request):
+            activity["active"] += 1
+            activity["maximum"] = max(activity["maximum"], activity["active"])
+            try:
+                await asyncio.sleep(0)
+                index = request.query.rsplit("-", 1)[-1]
+                return SearchCorpusResult(
+                    query=request.query, index_id="idx-test", degraded=False,
+                    hits=(_hit(f"chunk-{index}", "C001", 1),),
+                )
+            finally:
+                activity["active"] -= 1
+
+        async def evidence(request):
+            return GetEvidenceResult(records=tuple(
+                _record(chunk_id, "C001") for chunk_id in request.chunk_ids
+            ))
+
+        service.search_corpus.side_effect = search
+        service.get_evidence.side_effect = evidence
+        return service, activity
+
+    async def test_independent_batch_reduces_assessments_with_same_evidence(self):
+        results = []
+        for concurrency in (1, 2):
+            service, activity = self._service()
+            reasoner = FakeReasoner(*(
+                _assessment(index == 4 // concurrency)
+                for index in range(1, 4 // concurrency + 1)
+            ))
+            graph = build_research_graph(
+                planner=FakePlanner(self._plan()), reasoner=reasoner, service=service,
+                policy=ResearchRuntimePolicy(direct_search_concurrency=concurrency),
+            )
+            state = await graph.ainvoke({"question": "Find four facts"})
+            self.assertEqual(activity["maximum"], concurrency)
+            self.assertEqual(len(reasoner.calls), 4 // concurrency)
+            self.assertEqual(state["tool_call_count"], 8)
+            self.assertEqual(state["termination_reason"], "evidence_sufficient")
+            self.assertEqual(state["assessment_observation_counts"],
+                             list(range(concurrency, 5, concurrency)))
+            results.append(state)
+        self.assertEqual(results[0]["observations"], results[1]["observations"])
+        self.assertEqual(results[0]["evidence_records"], results[1]["evidence_records"])
+
+    async def test_legacy_or_dependent_steps_stay_serial(self):
+        service, activity = self._service()
+        reasoner = FakeReasoner(_assessment(False), _assessment(True))
+        plan = self._plan(independent=False, count=2)
+        self.assertFalse(plan.steps[0].independent_search)
+        graph = build_research_graph(
+            planner=FakePlanner(plan), reasoner=reasoner, service=service,
+            policy=ResearchRuntimePolicy(direct_search_concurrency=2),
+        )
+        state = await graph.ainvoke({"question": "Find two facts"})
+        self.assertEqual(activity["maximum"], 1)
+        self.assertEqual(state["assessment_observation_counts"], [1, 2])
+
+    async def test_followup_remains_serial_after_independent_batch(self):
+        service, _ = self._service()
+        reasoner = FakeReasoner(
+            _assessment(False, next_query="followup-5", next_objective="Fill a gap"),
+            _assessment(True),
+        )
+        graph = build_research_graph(
+            planner=FakePlanner(self._plan()), reasoner=reasoner, service=service,
+            policy=ResearchRuntimePolicy(direct_search_concurrency=2),
+        )
+        state = await graph.ainvoke({"question": "Find four facts"})
+        self.assertEqual(state["assessment_observation_counts"], [2, 3])
+        self.assertEqual(state["replan_count"], 1)
+        self.assertEqual([call.args[0].query for call in service.search_corpus.await_args_list],
+                         ["query-1", "query-2", "followup-5"])
+        self.assertFalse(ResearchPlan.model_validate(state["plan"]).steps[2].independent_search)
+
+    async def test_resume_does_not_repeat_completed_batch(self):
+        service, _ = self._service()
+        reasoner = FakeReasoner(_assessment(False), _assessment(True))
+        graph = build_research_graph(
+            planner=FakePlanner(self._plan()), reasoner=reasoner, service=service,
+            policy=ResearchRuntimePolicy(direct_search_concurrency=2),
+            checkpointer=InMemorySaver(),
+        )
+        config = {"configurable": {"thread_id": "direct-batch-resume"}}
+        await graph.ainvoke({"question": "Find four facts"}, config,
+                            interrupt_after=["execute_tools"])
+        state = await graph.ainvoke(None, config)
+        self.assertEqual(service.search_corpus.await_count, 4)
+        self.assertEqual(state["assessment_observation_counts"], [2, 4])
+
+    async def test_no_new_evidence_is_counted_per_batch_then_falls_back(self):
+        service, _ = self._service()
+
+        async def empty_search(request):
+            return SearchCorpusResult(query=request.query, index_id="idx-test",
+                                      degraded=False, hits=())
+
+        service.search_corpus.side_effect = empty_search
+        graph = build_research_graph(
+            planner=FakePlanner(self._plan()),
+            reasoner=FakeReasoner(_assessment(False), _assessment(False)), service=service,
+            policy=ResearchRuntimePolicy(direct_search_concurrency=2),
+        )
+        state = await graph.ainvoke({"question": "Find four facts"})
+        self.assertEqual(state["assessment_observation_counts"], [2, 3])
+        self.assertEqual(state["consecutive_no_new_evidence"], 2)
+        self.assertEqual(state["termination_reason"], "no_new_evidence")
+        self.assertEqual(service.search_corpus.await_count, 3)
+        service.get_evidence.assert_not_awaited()
+
+    async def test_failed_batch_cancels_siblings_without_partial_checkpoint(self):
+        service, _ = self._service()
+        sibling_started = asyncio.Event()
+        sibling_cancelled = asyncio.Event()
+
+        async def search(request):
+            if request.query == "query-1":
+                await sibling_started.wait()
+                raise RuntimeError("test search failure")
+            sibling_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                sibling_cancelled.set()
+
+        service.search_corpus.side_effect = search
+        graph = build_research_graph(
+            planner=FakePlanner(self._plan()), reasoner=FakeReasoner(), service=service,
+            policy=ResearchRuntimePolicy(direct_search_concurrency=2),
+            checkpointer=InMemorySaver(),
+        )
+        config = {"configurable": {"thread_id": "direct-batch-failure"}}
+        with self.assertRaisesRegex(RuntimeError, "test search failure"):
+            await graph.ainvoke({"question": "Find four facts"}, config)
+        self.assertTrue(sibling_cancelled.is_set())
+        checkpoint = await graph.aget_state(config)
+        self.assertEqual(checkpoint.values["observations"], [])
+        self.assertEqual(checkpoint.values["current_step"], 0)
+        self.assertEqual(checkpoint.values["tool_call_count"], 0)
+        service.get_evidence.assert_not_awaited()
+
+    async def test_cancelled_parent_drains_children(self):
+        started = asyncio.Event()
+        finished = asyncio.Event()
+
+        async def child():
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                finished.set()
+
+        task = asyncio.create_task(_gather_read_only_calls(child()))
+        await started.wait()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertTrue(finished.is_set())
+
+    def test_batch_falls_back_for_budget_duplicates_and_legacy_state(self):
+        plan = self._plan()
+        state = {
+            "direct_batching_allowed": True, "current_step": 0,
+            "replan_count": 0, "consecutive_no_new_evidence": 0,
+            "observations": [], "step_budget": 4,
+            "tool_call_count": 0, "tool_call_budget": 8,
+        }
+        policy = ResearchRuntimePolicy(direct_search_concurrency=2)
+        self.assertEqual(_direct_search_batch_size(state, plan, policy), 2)
+        for change in (
+            {"direct_batching_allowed": False}, {"tool_call_budget": 3},
+            {"step_budget": 1}, {"consecutive_no_new_evidence": 1}, {"replan_count": 1},
+        ):
+            self.assertEqual(_direct_search_batch_size({**state, **change}, plan, policy), 1)
+        legacy = {key: value for key, value in state.items() if key != "direct_batching_allowed"}
+        self.assertEqual(_direct_search_batch_size(legacy, plan, policy), 1)
+        repeated = plan.model_copy(update={"steps": (
+            plan.steps[0], plan.steps[1].model_copy(update={"query": plan.steps[0].query}),
+        )})
+        self.assertEqual(_direct_search_batch_size(state, repeated, policy), 1)
+
+    def test_batch_falls_back_before_evidence_truncation(self):
+        record = _record("chunk-1", "C001").model_copy(update={"text": "x" * 3_000})
+        observation = ResearchObservation(
+            step_id="earlier", objective="Earlier fact",
+            search=SearchCorpusResult(query="earlier", index_id="idx-test", degraded=False,
+                                     hits=(_hit("chunk-1", "C001", 1),)),
+            evidence=GetEvidenceResult(records=(record,)),
+        )
+        plan = self._plan(count=2).model_copy(update={"steps": tuple(
+            step.model_copy(update={"top_k": 6}) for step in self._plan(count=2).steps
+        )})
+        state = {
+            "direct_batching_allowed": True, "current_step": 0,
+            "replan_count": 0, "consecutive_no_new_evidence": 0,
+            "observations": [observation.model_dump(mode="json")], "step_budget": 4,
+            "tool_call_count": 0, "tool_call_budget": 8,
+        }
+        policy = ResearchRuntimePolicy(direct_search_concurrency=2,
+                                      initial_evidence_per_step=6)
+        self.assertEqual(_direct_search_batch_size(state, plan, policy), 1)
+
+    def test_assessment_batch_accounting_validates_resume_and_legacy(self):
+        _validate_direct_assessment_batches({"assessments": [{}, {}]}, 2)
+        _validate_direct_assessment_batches(
+            {"assessments": [{}, {}], "assessment_observation_counts": [2, 4],
+             "direct_batching_allowed": True}, 4,
+        )
+        for counts in ([2, 2], [2, 3], [4, 2], [2], [True, 4]):
+            with self.assertRaisesRegex(ValueError, "assessments do not match"):
+                _validate_direct_assessment_batches(
+                    {"assessments": [{}, {}], "assessment_observation_counts": counts}, 4,
+                )
 
 
 if __name__ == "__main__":

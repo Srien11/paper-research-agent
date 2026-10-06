@@ -111,6 +111,52 @@ class ResearchAgentFactoryTests(unittest.IsolatedAsyncioTestCase):
 
             await runtime.aclose()
             model.root_async_client.close.assert_awaited_once()
+            self.assertTrue(kwargs["http_async_client"].is_closed)
+
+    async def test_recreated_research_runtime_owns_a_fresh_transport(self) -> None:
+        transports = []
+        with tempfile.TemporaryDirectory() as directory:
+            for index in (1, 2):
+                model = Mock()
+                model.with_structured_output.return_value = AsyncMock()
+                model.root_async_client = Mock(close=AsyncMock())
+                with patch("paper_research_agent.agent.factory.ChatOpenAI", return_value=model) as factory:
+                    runtime = await create_research_agent_runtime(
+                        retriever=Mock(), paper_candidate_retriever=AsyncMock(),
+                        paper_candidate_query_resolver=AsyncMock(), chunks=(_chunk(),),
+                        storage_classes={"C001": "internal_research_only"},
+                        model_id="qwen-test", api_key="test-key",
+                        checkpoint_path=Path(directory) / f"runtime-{index}.sqlite3",
+                        extended_tools_enabled=False,
+                    )
+                transport = factory.call_args.kwargs["http_async_client"]
+                self.assertFalse(transport.is_closed)
+                transports.append(transport)
+                await runtime.aclose()
+                self.assertTrue(transport.is_closed)
+        self.assertIsNot(transports[0], transports[1])
+
+    async def test_model_construction_failure_closes_owned_transport(self) -> None:
+        transports = []
+
+        def fail_model(**kwargs):
+            transports.append(kwargs["http_async_client"])
+            raise RuntimeError("test model construction failure")
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch("paper_research_agent.agent.factory.ChatOpenAI", side_effect=fail_model),
+            self.assertRaisesRegex(RuntimeError, "test model construction failure"),
+        ):
+            await create_research_agent_runtime(
+                retriever=Mock(), paper_candidate_retriever=AsyncMock(),
+                paper_candidate_query_resolver=AsyncMock(), chunks=(_chunk(),),
+                storage_classes={"C001": "internal_research_only"},
+                model_id="qwen-test", api_key="test-key",
+                checkpoint_path=Path(directory) / "failed-runtime.sqlite3",
+                extended_tools_enabled=False,
+            )
+        self.assertTrue(transports[0].is_closed)
 
     async def test_persists_completed_graph_state_in_sqlite(self) -> None:
         chunk = _chunk()

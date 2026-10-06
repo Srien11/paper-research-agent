@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import aiosqlite
+import httpx
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from pydantic import SecretStr
@@ -182,10 +183,15 @@ async def create_research_agent_runtime(
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     connection = await aiosqlite.connect(checkpoint_path)
     model: ChatOpenAI | None = None
+    model_transport: httpx.AsyncClient | None = None
     extended_handle: Any | None = None
     try:
         checkpointer = AsyncSqliteSaver(connection)
         await checkpointer.setup()
+        # LangChain caches default transports by endpoint and timeout. A
+        # closable runtime must own its transport so closing one runtime cannot
+        # invalidate a subsequently constructed or concurrently active runtime.
+        model_transport = httpx.AsyncClient(timeout=runtime_policy.timeout_seconds)
         model = ChatOpenAI(
             model=normalized_model,
             api_key=SecretStr(resolved_key.strip()),
@@ -194,6 +200,7 @@ async def create_research_agent_runtime(
             top_p=0.7,
             timeout=runtime_policy.timeout_seconds,
             max_retries=2,
+            http_async_client=model_transport,
             extra_body={"enable_thinking": False},
         )
         corpus_catalog = {paper.corpus_id: paper.title for paper in papers}
@@ -266,6 +273,7 @@ async def create_research_agent_runtime(
         )
 
         async def close() -> None:
+            reasoner.assessment_cache.clear()
             try:
                 client = getattr(model, "root_async_client", None)
                 close_client = getattr(client, "close", None)
@@ -273,12 +281,19 @@ async def create_research_agent_runtime(
                     await close_client()
             finally:
                 try:
-                    if extended_handle is not None:
-                        await extended_handle.aclose()
+                    if model_transport is not None:
+                        await model_transport.aclose()
                 finally:
-                    await connection.close()
+                    try:
+                        if extended_handle is not None:
+                            await extended_handle.aclose()
+                    finally:
+                        await connection.close()
 
         async def clear(thread_id: str) -> None:
+            # A cleared conversation must not leave derived decisions in instance memory.
+            # Clearing all entries is conservative because cache keys retain no session IDs.
+            reasoner.assessment_cache.clear()
             await checkpointer.adelete_thread(thread_id)
             await checkpointer.adelete_thread(dynamic_checkpoint_thread_id(thread_id))
 
@@ -301,12 +316,18 @@ async def create_research_agent_runtime(
     except BaseException:
         if extended_handle is not None:
             await extended_handle.aclose()
-        if model is not None:
-            client = getattr(model, "root_async_client", None)
-            close_client = getattr(client, "close", None)
-            if close_client is not None:
-                await close_client()
-        await connection.close()
+        try:
+            if model is not None:
+                client = getattr(model, "root_async_client", None)
+                close_client = getattr(client, "close", None)
+                if close_client is not None:
+                    await close_client()
+        finally:
+            try:
+                if model_transport is not None:
+                    await model_transport.aclose()
+            finally:
+                await connection.close()
         raise
 
 

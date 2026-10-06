@@ -13,7 +13,9 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from paper_research_agent.agent.batching import direct_assessment_limits
 from paper_research_agent.agent.coverage import validate_evidence_assessment
+from paper_research_agent.agent.evidence_budget import direct_batch_fits_evidence_budget
 from paper_research_agent.agent.models import (
     TERMINATION_REASONS,
     EvidenceAssessment,
@@ -427,8 +429,6 @@ class ResearchAgentRuntime:
         if not isinstance(raw_assessments, list):
             raise TypeError("research graph assessments are missing")
         assessments = tuple(EvidenceAssessment.model_validate(value) for value in raw_assessments)
-        if plan.task_type == "direct" and len(assessments) != len(observations):
-            raise ValueError("research assessments do not match observations")
         if plan.task_type == "comparison" and (
             not assessments or len(assessments) > len(observations)
         ):
@@ -454,7 +454,24 @@ class ResearchAgentRuntime:
                 ):
                     raise ValueError("comparison assessment counts do not match batches")
         else:
-            assessment_limits = tuple(range(1, len(observations) + 1))
+            assessment_limits = direct_assessment_limits(
+                state, observation_count=len(observations), assessment_count=len(assessments)
+            )
+            previous_limit = 0
+            for limit in assessment_limits:
+                if limit - previous_limit > 1:
+                    batch_steps = plan.steps[previous_limit:limit]
+                    if not all(step.independent_search for step in batch_steps):
+                        raise ValueError("direct research batch contains dependent searches")
+                    if not direct_batch_fits_evidence_budget(
+                        observations[:previous_limit],
+                        additional_records=sum(
+                            min(step.top_k, self._policy.initial_evidence_per_step)
+                            for step in batch_steps
+                        ),
+                    ):
+                        raise ValueError("direct research batch exceeds evidence visibility budget")
+                previous_limit = limit
         for limit, assessment in zip(assessment_limits, assessments, strict=True):
             validate_evidence_assessment(plan, observations[:limit], assessment)
 

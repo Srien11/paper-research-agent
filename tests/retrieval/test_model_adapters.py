@@ -4,7 +4,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
@@ -69,6 +69,35 @@ class FastEmbedAdapterTests(unittest.TestCase):
         self.assertEqual(FakeTextEmbedding.revision, "embed-sha")
         self.assertEqual(FakeTextEmbedding.document_call, ["first", "second"])
         self.assertEqual(FakeTextEmbedding.query_call, "query")
+
+    def test_query_cache_reuses_exact_inputs_without_sharing_mutable_vectors(self) -> None:
+        with patch.dict(sys.modules, {"fastembed": self.fastembed}):
+            encoder = FastEmbedEncoder("org/embedding", revision="embed-sha")
+        encoder._model.query_embed = Mock(return_value=((5.0, 6.0),))
+        first = encoder.encode_query("query")
+        first[0] = 999
+        self.assertEqual(encoder.encode_query("query"), [5.0, 6.0])
+        self.assertEqual(encoder._model.query_embed.call_count, 1)
+        encoder.encode_query("different")
+        self.assertEqual(encoder._model.query_embed.call_count, 2)
+
+    def test_score_cache_keys_include_query_full_text_and_order(self) -> None:
+        modules = {
+            "fastembed": self.fastembed,
+            "fastembed.rerank": self.rerank,
+            "fastembed.rerank.cross_encoder": self.cross_encoder,
+        }
+        with patch.dict(sys.modules, modules):
+            reranker = FastEmbedReranker("org/reranker", revision="rerank-sha")
+        reranker._model.rerank = Mock(return_value=(0.25, 0.75))
+        scores = reranker.score("query", ["a", "b"])
+        scores[0] = 999
+        self.assertEqual(reranker.score("query", ["a", "b"]), [0.25, 0.75])
+        self.assertEqual(reranker._model.rerank.call_count, 1)
+        reranker.score("query", ["b", "a"])
+        reranker.score("query", ["a", "changed"])
+        reranker.score("other", ["a", "b"])
+        self.assertEqual(reranker._model.rerank.call_count, 4)
 
     def test_reranker_uses_v08_api_and_consumes_score_generator(self) -> None:
         modules = {

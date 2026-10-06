@@ -37,6 +37,7 @@ class ResearchRuntimePolicy(BaseModel):
         ge=1,
         le=DEFAULT_COMPARISON_SEARCH_CONCURRENCY,
     )
+    direct_search_concurrency: int = Field(default=1, ge=1, le=2)
     adaptive_evidence_hydration_enabled: bool = False
     initial_evidence_per_step: int = Field(
         default=4,

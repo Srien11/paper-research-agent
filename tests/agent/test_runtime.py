@@ -1,12 +1,24 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import unittest
 from collections.abc import Sequence
+from unittest.mock import AsyncMock
 
 from pydantic import ValidationError
 
+from paper_research_agent.agent.graph import build_research_graph
+from paper_research_agent.agent.models import (
+    EvidenceAssessment,
+    EvidenceRecord,
+    GetEvidenceResult,
+    ResearchPlan,
+    ResearchStep,
+    SearchCorpusHit,
+    SearchCorpusResult,
+)
 from paper_research_agent.agent.observability import AgentEvent
 from paper_research_agent.agent.policy import ResearchRuntimePolicy
 from paper_research_agent.agent.runtime import ResearchAgentRuntime
@@ -393,6 +405,82 @@ class ResearchAgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(ValueError, "thread_id"):
             await runtime.run("比较 RAG 方法", thread_id=" ")
+
+
+class DirectBatchRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def _batch_state(self):
+        chunks = (_chunk(), _chunk().model_copy(update={"chunk_id": "chunk-2"}))
+        planner = AsyncMock()
+        planner.plan.return_value = ResearchPlan(steps=tuple(
+            ResearchStep(step_id=f"step-{index}", objective="Find fact", query=f"query-{index}",
+                         top_k=1, independent_search=True)
+            for index in (1, 2)
+        ))
+        reasoner = AsyncMock()
+        reasoner.assess.return_value = EvidenceAssessment(
+            evidence_sufficient=True, status="sufficient",
+        )
+        service = AsyncMock()
+
+        async def search(request):
+            chunk = chunks[int(request.query.rsplit("-", 1)[-1]) - 1]
+            return SearchCorpusResult(query=request.query, index_id="idx-test", degraded=False,
+                hits=(SearchCorpusHit(chunk_id=chunk.chunk_id, corpus_id=chunk.corpus_id,
+                    section_id=chunk.section_id, page_start=chunk.page_start,
+                    page_end=chunk.page_end, text_sha256=chunk.text_sha256,
+                    storage_class="internal_research_only", final_rank=1),))
+
+        async def evidence(request):
+            return GetEvidenceResult(records=tuple(
+                EvidenceRecord(chunk_id=chunk.chunk_id, corpus_id=chunk.corpus_id,
+                    section_id=chunk.section_id, page_start=chunk.page_start,
+                    page_end=chunk.page_end, text=chunk.text, text_sha256=chunk.text_sha256,
+                    storage_class="internal_research_only")
+                for chunk in chunks if chunk.chunk_id in request.chunk_ids
+            ))
+
+        service.search_corpus.side_effect = search
+        service.get_evidence.side_effect = evidence
+        policy = ResearchRuntimePolicy(direct_search_concurrency=2)
+        graph = build_research_graph(planner=planner, reasoner=reasoner,
+                                     service=service, policy=policy)
+        state = await graph.ainvoke({"question": "Find two facts"})
+        return chunks, state, policy
+
+    async def test_runtime_accepts_and_revalidates_independent_batch(self):
+        chunks, state, policy = await self._batch_state()
+        runtime = ResearchAgentRuntime(graph=FakeGraph(state), chunks=chunks,
+            storage_classes={"C001": "internal_research_only"}, policy=policy)
+        result = await runtime.run("Find two facts", thread_id="batch-runtime")
+        self.assertEqual(len(result.observations), 2)
+        self.assertEqual(len(result.assessments), 1)
+        self.assertEqual(len(result.evidence), 2)
+        self.assertTrue(result.evidence_sufficient)
+
+    async def test_runtime_rejects_dependent_or_unmarked_batch(self):
+        chunks, state, policy = await self._batch_state()
+        for mutate in ("dependent", "unmarked", "oversized", "incomplete"):
+            corrupted = copy.deepcopy(state)
+            if mutate == "dependent":
+                corrupted["plan"]["steps"][1]["independent_search"] = False
+            elif mutate == "unmarked":
+                corrupted.pop("direct_batching_allowed")
+            elif mutate == "oversized":
+                corrupted["assessment_observation_counts"] = [3]
+            else:
+                corrupted["assessment_observation_counts"] = [1]
+            runtime = ResearchAgentRuntime(graph=FakeGraph(corrupted), chunks=chunks,
+                storage_classes={"C001": "internal_research_only"}, policy=policy)
+            with self.assertRaises(ValueError):
+                await runtime.run("Find two facts", thread_id=f"batch-{mutate}")
+
+    async def test_completed_batch_can_be_validated_after_policy_rollback(self):
+        chunks, state, _ = await self._batch_state()
+        runtime = ResearchAgentRuntime(graph=FakeGraph(state), chunks=chunks,
+            storage_classes={"C001": "internal_research_only"},
+            policy=ResearchRuntimePolicy(direct_search_concurrency=1))
+        result = await runtime.run("Find two facts", thread_id="batch-rollback")
+        self.assertEqual(len(result.assessments), 1)
 
 
 if __name__ == "__main__":

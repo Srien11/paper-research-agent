@@ -188,6 +188,11 @@ class SmokeTraceTests(unittest.TestCase):
             "fact_proposal_repair_exhausted",
         )
         self.assertEqual(trace["comparison_plan_ms"], 12.5)
+        self.assertEqual(trace["research_plan_ms"], 12.5)
+        self.assertEqual(trace["research_search_ms"], 20.0)
+        self.assertEqual(trace["research_assessment_ms"], 8.0)
+        self.assertEqual(trace["research_search_batches"], 1)
+        self.assertEqual(trace["research_assessment_calls"], 1)
 
 
 def _chunk() -> EvidenceChunk:
@@ -732,6 +737,16 @@ def _runtime(
 
 
 class RAGRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    def test_direct_batch_policy_reads_environment_and_rejects_overcommit(self) -> None:
+        with patch.dict("os.environ", {"PRA_DIRECT_SEARCH_CONCURRENCY": "2"}, clear=True):
+            self.assertEqual(_research_policy_from_environment().direct_search_concurrency, 2)
+        for value in ("0", "3", "invalid"):
+            with (
+                patch.dict("os.environ", {"PRA_DIRECT_SEARCH_CONCURRENCY": value}, clear=True),
+                self.assertRaises(ValueError),
+            ):
+                _research_policy_from_environment()
+
     def test_research_policy_defaults_cover_bounded_dynamic_budget(self) -> None:
         with patch.dict("os.environ", {}, clear=True):
             policy = _research_policy_from_environment()
@@ -739,6 +754,7 @@ class RAGRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(policy.max_steps, 24)
         self.assertEqual(policy.max_followup_steps, 4)
         self.assertEqual(policy.comparison_search_concurrency, 6)
+        self.assertEqual(policy.direct_search_concurrency, 1)
         self.assertFalse(policy.adaptive_evidence_hydration_enabled)
         self.assertEqual(policy.evidence_per_step, 4)
         self.assertEqual(policy.first_followup_evidence_per_step, 6)

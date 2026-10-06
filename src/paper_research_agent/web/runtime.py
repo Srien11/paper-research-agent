@@ -1460,6 +1460,9 @@ def _research_policy_from_environment() -> object:
             "PRA_COMPARISON_SEARCH_CONCURRENCY",
             DEFAULT_COMPARISON_SEARCH_CONCURRENCY,
         ),
+        direct_search_concurrency=_environment_int(
+            "PRA_DIRECT_SEARCH_CONCURRENCY", 1
+        ),
         adaptive_evidence_hydration_enabled=_environment_flag(
             "PRA_RESEARCH_AGENT_ADAPTIVE_EVIDENCE_HYDRATION_ENABLED",
             default=False,

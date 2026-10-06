@@ -650,6 +650,9 @@ class ResearchStep(FrozenContract):
     query: str = Field(min_length=1, max_length=2000)
     top_k: int = Field(default=10, ge=1, le=20)
     corpus_id: str | None = Field(default=None, pattern=r"^[CT]\d{3}$")
+    # Missing in legacy plans: keep sequential execution unless the planner
+    # explicitly declares a fully specified, result-independent search.
+    independent_search: bool = Field(default=False, strict=True)
     target_ids: tuple[str, ...] = Field(default=(), max_length=4)
     dimension_ids: tuple[str, ...] = Field(default=(), max_length=5)
     fact_requirement_id: str | None = Field(

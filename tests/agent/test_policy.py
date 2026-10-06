@@ -81,3 +81,11 @@ def test_legacy_evidence_per_step_input_maps_to_initial_cutoff() -> None:
 
     assert policy.initial_evidence_per_step == 3
     assert policy.evidence_per_step == 3
+
+
+def test_direct_search_concurrency_is_conservative_and_bounded() -> None:
+    assert ResearchRuntimePolicy().direct_search_concurrency == 1
+    assert ResearchRuntimePolicy(direct_search_concurrency=2).direct_search_concurrency == 2
+    for value in (0, 3):
+        with pytest.raises(ValidationError):
+            ResearchRuntimePolicy(direct_search_concurrency=value)
